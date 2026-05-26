@@ -1,0 +1,623 @@
+"""
+core/scanner.py
+───────────────
+Dynamic market discovery — Polymarket Gamma API scanner.
+
+Background asyncio task that periodically polls the Gamma API to find active
+binary markets, extracts their YES/NO CLOB token IDs, and registers each
+newly discovered market with a FeedRegistry, which spins up a MarketFeed
+task for it without requiring a bot restart.
+
+Gamma API
+─────────
+  GET https://gamma-api.polymarket.com/markets
+      ?active=true&closed=false&archived=false
+      &limit=100&next_cursor=<cursor>
+
+Each market response item has at minimum:
+  {
+    "conditionId":   "0x…",          # bytes32 hex condition identifier
+    "clobTokenIds":  ["0xYES…","0xNO…"],  # [YES token, NO token]
+    "active":        true,
+    "closed":        false,
+  }
+
+The scanner pages through all results using next_cursor, deduplicates via an
+internal set of known condition IDs, and fires on_market_added only once per
+market per process lifetime.
+
+FeedRegistry
+────────────
+Wraps a live dict of condition_id → asyncio.Task (each running a MarketFeed).
+New feeds are created by calling add_market(); existing feeds survive
+reconnects inside MarketFeed.run().  stop_all() cancels every feed task
+gracefully for clean shutdown.
+
+Usage in main.py::
+
+    queue         = asyncio.Queue(maxsize=2048)
+    feed_registry = FeedRegistry(queue=queue)
+
+    # Seed from ENV if present
+    if YES_TOKEN_ID and NO_TOKEN_ID:
+        await feed_registry.add_market(CONDITION_ID, YES_TOKEN_ID, NO_TOKEN_ID)
+
+    scanner = MarketScanner(on_market_added=feed_registry.add_market)
+    asyncio.create_task(scanner.run(), name="scanner")
+"""
+
+from __future__ import annotations
+
+import ast
+import asyncio
+import json
+import logging
+import math
+import time
+import warnings
+from datetime import datetime, timezone
+from typing import Awaitable, Callable
+
+import aiohttp
+
+from core.ws_feed import MarketFeed
+from strategy.arbitrage import _resolve_rebate
+from telemetry.metrics import (
+    SCANNER_ADMITTED,
+    SCANNER_CANDIDATES,
+    SCANNER_FEEDS_FETCHED,
+    SCANNER_SCAN_DURATION,
+    SCANNER_SCORE_AVG,
+    SCANNER_SCORE_MAX,
+    SCANNER_SCORE_MIN,
+)
+
+logger = logging.getLogger(__name__)
+
+# ── Gamma API endpoint ──────────────────────────────────────────────────────
+_GAMMA_URL   = "https://gamma-api.polymarket.com/markets"
+_PAGE_LIMIT  = 100
+# Polymarket uses "LTE=" as the terminal cursor value for paginated endpoints.
+_END_CURSOR  = "LTE="
+
+# ── Scanner defaults ────────────────────────────────────────────────────────
+SCAN_INTERVAL: float = 300.0   # seconds between full market-list polls (5 min)
+
+# Callable signature for the market-added callback.
+# Async: async def cb(condition_id: str, yes_token_id: str, no_token_id: str) -> None
+MarketCallback = Callable[[str, str, str], Awaitable[None]]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FeedRegistry
+# ═══════════════════════════════════════════════════════════════════════════
+
+class FeedRegistry:
+    """
+    Manages one MarketFeed asyncio.Task per active Polymarket binary market.
+
+    Each feed runs independently; they all push arb_tick dicts to the shared
+    queue supplied at construction.  add_market() is idempotent — calling it
+    for an already-tracked condition_id is a no-op.
+
+    Attributes
+    ----------
+    condition_ids : frozenset[str]
+        Snapshot of all condition IDs currently being fed.
+    active_count : int
+        Number of live feed tasks.
+    """
+
+    def __init__(self, queue: asyncio.Queue) -> None:
+        self._queue = queue
+        # condition_id → (MarketFeed, asyncio.Task)
+        self._feeds: dict[str, tuple[MarketFeed, asyncio.Task]] = {}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Public API
+    # ──────────────────────────────────────────────────────────────────────────
+
+    async def add_market(
+        self,
+        condition_id:  str,
+        yes_token_id:  str,
+        no_token_id:   str,
+    ) -> None:
+        """
+        Register a market and start its WebSocket feed task.
+
+        Idempotent — silently returns if condition_id is already tracked.
+        Logs an error (and does not crash) if the task cannot be created.
+        """
+        if condition_id in self._feeds:
+            return
+
+        try:
+            feed = MarketFeed(
+                yes_token_id=yes_token_id,
+                no_token_id=no_token_id,
+                condition_id=condition_id,
+                queue=self._queue,
+            )
+            task = asyncio.create_task(
+                feed.run(),
+                name=f"feed-{condition_id[:16]}",
+            )
+            self._feeds[condition_id] = (feed, task)
+            logger.info(
+                "FeedRegistry | feed started condition=%s yes=%s no=%s "
+                "(total_feeds=%d)",
+                condition_id[:16], yes_token_id[:12], no_token_id[:12],
+                len(self._feeds),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "FeedRegistry | failed to start feed for condition=%s: %s",
+                condition_id[:16], exc,
+            )
+
+    async def remove_market(self, condition_id: str) -> None:
+        """
+        Cancel and remove the feed for a specific condition ID.
+
+        Safe to call even if the market is not tracked (no-op in that case).
+        """
+        entry = self._feeds.pop(condition_id, None)
+        if entry is None:
+            return
+        feed, task = entry
+        feed.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        logger.info(
+            "FeedRegistry | feed removed condition=%s (remaining=%d)",
+            condition_id[:16], len(self._feeds),
+        )
+
+    async def stop_all(self) -> None:
+        """Cancel all feed tasks for clean shutdown."""
+        if not self._feeds:
+            return
+        logger.info("FeedRegistry | stopping %d feed(s) …", len(self._feeds))
+        for _cond_id, (feed, task) in list(self._feeds.items()):
+            feed.stop()
+            task.cancel()
+        await asyncio.gather(
+            *(task for _, task in self._feeds.values()),
+            return_exceptions=True,
+        )
+        self._feeds.clear()
+        logger.info("FeedRegistry | all feeds stopped")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Observability
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @property
+    def condition_ids(self) -> frozenset[str]:
+        """Snapshot of all currently tracked condition IDs."""
+        return frozenset(self._feeds.keys())
+
+    @property
+    def active_count(self) -> int:
+        """Number of live feed tasks."""
+        return len(self._feeds)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MarketScorer
+# ═══════════════════════════════════════════════════════════════════════════
+
+class MarketScorer:
+    """
+    Scores Gamma API market dicts by estimated maker-rebate yield per day.
+
+    Formula::
+
+        score = (volume_24h × maker_rebate_rate) / max(days_to_close, 1)
+
+    Higher score indicates more daily rebate income before expiry.
+    Used by MarketScanner to rank candidates when max_feeds > 0.
+    """
+
+    def score(self, market: dict) -> float:
+        """Return the priority score for a single Gamma API market object."""
+        raw_vol    = (
+            market.get("volume24hr")
+            or market.get("volume_24h")
+            or market.get("volume")
+            or 0.0
+        )
+        volume_24h  = float(raw_vol)
+        if not math.isfinite(volume_24h):
+            volume_24h = 0.0
+        rebate_rate = _resolve_rebate(str(market.get("category") or "")) or 0.0
+        days        = self._days_to_close(market)
+        if days <= 0:
+            return 0.0
+        return (volume_24h * rebate_rate) / days
+
+    @staticmethod
+    def _days_to_close(market: dict) -> float:
+        """
+        Return calendar days until market expiry, or 0.0 if expired/unknown.
+        """
+        raw = market.get("endDate") or market.get("end_date")
+        if not raw:
+            return 0.0
+        try:
+            end_dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            delta  = (end_dt - datetime.now(timezone.utc)).total_seconds()
+            return max(delta / 86_400.0, 0.0)
+        except (ValueError, TypeError):
+            return 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MarketScanner
+# ═══════════════════════════════════════════════════════════════════════════
+
+class MarketScanner:
+    """
+    Polls the Polymarket Gamma API for active binary markets and calls
+    on_market_added for each newly discovered market.
+
+    Deduplication
+    ─────────────
+    self._known tracks every condition_id that has already been dispatched so
+    the callback fires exactly once per market per process lifetime.  Pass
+    seed_condition_ids to pre-populate this set with markets that were seeded
+    via ENV or a config file so they are not re-added by the scanner.
+
+    Usage::
+
+        registry = FeedRegistry(queue)
+        scanner  = MarketScanner(on_market_added=registry.add_market)
+        asyncio.create_task(scanner.run(), name="scanner")
+    """
+
+    def __init__(
+        self,
+        on_market_added:    MarketCallback,
+        *,
+        scan_interval:      float = SCAN_INTERVAL,
+        seed_condition_ids: set[str] | None = None,
+        max_feeds:          int = 50,
+    ) -> None:
+        self._on_market_added = on_market_added
+        self._scan_interval   = scan_interval
+        self._known: set[str] = set(seed_condition_ids or [])
+        self._running         = False
+        self._max_feeds       = max(0, max_feeds)
+        self._scorer          = MarketScorer()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Public control
+    # ──────────────────────────────────────────────────────────────────────────
+
+    async def run(self) -> None:
+        """
+        Long-running scanner loop.  Performs an initial scan immediately on
+        startup, then sleeps scan_interval seconds between subsequent polls.
+        Cancel the task to stop cleanly.
+        """
+        self._running = True
+        logger.info(
+            "MarketScanner started | interval=%.0fs seed_count=%d max_feeds=%d",
+            self._scan_interval, len(self._known), self._max_feeds,
+        )
+
+        try:
+            while self._running:
+                try:
+                    await self._scan_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("MarketScanner scan error: %s", exc)
+
+                await asyncio.sleep(self._scan_interval)
+
+        except asyncio.CancelledError:
+            self._running = False
+            logger.info("MarketScanner stopped")
+            raise
+
+    def stop(self) -> None:
+        """Signal the scanner to stop after the current sleep expires."""
+        self._running = False
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Internal scan logic
+    # ──────────────────────────────────────────────────────────────────────────
+
+    async def _scan_once(self) -> None:
+        """
+        Fetch every active binary market from the Gamma API, call
+        on_market_added for any not yet in self._known.
+
+        When max_feeds > 0 all new candidates are scored and sorted by
+        MarketScorer before admission; only the top max_feeds are registered.
+        When max_feeds == 0 the original sequential behaviour is preserved.
+        """
+        _t0 = time.perf_counter()
+        try:
+            await self._scan_once_inner()
+        finally:
+            SCANNER_SCAN_DURATION.observe(time.perf_counter() - _t0)
+
+    async def _scan_once_inner(self) -> None:
+        markets = await self._fetch_all_active()
+        SCANNER_FEEDS_FETCHED.inc(len(markets))
+
+        if self._max_feeds == 0:
+            # ── original path (unchanged) ───────────────────────────────────
+            new_count = 0
+            for m in markets:
+                condition_id = _extract_condition_id(m)
+                if not condition_id or condition_id in self._known:
+                    continue
+
+                yes_id, no_id = _extract_token_ids(m)
+                if not yes_id or not no_id:
+                    logger.debug(
+                        "MarketScanner | %s skipped — could not parse YES/NO token IDs",
+                        condition_id[:16],
+                    )
+                    continue
+
+                self._known.add(condition_id)
+                new_count += 1
+                logger.info(
+                    "MarketScanner | new market condition=%s yes=%s no=%s",
+                    condition_id[:16], yes_id[:12], no_id[:12],
+                )
+                await self._on_market_added(condition_id, yes_id, no_id)
+
+            SCANNER_CANDIDATES.set(new_count)
+            SCANNER_ADMITTED.set(new_count)
+            logger.debug(
+                "MarketScanner scan done | new=%d total_known=%d",
+                new_count, len(self._known),
+            )
+            if new_count:
+                logger.info(
+                    "MarketScanner | %d new market(s) added | %d total tracked",
+                    new_count, len(self._known),
+                )
+            return
+
+        # ── priority scoring path ───────────────────────────────────────────
+        # Collect all unseen, parseable candidates then score once upfront.
+        # Tuple layout: (score, market_dict, cond_id, yes_id, no_id)
+        ScoredCandidate = tuple[float, dict, str, str, str]
+        scored_pairs: list[ScoredCandidate] = []
+        for m in markets:
+            condition_id = _extract_condition_id(m)
+            if not condition_id or condition_id in self._known:
+                continue
+            # Skip expired markets before scoring.
+            if MarketScorer._days_to_close(m) <= 0:
+                logger.debug(
+                    "MarketScanner | %s skipped — market expired",
+                    condition_id[:16],
+                )
+                continue
+            yes_id, no_id = _extract_token_ids(m)
+            if not yes_id or not no_id:
+                logger.debug(
+                    "MarketScanner | %s skipped — could not parse YES/NO token IDs",
+                    condition_id[:16],
+                )
+                continue
+            scored_pairs.append((self._scorer.score(m), m, condition_id, yes_id, no_id))
+
+        scored_pairs.sort(key=lambda t: t[0], reverse=True)
+        total_candidates = len(scored_pairs)
+
+        # Score distribution metrics — emit 0.0 sentinels when list is empty.
+        if scored_pairs:
+            all_scores = [s for s, *_ in scored_pairs]
+            SCANNER_SCORE_MIN.set(min(all_scores))
+            SCANNER_SCORE_MAX.set(max(all_scores))
+            SCANNER_SCORE_AVG.set(sum(all_scores) / len(all_scores))
+        else:
+            SCANNER_SCORE_MIN.set(0.0)
+            SCANNER_SCORE_MAX.set(0.0)
+            SCANNER_SCORE_AVG.set(0.0)
+
+        SCANNER_CANDIDATES.set(total_candidates)
+
+        # Log top-5 for observability.
+        for score, m, cond_id, _yes, _no in scored_pairs[:5]:
+            vol    = float(
+                m.get("volume24hr") or m.get("volume_24h") or m.get("volume") or 0.0
+            )
+            if not math.isfinite(vol):
+                vol = 0.0
+            days          = MarketScorer._days_to_close(m)
+            rebate        = _resolve_rebate(str(m.get("category") or "")) or 0.0
+            daily_rebate  = vol * rebate
+            logger.info(
+                "MarketScorer | top-5 condition=%s category=%s score=%.4f "
+                "volume_24h=%.2f days_to_close=%.1f rebate=%.2f%% "
+                "expected_daily_rebate=%.4f",
+                cond_id[:16], m.get("category", ""), score,
+                vol, days, rebate * 100, daily_rebate,
+            )
+
+        admitted = scored_pairs[: self._max_feeds]
+        SCANNER_ADMITTED.set(len(admitted))
+        logger.info(
+            "MarketScorer | total_candidates=%d admitted=%d (max_feeds=%d)",
+            total_candidates, len(admitted), self._max_feeds,
+        )
+
+        new_count = 0
+        for score, m, condition_id, yes_id, no_id in admitted:
+            self._known.add(condition_id)
+            new_count += 1
+            logger.info(
+                "MarketScanner | new market condition=%s yes=%s no=%s score=%.4f",
+                condition_id[:16], yes_id[:12], no_id[:12], score,
+            )
+            await self._on_market_added(condition_id, yes_id, no_id)
+
+        logger.debug(
+            "MarketScanner scan done | new=%d total_known=%d",
+            new_count, len(self._known),
+        )
+        if new_count:
+            logger.info(
+                "MarketScanner | %d new market(s) added | %d total tracked",
+                new_count, len(self._known),
+            )
+
+    async def _fetch_all_active(self) -> list[dict]:
+        """
+        Page through the Gamma API and collect all active, non-closed,
+        non-archived binary markets (clobTokenIds has exactly 2 entries).
+        """
+        results: list[dict] = []
+        cursor              = ""
+
+        async with aiohttp.ClientSession() as session:
+            while True:
+                params: dict[str, object] = {
+                    "active":   "true",
+                    "closed":   "false",
+                    "archived": "false",
+                    "limit":    _PAGE_LIMIT,
+                }
+                if cursor:
+                    params["next_cursor"] = cursor
+
+                data = None
+                for _attempt in range(3):
+                    try:
+                        async with session.get(
+                            _GAMMA_URL,
+                            params=params,
+                            timeout=aiohttp.ClientTimeout(total=30),
+                        ) as resp:
+                            resp.raise_for_status()
+                            data = await resp.json(content_type=None)
+                        break  # success
+                    except Exception as exc:  # noqa: BLE001
+                        if _attempt == 2:
+                            warnings.warn(
+                                f"Gamma API failed after 3 attempts: {exc} — "
+                                "returning partial results",
+                                RuntimeWarning,
+                                stacklevel=2,
+                            )
+                            logger.warning(
+                                "Gamma API failed after 3 attempts: %s", exc
+                            )
+                            return results
+                        await asyncio.sleep(0.5 * (2 ** _attempt))  # 0.5 s, 1.0 s
+                if data is None:
+                    return results
+
+                # The Gamma API may return a plain list or a paginated dict.
+                if isinstance(data, list):
+                    for m in data:
+                        if _is_binary(m):
+                            results.append(m)
+                    break  # plain list is never paginated
+
+                # Paginated response: {"data": [...], "next_cursor": "…"}
+                for m in data.get("data", []):
+                    if _is_binary(m):
+                        results.append(m)
+
+                cursor = data.get("next_cursor", "")
+                if not cursor or cursor == _END_CURSOR:
+                    break
+
+        return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helpers — Gamma API response parsing
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _is_binary(market: dict) -> bool:
+    """Return True if market has exactly 2 non-empty, distinct CLOB token IDs."""
+    ids = _raw_clob_ids(market)
+    return len(ids) == 2 and bool(ids[0]) and bool(ids[1]) and ids[0] != ids[1]
+
+
+def _raw_clob_ids(market: dict) -> list[str]:
+    """
+    Extract CLOB token IDs from a Gamma API market object.
+
+    The API may return clobTokenIds as:
+      - A JSON list:   ["0xYES", "0xNO"]
+      - A JSON string: '["0xYES", "0xNO"]'   (double-encoded)
+      - A nested list under "tokens": [{"token_id": "…"}, …]
+    """
+    raw = market.get("clobTokenIds") or market.get("clob_token_ids")
+    if isinstance(raw, list):
+        return [str(x) for x in raw if x]
+    if isinstance(raw, str):
+        # Unwrap double- or triple-encoded JSON strings.
+        decoded: object = raw
+        while isinstance(decoded, str):
+            try:
+                decoded = json.loads(decoded)
+            except (json.JSONDecodeError, ValueError):
+                # Try ast as a last resort, then give up.
+                try:
+                    decoded = ast.literal_eval(decoded)
+                except Exception:  # noqa: BLE001
+                    decoded = None
+                break
+        if isinstance(decoded, list):
+            return [str(x) for x in decoded if x]
+
+    # Fallback: parse from "tokens" array
+    tokens: list[dict] = market.get("tokens", [])
+    ids = [t.get("token_id", "") for t in tokens if isinstance(t, dict)]
+    return [x for x in ids if x]
+
+
+def _extract_condition_id(market: dict) -> str:
+    """Return the normalised condition ID hex string, or '' if missing."""
+    cid = (
+        market.get("conditionId")
+        or market.get("condition_id")
+        or ""
+    )
+    return str(cid).strip()
+
+
+def _extract_token_ids(market: dict) -> tuple[str, str]:
+    """
+    Return (yes_token_id, no_token_id).
+
+    Polymarket convention: clobTokenIds[0] = YES outcome, [1] = NO outcome.
+    Falls back to alphabetical sort when the "tokens" outcome labels are missing.
+    """
+    ids = _raw_clob_ids(market)
+    if len(ids) >= 2:
+        return ids[0], ids[1]
+
+    # Fallback: find YES/NO tokens by outcome label, then alphabetical order.
+    tokens: list[dict] = market.get("tokens", [])
+    if len(tokens) >= 2:
+        yes_tok = next(
+            (t for t in tokens if "yes" in str(t.get("outcome", "")).lower()), None
+        )
+        no_tok  = next(
+            (t for t in tokens if "no"  in str(t.get("outcome", "")).lower()), None
+        )
+        if yes_tok and no_tok and yes_tok is not no_tok:
+            return str(yes_tok.get("token_id", "")), str(no_tok.get("token_id", ""))
+        # Last resort: alphabetical sort by outcome label.
+        tokens_sorted = sorted(tokens, key=lambda t: str(t.get("outcome", "")).lower())
+        yes = str(tokens_sorted[0].get("token_id", ""))
+        no  = str(tokens_sorted[1].get("token_id", ""))
+        return yes, no
+
+    return "", ""

@@ -1,0 +1,947 @@
+"""
+strategy/arbitrage.py
+─────────────────────
+Low-latency pricing engine — MakerArbitrageMachine 2026 Edition.
+
+Mathematical model — binary markets
+─────────────────────────────────────
+At expiry, exactly one outcome token pays $1.00 USDC per share; the other
+pays $0.00.  Posting MAKER bids on both legs below their current best asks
+creates a Dutch Book position: if both fills execute, we are guaranteed to
+collect $1.00 while having paid strictly less.
+
+Dutch Book spread (gross, pre-rebate)
+──────────────────────────────────────
+    yes_bid = best_ask_yes − TICK_SIZE      ← synthetic post-only clamp
+    no_bid  = best_ask_no  − TICK_SIZE
+
+    gross_spread = 1.0 − (yes_bid + no_bid)
+                 = 1.0 − (best_ask_yes + best_ask_no − 2 × TICK_SIZE)
+
+Mathematical model — NegRisk multi-outcome markets
+───────────────────────────────────────────────────
+In a market with N mutually exclusive outcomes (O₁ … Oₙ), each outcome i has
+a NO token.  At expiry, exactly one outcome wins; N−1 NO tokens pay $1 each.
+
+Strategy: buy 1 NO share per outcome simultaneously (a "bundle").
+
+    no_bid_i      = no_ask_i − TICK_SIZE            ← synthetic post-only
+    combined_bid  = Σ no_bid_i                       (sum over all N legs)
+    payout        = N − 1                            (USDC at expiry)
+    effective_cost = combined_bid × (1 − maker_rebate)
+    net_edge      = payout − effective_cost
+    relative_edge = net_edge / payout                ← comparable across N
+
+Signal condition (NegRisk maker arb):
+    relative_edge > DESIRED_NET_MARGIN
+    ⟺ combined_bid < (N−1) × (1 − DESIRED_NET_MARGIN) / (1 − maker_rebate)
+
+2026 Dynamic Maker Rebate System
+─────────────────────────────────
+Polymarket pays a MAKER REBATE to liquidity providers whose resting orders
+get lifted by takers.  The rebate is a percentage of the filled notional and
+acts as a COST DEDUCTION, making our effective combined purchase price lower:
+
+    effective_cost = (yes_bid + no_bid) × (1 − maker_rebate_rate)
+
+    net_edge = 1.0 − effective_cost
+             = 1.0 − (yes_bid + no_bid) × (1 − maker_rebate_rate)
+
+2026 category-level rebate schedule
+─────────────────────────────────────
+  politics       0.0100  (1.00 %)   high-volume, lowest spread
+  crypto         0.0144  (1.44 %)   highest volatility → highest rebate
+  sports         0.0075  (0.75 %)
+  entertainment  0.0075  (0.75 %)
+  economy        0.0080  (0.80 %)
+  science        0.0060  (0.60 %)
+  other/unknown  0.0050  (0.50 %)   conservative default
+
+Signal condition (maker arb)
+─────────────────────────────
+    net_edge > DESIRED_NET_MARGIN
+    ⟺ (yes_bid + no_bid) < (1 − DESIRED_NET_MARGIN) / (1 − maker_rebate)
+
+Taker fallback (FeeEngine)
+───────────────────────────
+For FOK taker arb (used when maker queues are empty or fills are too slow),
+the taker fee is a COST ADDITION:
+
+    taker_net_edge = 1.0 − (yes_ask + no_ask) × (1 + taker_fee_rate)
+
+The FeeEngine fetches each market's fee from:
+  1. Gamma API  GET /markets?conditionId={id}  →  market.feeRate
+  2. CLOB API   GET /markets/{id}              →  takerBaseFee
+  3. DEFAULT_TAKER_FEE (conservative 2.0 %)
+
+Both engines cache their rates per condition_id with a 5-minute TTL.
+
+Public contract
+───────────────
+  MakerRebateEngine
+    async get_maker_rebate(condition_id: str) → float
+    prime_cache(condition_id, category_slug, fee_rate)
+
+  DutchBookPricer(desired_net_margin, default_rebate_rate)
+    evaluate_maker(condition_id, yes_token_id, no_token_id,
+                   yes_ask, no_ask, max_position_usdc,
+                   maker_rebate=None) → Optional[ArbSignal]
+
+  FeeEngine(default_fee)
+    async get_taker_fee(condition_id: str) → float
+    prime_cache(condition_id, fee_rate)
+
+  ArbDetector — backward-compatible taker-arb evaluator (unchanged API)
+    evaluate(condition_id, yes_token_id, no_token_id,
+             yes_ask, no_ask, max_position_usdc, fee_rate=None) → Optional[ArbSignal]
+
+  NegRiskArbDetector — N-outcome NegRisk maker arb (Phase 9)
+    evaluate_neg_risk(condition_id, outcome_token_ids, no_asks,
+                      max_position_usdc, maker_rebate=None) → Optional[NegRiskSignal]
+
+  ArbSignal fields (frozen dataclass):
+    condition_id    yes_token_id    no_token_id
+    yes_ask         no_ask          combined_cost   fee_rate    fee_cost    net_edge
+    yes_size        no_size
+    yes_bid*        no_bid*         maker_rebate*   maker_net_edge*
+    (* = 0.0 for taker-path signals; populated for maker-path signals)
+
+  ArbLeg fields (frozen dataclass, NegRisk per-outcome leg):
+    token_id    no_ask    no_bid    size
+
+  NegRiskSignal fields (frozen dataclass):
+    condition_id    n_outcomes      legs            combined_bid
+    payout          maker_rebate    effective_cost  net_edge
+    relative_edge   n_bundles
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+import aiohttp
+
+logger = logging.getLogger(__name__)
+
+# ── Maker rebate schedule — 2026 Polymarket category rates ──────────────────
+MAKER_REBATES: dict[str, float] = {
+    "politics":     0.0100,   # 1.00 %
+    "crypto":       0.0144,   # 1.44 %
+    "sports":       0.0075,   # 0.75 %
+    "entertainment":0.0075,   # 0.75 %
+    "economy":      0.0080,   # 0.80 %
+    "science":      0.0060,   # 0.60 %
+    # Any category not in this map falls back to DEFAULT_MAKER_REBATE
+}
+DEFAULT_MAKER_REBATE: float = 0.0050   # 0.50 % — conservative unknown-category default
+MAX_MAKER_REBATE:     float = 0.0200   # sanity clamp
+
+# ── Taker fee constants (used by FeeEngine / ArbDetector) ───────────────────
+DEFAULT_TAKER_FEE:  float = 0.0200   # 2.00 % — conservative fall-back
+MAX_TAKER_FEE:      float = 0.0400   # sanity clamp for implausibly high API values
+
+# ── Common constants ─────────────────────────────────────────────────────────
+DESIRED_NET_MARGIN: float = 0.0050   # 0.50 % minimum guaranteed profit per pair
+TICK_SIZE:          float = 0.001    # Polymarket minimum price increment (0.1 cent)
+
+# ── API endpoints ─────────────────────────────────────────────────────────────
+_CLOB_HOST   = "https://clob.polymarket.com"
+_GAMMA_HOST  = "https://gamma-api.polymarket.com"
+_CACHE_TTL   = 300.0   # 5-minute cache TTL for both engines
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MakerRebateEngine
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MakerRebateEngine:
+    """
+    Fetches and caches per-market maker rebate rates.
+
+    Resolution order for a cache miss:
+      1. Gamma API  /markets?conditionId={id}  →  market.category (slug)
+                                                   then MAKER_REBATES[category]
+      2. DEFAULT_MAKER_REBATE
+
+    Cache policy:  each condition_id is cached for CACHE_TTL seconds.
+
+    Usage::
+
+        engine   = MakerRebateEngine()
+        rebate   = await engine.get_maker_rebate("0xabc…")
+        # e.g. 0.0144 for a crypto market
+    """
+
+    def __init__(self, default_rebate: float = DEFAULT_MAKER_REBATE) -> None:
+        self._default = max(0.0, min(default_rebate, MAX_MAKER_REBATE))
+        # condition_id → (rebate_rate, cached_at_monotonic)
+        self._cache: dict[str, tuple[float, float]] = {}
+
+    async def get_maker_rebate(self, condition_id: str) -> float:
+        """
+        Return the maker rebate rate for a market as a fraction (0.0144 = 1.44 %).
+        Returns cached value if fresh; otherwise fetches from Gamma API.
+        """
+        cached = self._cache.get(condition_id)
+        if cached is not None:
+            rate, ts = cached
+            if time.monotonic() - ts < _CACHE_TTL:
+                return rate
+
+        rate = await self._fetch_rebate(condition_id)
+        self._cache[condition_id] = (rate, time.monotonic())
+        return rate
+
+    def prime_cache(
+        self,
+        condition_id:  str,
+        category_slug: str | None = None,
+        rebate_rate:   float | None = None,
+    ) -> None:
+        """
+        Pre-populate cache (e.g. from config file or test fixture).
+        If rebate_rate is given it is used directly; otherwise the category slug
+        is resolved against MAKER_REBATES.
+        """
+        if rebate_rate is not None:
+            rate = max(0.0, min(rebate_rate, MAX_MAKER_REBATE))
+        elif category_slug is not None:
+            rate = _resolve_rebate(category_slug)
+        else:
+            rate = self._default
+        self._cache[condition_id] = (rate, time.monotonic())
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Internal
+    # ──────────────────────────────────────────────────────────────────────────
+
+    async def _fetch_rebate(self, condition_id: str) -> float:
+        """Query Gamma API for market category, then look up the rebate."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{_GAMMA_HOST}/markets",
+                    params={"conditionId": condition_id},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        return self._default
+                    data = await resp.json(content_type=None)
+
+            markets = data if isinstance(data, list) else data.get("data", [])
+            if not markets:
+                return self._default
+
+            market   = markets[0]
+            category = (
+                market.get("category")
+                or market.get("market_type")
+                or market.get("type")
+                or ""
+            )
+            rate = _resolve_rebate(str(category))
+            logger.debug(
+                "MakerRebateEngine | %s → category=%r rebate=%.4f (%.2f%%)",
+                condition_id[:16], category, rate, rate * 100,
+            )
+            return rate
+
+        except Exception as exc:
+            logger.debug(
+                "MakerRebateEngine | Gamma API error for %s: %s",
+                condition_id[:16], exc,
+            )
+            return self._default
+
+
+def _resolve_rebate(category: str) -> float:
+    """Map a category string to the closest MAKER_REBATES entry."""
+    slug = category.strip().lower()
+    # Direct match
+    if slug in MAKER_REBATES:
+        return MAKER_REBATES[slug]
+    # Partial match (e.g. "us-politics" → "politics")
+    for key, rate in MAKER_REBATES.items():
+        if key in slug or slug in key:
+            return rate
+    return DEFAULT_MAKER_REBATE
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ArbSignal (extended for both taker and maker paths)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class ArbSignal:
+    """
+    Describes a viable arbitrage opportunity on a Polymarket binary market.
+
+    Populated by either:
+      • ArbDetector.evaluate()     — taker path  (yes_bid/no_bid = 0.0)
+      • DutchBookPricer.evaluate_maker() — maker path  (yes_bid/no_bid set)
+
+    All prices are USDC per share (range 0.01 – 0.99).
+    Sizes are number of shares (Polymarket minimum increment 0.01).
+    """
+    condition_id:   str
+    yes_token_id:   str
+    no_token_id:    str
+    yes_ask:        float   # best ask for YES leg  (taker entry point)
+    no_ask:         float   # best ask for NO leg
+    combined_cost:  float   # yes_ask + no_ask  (gross cost per share-pair)
+    fee_rate:       float   # taker fee rate applied  (fraction, e.g. 0.02 = 2 %)
+    fee_cost:       float   # combined_cost × fee_rate  (taker fee USDC per pair)
+    net_edge:       float   # 1 − combined_cost × (1 + fee_rate)  — taker net profit
+    yes_size:       float   # shares to buy / bid on YES leg
+    no_size:        float   # shares to buy / bid on NO leg
+
+    # ── Maker-path fields (populated by DutchBookPricer; 0.0 for taker signals)
+    yes_bid:        float = 0.0   # synthetic post-only bid for YES (ask − TICK)
+    no_bid:         float = 0.0   # synthetic post-only bid for NO  (ask − TICK)
+    maker_rebate:   float = 0.0   # maker rebate rate for this market
+    maker_net_edge: float = 0.0   # 1 − (yes_bid+no_bid)×(1−maker_rebate)
+
+    @property
+    def is_maker_signal(self) -> bool:
+        return self.yes_bid > 0.0 and self.no_bid > 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NegRisk data structures (Phase 9)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class ArbLeg:
+    """
+    A single NO-side leg in a NegRisk multi-outcome arbitrage bundle.
+
+    Produced by `NegRiskArbDetector.evaluate_neg_risk()`.  Pass token_id,
+    no_bid, and size to `BundleLeg` (core/clob_client.py) when submitting.
+    """
+    token_id: str
+    no_ask:   float   # best ask from WS feed
+    no_bid:   float   # synthetic post-only bid (no_ask − TICK_SIZE)
+    size:     float   # shares per bundle (= n_bundles)
+
+
+@dataclass(frozen=True)
+class NegRiskSignal:
+    """
+    Describes a viable NegRisk arbitrage opportunity across N mutually
+    exclusive outcomes.
+
+    Produced by `NegRiskArbDetector.evaluate_neg_risk()`.
+
+    All costs/profits are USDC per bundle (one NO share per outcome).
+
+    Fields
+    ------
+    condition_id   : Polymarket condition ID of the parent market.
+    n_outcomes     : Number of outcomes (= len(legs)).
+    legs           : Per-outcome ArbLeg tuple, order preserved from input.
+    combined_bid   : Σ leg.no_bid — total USDC spent per bundle.
+    payout         : N − 1 — USDC collected at expiry per bundle.
+    maker_rebate   : Rebate rate applied (fraction, e.g. 0.0100 = 1 %).
+    effective_cost : combined_bid × (1 − maker_rebate).
+    net_edge       : payout − effective_cost  (absolute USDC profit / bundle).
+    relative_edge  : net_edge / payout  (comparable to binary DESIRED_NET_MARGIN).
+    n_bundles      : Bundles fitting within max_position_usdc (floor to 2 d.p.).
+    """
+    condition_id:   str
+    n_outcomes:     int
+    legs:           tuple[ArbLeg, ...]
+    combined_bid:   float
+    payout:         float
+    maker_rebate:   float
+    effective_cost: float
+    net_edge:       float
+    relative_edge:  float
+    n_bundles:      float
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DutchBookPricer — maker-arb pricing engine
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class DutchBookPricer:
+    """
+    2026 maker-rebate-aware Dutch Book pricing engine.
+
+    Signal condition:
+        net_edge = 1.0 − (yes_bid + no_bid) × (1 − maker_rebate) > desired_net_margin
+
+    Equivalently:
+        (yes_bid + no_bid) < (1 − desired_net_margin) / (1 − maker_rebate)
+
+    where:
+        yes_bid = best_ask_yes − TICK_SIZE   ← synthetic post-only clamp
+        no_bid  = best_ask_no  − TICK_SIZE
+
+    Usage::
+
+        pricer       = DutchBookPricer()
+        rebate_engine = MakerRebateEngine()
+
+        # In the strategy loop (maker path):
+        rebate = await rebate_engine.get_maker_rebate(condition_id)
+        signal = pricer.evaluate_maker(
+            condition_id, yes_token_id, no_token_id,
+            yes_ask, no_ask,
+            max_position_usdc=50.0,
+            maker_rebate=rebate,
+        )
+        if signal:
+            yes_resp, no_resp = await client.execute_arb_maker_pair(
+                yes_token_id, signal.yes_bid, signal.yes_size,
+                no_token_id,  signal.no_bid,  signal.no_size,
+            )
+            inventory_manager.register_maker_pair(signal, yes_resp, no_resp)
+    """
+
+    def __init__(
+        self,
+        desired_net_margin:  float = DESIRED_NET_MARGIN,
+        default_rebate_rate: float = DEFAULT_MAKER_REBATE,
+    ) -> None:
+        if not (0.0 < desired_net_margin < 1.0):
+            raise ValueError(
+                f"desired_net_margin must be in (0, 1); got {desired_net_margin}"
+            )
+        self._net_margin     = desired_net_margin
+        self._default_rebate = max(0.0, min(default_rebate_rate, MAX_MAKER_REBATE))
+
+    def evaluate_maker(
+        self,
+        condition_id:      str,
+        yes_token_id:      str,
+        no_token_id:       str,
+        yes_ask:           float,   # best ask from WS feed
+        no_ask:            float,   # best ask from WS feed
+        max_position_usdc: float = 50.0,
+        maker_rebate:      float | None = None,
+    ) -> Optional[ArbSignal]:
+        """
+        Evaluate a Dutch Book opportunity using synthetic post-only maker bids.
+
+        Steps:
+          1. Clamp bids below respective best asks (post-only safety)
+          2. Resolve maker rebate rate
+          3. Calculate effective_cost = (yes_bid + no_bid) × (1 − rebate)
+          4. Check net_edge = 1.0 − effective_cost > desired_net_margin
+          5. Size the position: n_shares × (yes_bid + no_bid) ≤ max_position_usdc
+          6. Return ArbSignal or None
+
+        Parameters
+        ----------
+        yes_ask / no_ask   : Current best asks from the WS feed.
+        max_position_usdc  : Hard capital ceiling ($50 from CircuitBreaker).
+        maker_rebate       : Pre-fetched rebate from MakerRebateEngine.
+                             Pass None to use the conservative default.
+        """
+        # ── 1. Validate ask prices ────────────────────────────────────────────
+        if not (0.01 <= yes_ask <= 0.99 and 0.01 <= no_ask <= 0.99):
+            logger.debug(
+                "DutchBookPricer | invalid asks yes=%.4f no=%.4f — skip",
+                yes_ask, no_ask,
+            )
+            return None
+
+        # ── 2. Apply synthetic post-only clamp (stay below the ask) ──────────
+        yes_bid = round(max(0.01, yes_ask - TICK_SIZE), 3)
+        no_bid  = round(max(0.01, no_ask  - TICK_SIZE), 3)
+
+        # ── 3. Resolve maker rebate ───────────────────────────────────────────
+        rebate = (
+            max(0.0, min(maker_rebate, MAX_MAKER_REBATE))
+            if maker_rebate is not None
+            else self._default_rebate
+        )
+
+        # ── 4. Dutch Book spread with rebate as net-cost deduction ───────────
+        combined_bid    = yes_bid + no_bid
+        effective_cost  = combined_bid * (1.0 - rebate)   # rebate lowers our cost
+        maker_net_edge  = round(1.0 - effective_cost, 6)
+
+        # Dynamic threshold: edge must exceed required net margin
+        if maker_net_edge <= self._net_margin:
+            logger.debug(
+                "DutchBookPricer | no edge — yes_bid=%.4f no_bid=%.4f "
+                "combined=%.6f rebate=%.4f(%.2f%%) effective=%.6f edge=%.6f < margin=%.4f",
+                yes_bid, no_bid, combined_bid,
+                rebate, rebate * 100, effective_cost,
+                maker_net_edge, self._net_margin,
+            )
+            return None
+
+        # ── 5. Size within the hard capital ceiling ───────────────────────────
+        if combined_bid <= 0.0:
+            return None
+
+        raw_shares = max_position_usdc / combined_bid
+        n_shares   = math.floor(raw_shares * 100) / 100.0   # floor to 2 d.p.
+
+        if n_shares < 0.01:
+            logger.warning(
+                "DutchBookPricer | n_shares %.4f below minimum "
+                "(yes_bid=%.4f no_bid=%.4f combined=%.4f cap=%.2f)",
+                n_shares, yes_bid, no_bid, combined_bid, max_position_usdc,
+            )
+            return None
+
+        # ── 6. Populate full ArbSignal (maker fields + taker fields for compat)
+        spread_bps = round(maker_net_edge * 10_000, 1)
+        signal = ArbSignal(
+            condition_id=condition_id,
+            yes_token_id=yes_token_id,
+            no_token_id=no_token_id,
+            yes_ask=yes_ask,
+            no_ask=no_ask,
+            combined_cost=round(combined_bid, 6),   # bid-based combined cost
+            fee_rate=0.0,                            # no taker fee on maker fills
+            fee_cost=0.0,
+            net_edge=round(1.0 - combined_bid, 6),  # gross Dutch Book spread
+            yes_size=n_shares,
+            no_size=n_shares,
+            # Maker-path fields
+            yes_bid=yes_bid,
+            no_bid=no_bid,
+            maker_rebate=round(rebate, 6),
+            maker_net_edge=maker_net_edge,
+        )
+
+        logger.info(
+            "DUTCH BOOK SIGNAL | condition=%s "
+            "yes_ask=%.4f→bid=%.4f no_ask=%.4f→bid=%.4f "
+            "rebate=%.2f%% effective_cost=%.6f maker_net_edge=%.6f(%+.1f bps) "
+            "shares=%.2f",
+            condition_id[:16],
+            yes_ask, yes_bid, no_ask, no_bid,
+            rebate * 100, effective_cost, maker_net_edge, spread_bps,
+            n_shares,
+        )
+        return signal
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FeeEngine — taker fee cache (unchanged from Phase 7; kept for taker fallback)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class FeeEngine:
+    """
+    Fetches and caches per-market Polymarket taker fee rates.
+
+    Resolution order for a cache miss:
+      1. Gamma API  /markets?conditionId={id}  →  feeRate  (fraction or bps)
+      2. CLOB API   /markets/{id}              →  takerBaseFee
+      3. DEFAULT_TAKER_FEE (conservative 2.0 %)
+
+    Usage::
+
+        fee_engine = FeeEngine()
+        fee = await fee_engine.get_taker_fee("0xabc…")   # e.g. 0.02
+    """
+
+    def __init__(self, default_fee: float = DEFAULT_TAKER_FEE) -> None:
+        self._default = default_fee
+        self._cache: dict[str, tuple[float, float]] = {}
+
+    async def get_taker_fee(self, condition_id: str) -> float:
+        """Return the taker fee rate as a fraction (0.02 = 2.0 %)."""
+        cached = self._cache.get(condition_id)
+        if cached is not None:
+            fee, ts = cached
+            if time.monotonic() - ts < _CACHE_TTL:
+                return fee
+
+        fee = await self._fetch_fee(condition_id)
+        self._cache[condition_id] = (fee, time.monotonic())
+        return fee
+
+    def prime_cache(self, condition_id: str, fee_rate: float) -> None:
+        self._cache[condition_id] = (fee_rate, time.monotonic())
+
+    async def _fetch_fee(self, condition_id: str) -> float:
+        fee = await self._try_gamma(condition_id)
+        if fee is not None:
+            logger.debug(
+                "FeeEngine | Gamma fee for %s → %.4f (%.2f%%)",
+                condition_id[:16], fee, fee * 100,
+            )
+            return fee
+        fee = await self._try_clob(condition_id)
+        if fee is not None:
+            logger.debug(
+                "FeeEngine | CLOB fee for %s → %.4f (%.2f%%)",
+                condition_id[:16], fee, fee * 100,
+            )
+            return fee
+        logger.debug(
+            "FeeEngine | using default %.4f for %s",
+            self._default, condition_id[:16],
+        )
+        return self._default
+
+    async def _try_gamma(self, condition_id: str) -> float | None:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{_GAMMA_HOST}/markets",
+                    params={"conditionId": condition_id},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json(content_type=None)
+            markets = data if isinstance(data, list) else data.get("data", [])
+            if not markets:
+                return None
+            market = markets[0]
+            for fld in ("feeRate", "fee_rate", "fee"):
+                raw = market.get(fld)
+                if raw is not None:
+                    return _normalise_fee(raw)
+        except Exception as exc:
+            logger.debug("FeeEngine | Gamma API error for %s: %s", condition_id[:16], exc)
+        return None
+
+    async def _try_clob(self, condition_id: str) -> float | None:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{_CLOB_HOST}/markets/{condition_id}",
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json(content_type=None)
+            for fld in ("takerBaseFee", "taker_base_fee"):
+                raw = data.get(fld)
+                if raw is not None:
+                    return _normalise_fee(raw)
+        except Exception as exc:
+            logger.debug("FeeEngine | CLOB API error for %s: %s", condition_id[:16], exc)
+        return None
+
+
+def _normalise_fee(raw: object) -> float | None:
+    """
+    Normalise a raw fee value to a fraction in [0, MAX_TAKER_FEE].
+    Handles basis-point integers (100 → 0.0100) and fractions (0.02 → 0.0200).
+    """
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if val < 0:
+        return None
+    fraction = val / 10_000 if val > 1.0 else val
+    return fraction if fraction <= MAX_TAKER_FEE else None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ArbDetector — backward-compatible taker arb evaluator
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ArbDetector:
+    """
+    Fee-aware taker arbitrage signal detector (FOK market orders).
+
+    Trigger condition:
+        (P_yes + P_no) × (1 + fee_rate) + desired_net_margin < 1.0
+
+    API is unchanged from Phase 7 — the `yes_bid` / `no_bid` fields on the
+    returned ArbSignal are 0.0 (taker path does not clamp bids).
+
+    Usage::
+
+        detector   = ArbDetector()
+        fee_engine = FeeEngine()
+        fee_rate   = await fee_engine.get_taker_fee(condition_id)
+        signal     = detector.evaluate(
+                         condition_id, yes_token_id, no_token_id,
+                         yes_ask, no_ask,
+                         max_position_usdc=50.0,
+                         fee_rate=fee_rate,
+                     )
+        if signal:
+            await client.execute_arb_pair(...)
+    """
+
+    def __init__(
+        self,
+        desired_net_margin: float = DESIRED_NET_MARGIN,
+        default_fee_rate:   float = DEFAULT_TAKER_FEE,
+    ) -> None:
+        if not (0.0 < desired_net_margin < 1.0):
+            raise ValueError(
+                f"desired_net_margin must be in (0, 1); got {desired_net_margin}"
+            )
+        if not (0.0 <= default_fee_rate <= MAX_TAKER_FEE):
+            raise ValueError(
+                f"default_fee_rate must be in [0, {MAX_TAKER_FEE}]; got {default_fee_rate}"
+            )
+        self._net_margin  = desired_net_margin
+        self._default_fee = default_fee_rate
+
+    def evaluate(
+        self,
+        condition_id:      str,
+        yes_token_id:      str,
+        no_token_id:       str,
+        yes_ask:           float,
+        no_ask:            float,
+        max_position_usdc: float = 50.0,
+        fee_rate:          float | None = None,
+    ) -> Optional[ArbSignal]:
+        """
+        Evaluate whether a YES/NO best-ask pair offers a taker fee-adjusted edge.
+
+        Returns ArbSignal when (yes_ask + no_ask) × (1 + fee_rate) < 1 − margin.
+        Returns None otherwise.
+        """
+        if not (0.01 <= yes_ask <= 0.99 and 0.01 <= no_ask <= 0.99):
+            logger.debug(
+                "ArbDetector | invalid prices yes=%.4f no=%.4f — skip",
+                yes_ask, no_ask,
+            )
+            return None
+
+        effective_fee  = max(0.0, min(fee_rate if fee_rate is not None else self._default_fee, MAX_TAKER_FEE))
+        combined_cost  = yes_ask + no_ask
+        fee_cost       = combined_cost * effective_fee
+        adjusted_cost  = combined_cost * (1.0 + effective_fee)
+
+        if adjusted_cost >= 1.0 - self._net_margin:
+            logger.debug(
+                "ArbDetector | no edge — adjusted=%.6f fee=%.2f%% threshold=%.6f",
+                adjusted_cost, effective_fee * 100, 1.0 - self._net_margin,
+            )
+            return None
+
+        net_edge = round(1.0 - adjusted_cost, 6)
+
+        if combined_cost <= 0.0:
+            return None
+        raw_shares = max_position_usdc / combined_cost
+        n_shares   = math.floor(raw_shares * 100) / 100.0
+
+        if n_shares < 0.01:
+            logger.warning(
+                "ArbDetector | n_shares=%.4f below minimum "
+                "(yes=%.4f no=%.4f combined=%.4f cap=%.2f)",
+                n_shares, yes_ask, no_ask, combined_cost, max_position_usdc,
+            )
+            return None
+
+        spread_bps = round(net_edge * 10_000, 1)
+        signal = ArbSignal(
+            condition_id=condition_id,
+            yes_token_id=yes_token_id,
+            no_token_id=no_token_id,
+            yes_ask=yes_ask,
+            no_ask=no_ask,
+            combined_cost=round(combined_cost, 6),
+            fee_rate=round(effective_fee, 6),
+            fee_cost=round(fee_cost, 6),
+            net_edge=net_edge,
+            yes_size=n_shares,
+            no_size=n_shares,
+        )
+
+        logger.info(
+            "ARB SIGNAL | condition=%s yes=%.4f no=%.4f combined=%.6f "
+            "fee=%.2f%% net_edge=%.6f(%+.1f bps) shares=%.2f",
+            condition_id[:16], yes_ask, no_ask, combined_cost,
+            effective_fee * 100, net_edge, spread_bps, n_shares,
+        )
+        return signal
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NegRiskArbDetector — N-outcome NegRisk maker arb (Phase 9)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class NegRiskArbDetector:
+    """
+    Negative Risk multi-outcome arbitrage detector (maker path).
+
+    Strategy: simultaneously post synthetic post-only BUY bids on the NO token
+    of every mutually exclusive outcome.  At expiry N−1 of the N NO tokens pay
+    $1, guaranteeing a positive return when the bundle cost is low enough.
+
+    NegRisk formula (per bundle of 1 NO share per outcome):
+    ─────────────────────────────────────────────────────────
+        no_bid_i      = no_ask_i − TICK_SIZE
+        combined_bid  = Σ no_bid_i
+        payout        = N − 1
+        effective_cost = combined_bid × (1 − maker_rebate)
+        net_edge      = payout − effective_cost
+        relative_edge = net_edge / payout       ← normalised; directly comparable
+                                                   to DESIRED_NET_MARGIN (binary)
+
+    Signal condition:
+        relative_edge > DESIRED_NET_MARGIN
+
+    Usage::
+
+        detector      = NegRiskArbDetector()
+        rebate_engine = MakerRebateEngine()
+
+        rebate = await rebate_engine.get_maker_rebate(condition_id)
+        signal = detector.evaluate_neg_risk(
+            condition_id       = condition_id,
+            outcome_token_ids  = [no_token_A, no_token_B, no_token_C],
+            no_asks            = [ask_A, ask_B, ask_C],
+            max_position_usdc  = 50.0,
+            maker_rebate       = rebate,
+        )
+        if signal:
+            bundle_legs = [
+                BundleLeg(token_id=leg.token_id, bid=leg.no_bid, size=leg.size)
+                for leg in signal.legs
+            ]
+            responses = await client.execute_arb_maker_bundle(bundle_legs)
+    """
+
+    def __init__(
+        self,
+        desired_net_margin:  float = DESIRED_NET_MARGIN,
+        default_rebate_rate: float = DEFAULT_MAKER_REBATE,
+    ) -> None:
+        if not (0.0 < desired_net_margin < 1.0):
+            raise ValueError(
+                f"desired_net_margin must be in (0, 1); got {desired_net_margin}"
+            )
+        self._net_margin     = desired_net_margin
+        self._default_rebate = max(0.0, min(default_rebate_rate, MAX_MAKER_REBATE))
+
+    def evaluate_neg_risk(
+        self,
+        condition_id:       str,
+        outcome_token_ids:  list[str],    # NO token ID for each of the N outcomes
+        no_asks:            list[float],  # corresponding best NO asks from WS feed
+        max_position_usdc:  float = 50.0,
+        maker_rebate:       float | None = None,
+    ) -> Optional[NegRiskSignal]:
+        """
+        Evaluate whether buying NO on all N outcomes yields a NegRisk edge.
+
+        Parameters
+        ----------
+        condition_id      : Polymarket condition ID (used for logging).
+        outcome_token_ids : NO token IDs — one per outcome, same order as no_asks.
+        no_asks           : Current best NO asks from the WS feed.
+        max_position_usdc : Hard capital ceiling (default $50; enforced again by
+                            execute_arb_maker_bundle).
+        maker_rebate      : Pre-fetched rate from MakerRebateEngine.  Pass None
+                            to use the conservative default.
+
+        Returns
+        -------
+        NegRiskSignal if relative_edge > DESIRED_NET_MARGIN, else None.
+        """
+        n = len(outcome_token_ids)
+
+        # ── 1. Basic validation ───────────────────────────────────────────────
+        if n != len(no_asks):
+            logger.error(
+                "NegRiskArbDetector | token_ids length %d ≠ no_asks length %d",
+                n, len(no_asks),
+            )
+            return None
+
+        if n < 2:
+            logger.debug(
+                "NegRiskArbDetector | need ≥ 2 outcomes; got %d — skip", n
+            )
+            return None
+
+        # ── 2. Validate all ask prices ────────────────────────────────────────
+        for i, ask in enumerate(no_asks):
+            if not (0.01 <= ask <= 0.99):
+                logger.debug(
+                    "NegRiskArbDetector | outcome %d invalid no_ask=%.4f — skip",
+                    i, ask,
+                )
+                return None
+
+        # ── 3. Synthetic post-only NO bids ────────────────────────────────────
+        no_bids = [round(max(0.01, ask - TICK_SIZE), 3) for ask in no_asks]
+
+        # ── 4. Resolve maker rebate ───────────────────────────────────────────
+        rebate = (
+            max(0.0, min(maker_rebate, MAX_MAKER_REBATE))
+            if maker_rebate is not None
+            else self._default_rebate
+        )
+
+        # ── 5. NegRisk math ───────────────────────────────────────────────────
+        payout         = float(n - 1)
+        combined_bid   = sum(no_bids)
+        effective_cost = combined_bid * (1.0 - rebate)
+        net_edge       = round(payout - effective_cost, 6)
+        relative_edge  = round(net_edge / payout, 6)
+
+        if relative_edge <= self._net_margin:
+            logger.debug(
+                "NegRiskArbDetector | no edge — outcomes=%d combined=%.6f "
+                "payout=%.1f rebate=%.4f(%.2f%%) effective=%.6f "
+                "relative_edge=%.6f < margin=%.4f",
+                n, combined_bid, payout, rebate, rebate * 100,
+                effective_cost, relative_edge, self._net_margin,
+            )
+            return None
+
+        # ── 6. Size within capital ceiling ────────────────────────────────────
+        if combined_bid <= 0.0:
+            return None
+
+        raw_bundles = max_position_usdc / combined_bid
+        n_bundles   = math.floor(raw_bundles * 100) / 100.0
+
+        if n_bundles < 0.01:
+            logger.warning(
+                "NegRiskArbDetector | n_bundles %.4f below minimum "
+                "(combined_bid=%.4f cap=%.2f)",
+                n_bundles, combined_bid, max_position_usdc,
+            )
+            return None
+
+        # ── 7. Build per-outcome leg tuple ────────────────────────────────────
+        legs = tuple(
+            ArbLeg(
+                token_id=token_id,
+                no_ask=ask,
+                no_bid=bid,
+                size=n_bundles,
+            )
+            for token_id, ask, bid in zip(outcome_token_ids, no_asks, no_bids)
+        )
+
+        spread_bps = round(relative_edge * 10_000, 1)
+        signal = NegRiskSignal(
+            condition_id=condition_id,
+            n_outcomes=n,
+            legs=legs,
+            combined_bid=round(combined_bid, 6),
+            payout=payout,
+            maker_rebate=round(rebate, 6),
+            effective_cost=round(effective_cost, 6),
+            net_edge=net_edge,
+            relative_edge=relative_edge,
+            n_bundles=n_bundles,
+        )
+
+        logger.info(
+            "NEG RISK SIGNAL | condition=%s outcomes=%d "
+            "combined_bid=%.6f payout=%.1f rebate=%.2f%% "
+            "effective=%.6f net_edge=%.6f relative=%.6f(%+.1f bps) bundles=%.2f",
+            condition_id[:16], n,
+            combined_bid, payout, rebate * 100,
+            effective_cost, net_edge, relative_edge, spread_bps, n_bundles,
+        )
+        return signal

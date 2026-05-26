@@ -1,0 +1,93 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# polymarket-sniper.service
+# Polymarket CLOB Sniper Bot — systemd unit for Ubuntu VPS
+#
+# SETUP (run as root or with sudo):
+# ──────────────────────────────────
+#  1. Clone the project to your VPS, e.g.:
+#       git clone <repo> /opt/polymarket-sniper
+#
+#  2. Create and activate a Python virtualenv, then install dependencies:
+#       python3 -m venv /opt/polymarket-sniper/.venv
+#       /opt/polymarket-sniper/.venv/bin/pip install -r /opt/polymarket-sniper/requirements.txt
+#
+#  3. Copy and populate the .env file:
+#       cp /opt/polymarket-sniper/.env.example /opt/polymarket-sniper/.env
+#       nano /opt/polymarket-sniper/.env
+#
+#  4. Lock down .env permissions so only the service user can read it:
+#       chown sniper:sniper /opt/polymarket-sniper/.env
+#       chmod 600 /opt/polymarket-sniper/.env
+#
+#  5. Create a dedicated non-root system user (recommended):
+#       useradd --system --no-create-home --shell /usr/sbin/nologin sniper
+#       chown -R sniper:sniper /opt/polymarket-sniper
+#
+#  6. Replace the two EDIT_ME placeholders below, then install:
+#       cp /opt/polymarket-sniper/polymarket-sniper.service /etc/systemd/system/
+#       systemctl daemon-reload
+#       systemctl enable --now polymarket-sniper
+#
+#  7. Tail live logs:
+#       journalctl -u polymarket-sniper -f
+# ══════════════════════════════════════════════════════════════════════════════
+
+[Unit]
+Description=Polymarket CLOB Sniper Bot
+Documentation=https://github.com/polymarket/py-clob-client
+# Start only after the network stack is fully up (resolves DNS, routes ready)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# ── Identity ────────────────────────────────────────────────────────────────
+# Replace with the non-root user you created in step 5 above.
+User=sniper
+Group=sniper
+
+# ── File paths ───────────────────────────────────────────────────────────────
+# All paths MUST be absolute.  Replace /opt/polymarket-sniper with your actual
+# project root if it differs.
+WorkingDirectory=/opt/polymarket-sniper
+
+# Load secrets into the process environment before exec.
+# python-dotenv in main.py also loads this file, so the settings are applied
+# twice — harmless, and the systemd copy ensures env vars are available even
+# if dotenv is later removed.
+EnvironmentFile=/opt/polymarket-sniper/.env
+
+# ── Execution ────────────────────────────────────────────────────────────────
+# Use the virtualenv interpreter, not the system Python.
+ExecStart=/opt/polymarket-sniper/.venv/bin/python main.py
+
+# ── Restart policy ───────────────────────────────────────────────────────────
+# Restart on any non-zero exit, including unhandled exceptions.
+# on-failure covers crashes, OOM kills, and segfaults.
+# on-abnormal additionally covers watchdog timeouts (not used here).
+Restart=on-failure
+RestartSec=5s
+
+# Cap restart attempts to avoid a spinning crash loop.
+# After StartLimitBurst restarts within StartLimitIntervalSec the unit is
+# moved to a failed state — alert and investigate before re-enabling.
+StartLimitIntervalSec=120s
+StartLimitBurst=5
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+# Route both stdout and stderr to the systemd journal.
+# Query with: journalctl -u polymarket-sniper -f
+# Or with timestamps: journalctl -u polymarket-sniper --since "1 hour ago"
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polymarket-sniper
+
+# ── Hardening (principle of least privilege) ─────────────────────────────────
+# Remove dangerous capabilities the bot never needs.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# Allow the bot to write daily_state.json inside the project directory.
+ReadWritePaths=/opt/polymarket-sniper
+
+[Install]
+WantedBy=multi-user.target

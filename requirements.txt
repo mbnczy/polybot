@@ -1,0 +1,27 @@
+# Polymarket Arb Bot — Python dependencies
+# Install inside a virtualenv:
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+# Polymarket CLOB SDK (order signing, ECDSA, REST API)
+py-clob-client>=0.18.0
+
+# Async HTTP client + WebSocket transport (ws_feed + telegram notifier)
+aiohttp>=3.9.0
+
+# .env file loader (must be loaded before any os.environ access in main.py)
+python-dotenv>=1.0.0
+
+# High-performance asyncio event loop (replaces default CPython loop)
+uvloop>=0.19.0
+
+# Async SQLite driver (WAL-mode signal logger — telemetry/db_logger.py)
+aiosqlite>=0.20.0
+
+# ── Phase 13: backtesting dependencies ───────────────────────────────────────
+
+# Kaggle dataset downloader — non-interactive, reads KAGGLE_KEY env var
+# (backtest/data_handler.py)
+kagglehub>=0.3.0
+
+# DataFrame parsing for Kaggle CSV ingestion (backtest/data_handler.py)
+pandas>=2.1.0
