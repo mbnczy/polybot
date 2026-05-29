@@ -43,6 +43,7 @@ before the next tick is loaded.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -257,23 +258,12 @@ class HistoricalDataFeed:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _load_and_normalise_csv(self, path: Path) -> pd.DataFrame:
-        """
-        Load the CSV and normalise column names to lowercase_snake_case so
-        the rest of the code is independent of exact capitalisation variants
-        in the Kaggle dataset.
-        """
         df = pd.read_csv(path, nrows=self._max_rows, low_memory=False)
         logger.info(
             "HistoricalDataFeed | loaded %d rows — columns: %s",
             len(df), list(df.columns),
         )
-
-        # Normalise: strip whitespace, lowercase, spaces/hyphens → underscores
-        df = df.rename(columns={
-            col: col.strip().lower().replace(" ", "_").replace("-", "_")
-            for col in df.columns
-        })
-        return df
+        return _normalise_columns(df)
 
     def _row_to_tick(self, row: "pd.Series", idx: int) -> Optional[OrderBookTick]:
         """
@@ -359,6 +349,13 @@ class HistoricalDataFeed:
 
 # ── Column accessor helpers ───────────────────────────────────────────────────
 
+def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip whitespace, lowercase, spaces/hyphens → underscores in column names."""
+    return df.rename(columns={
+        col: col.strip().lower().replace(" ", "_").replace("-", "_")
+        for col in df.columns
+    })
+
 def _col_float(
     row: "pd.Series",
     candidates: tuple[str, ...],
@@ -388,3 +385,214 @@ def _col_str(
                 if s and s.lower() not in ("nan", "none", "nat", ""):
                     return s
     return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# OrderFilledDataFeed — warproxxx/poly_data adapter
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_USDC_TOKEN_ID = "0"
+
+
+class OrderFilledDataFeed:
+    """
+    Synthetic OrderBookTick stream built from warproxxx/poly_data:
+      orderFilled.csv  — raw on-chain fill events; price derived from amounts
+      markets.csv      — token-id → condition_id + YES/NO mapping
+
+    For each fill, the complementary leg is resolved from the last seen trade
+    within `align_window_s` seconds. Because YES and NO prices come from
+    independent trades, their combined cost can fall below 1.0 — making genuine
+    Dutch-book signals detectable.
+
+    Limitations vs real orderbook data
+    ────────────────────────────────────
+    • Trade price ≈ last-executed price, not a live bid/ask quote
+    • Only emits ticks when both legs have traded recently
+    • Arb signals reflect prices at which trades cleared, not resting quotes
+    """
+
+    def __init__(
+        self,
+        orders_path: Path,
+        markets_path: Path,
+        align_window_s: float = 30.0,
+        max_rows: Optional[int] = None,
+    ) -> None:
+        self._orders_path = Path(orders_path)
+        self._markets_path = Path(markets_path)
+        self._align_window_s = align_window_s
+        self._max_rows = max_rows
+
+    # ── Market / token map ────────────────────────────────────────────────────
+
+    def _build_token_map(self, markets_df: pd.DataFrame) -> dict[str, dict]:
+        """
+        Returns: token_id → {condition_id, is_yes, category,
+                              yes_token_id, no_token_id}
+        """
+        token_map: dict[str, dict] = {}
+
+        for row in markets_df.itertuples(index=False):
+            condition_id = str(
+                getattr(row, "conditionid", None) or getattr(row, "condition_id", None) or ""
+            ).strip().lower()
+
+            category = str(
+                getattr(row, "category", None) or getattr(row, "market_type", None) or "other"
+            ).strip().lower()
+
+            clob_raw = getattr(row, "clobtokenids", None) or getattr(row, "clob_token_ids", None) or ""
+            try:
+                token_ids = json.loads(str(clob_raw)) if clob_raw else []
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+            if len(token_ids) < 2:
+                continue
+
+            yes_id = str(token_ids[0]).strip()
+            no_id  = str(token_ids[1]).strip()
+
+            if not condition_id or not yes_id or not no_id:
+                continue
+
+            base = {
+                "condition_id": condition_id,
+                "category":     category,
+                "yes_token_id": yes_id,
+                "no_token_id":  no_id,
+            }
+            token_map[yes_id] = {**base, "is_yes": True}
+            token_map[no_id]  = {**base, "is_yes": False}
+
+        return token_map
+
+    # ── Tick generation ───────────────────────────────────────────────────────
+
+    def _generate_ticks(
+        self,
+        orders_df: pd.DataFrame,
+        token_map: dict[str, dict],
+    ):
+        """
+        Walk fills chronologically. Maintain last-seen price per token.
+        Emit a tick whenever both legs of a market have traded within
+        align_window_s seconds of each other.
+        """
+        ts_col = next(
+            (c for c in ("timestamp", "created_at", "block_timestamp")
+             if c in orders_df.columns),
+            None,
+        )
+        if ts_col is None:
+            raise ValueError("No timestamp column found in orderFilled CSV")
+
+        orders_df = orders_df.sort_values(ts_col).reset_index(drop=True)
+
+        # last_price[token_id] = (unix_ts_float, price)
+        last_price: dict[str, tuple[float, float]] = {}
+
+        for idx, row in orders_df.iterrows():
+            maker_asset  = str(row.get("makerassetid")      or "").strip()
+            taker_asset  = str(row.get("takerassetid")      or "").strip()
+            try:
+                maker_amt = float(row.get("makeramountfilled") or 0)
+                taker_amt = float(row.get("takeramountfilled") or 0)
+            except (TypeError, ValueError):
+                continue
+
+            if maker_amt <= 0 or taker_amt <= 0:
+                continue
+
+            # Identify which leg is USDC and derive price
+            # (both USDC and conditional tokens use 6 decimals → scale cancels)
+            if maker_asset == _USDC_TOKEN_ID:
+                token_id = taker_asset
+                price    = maker_amt / taker_amt
+            elif taker_asset == _USDC_TOKEN_ID:
+                token_id = maker_asset
+                price    = taker_amt / maker_amt
+            else:
+                continue  # neither side is USDC
+
+            if not (0.01 <= price <= 0.99):
+                continue
+            if token_id not in token_map:
+                continue
+
+            try:
+                ts_val = float(row[ts_col])
+            except (TypeError, ValueError):
+                ts_val = float(idx)
+
+            last_price[token_id] = (ts_val, price)
+
+            info         = token_map[token_id]
+            complement   = info["no_token_id"] if info["is_yes"] else info["yes_token_id"]
+
+            if complement not in last_price:
+                continue
+
+            comp_ts, comp_price = last_price[complement]
+            if abs(ts_val - comp_ts) > self._align_window_s:
+                continue
+
+            yes_ask = price      if info["is_yes"] else comp_price
+            no_ask  = comp_price if info["is_yes"] else price
+
+            if not (0.01 <= yes_ask <= 0.99 and 0.01 <= no_ask <= 0.99):
+                continue
+
+            yes_bid = round(max(0.01, yes_ask - 0.001), 4)
+            no_bid  = round(max(0.01, no_ask  - 0.001), 4)
+
+            yield OrderBookTick(
+                timestamp    = str(int(ts_val)),
+                condition_id = info["condition_id"],
+                yes_token_id = info["yes_token_id"],
+                no_token_id  = info["no_token_id"],
+                yes_bid      = yes_bid,
+                yes_ask      = round(yes_ask, 4),
+                no_bid       = no_bid,
+                no_ask       = round(no_ask, 4),
+                category     = info["category"],
+                row_index    = int(idx),  # type: ignore[arg-type]
+            )
+
+    # ── Async stream ──────────────────────────────────────────────────────────
+
+    async def stream(
+        self,
+        queue: "asyncio.Queue[Optional[OrderBookTick]]",
+    ) -> None:
+        markets_df = _normalise_columns(
+            pd.read_csv(self._markets_path, low_memory=False)
+        )
+
+        token_map = self._build_token_map(markets_df)
+        logger.info(
+            "OrderFilledDataFeed | token map: %d tokens across %d markets",
+            len(token_map), len(markets_df),
+        )
+
+        # dtype=str preserves large token-ID integers that pandas would otherwise
+        # convert to float (e.g. "1000...0" → 1e+76), breaking token map lookups.
+        orders_df = _normalise_columns(
+            pd.read_csv(self._orders_path, nrows=self._max_rows, dtype=str)
+        )
+
+        logger.info("OrderFilledDataFeed | loaded %d fills", len(orders_df))
+
+        tick_count = 0
+        for i, tick in enumerate(self._generate_ticks(orders_df, token_map)):
+            await queue.put(tick)
+            tick_count += 1
+            if i % 100 == 0:
+                await asyncio.sleep(0)
+
+        logger.info(
+            "OrderFilledDataFeed | %d ticks generated (window=%.0fs)",
+            tick_count, self._align_window_s,
+        )
+        await queue.put(None)

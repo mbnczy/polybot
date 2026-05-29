@@ -1008,12 +1008,12 @@ class PolyClient:
             raise ValueError("execute_arb_maker_bundle: legs list is empty")
 
         # ── V2 profitability gate ─────────────────────────────────────────────
-        # effective_cost accounts for the taker fee embedded in feeRateBps.
-        # The arb is only viable when effective_cost < payout (N − 1 USDC).
-        total_cost      = sum(leg.bid * leg.size for leg in legs)
+        # Per-bundle cost × fee multiplier must be < payout (N − 1 USDC / bundle).
+        # Uses per-bundle quantities so the check is independent of position size.
+        bundle_cost     = sum(leg.bid for leg in legs)   # cost of 1 bundle
         fee_multiplier  = 1.0 + fee_rate_bps / 10_000
-        effective_cost  = total_cost * fee_multiplier
-        payout          = float(len(legs) - 1)   # NegRisk payout = N − 1
+        effective_cost  = bundle_cost * fee_multiplier
+        payout          = float(len(legs) - 1)   # NegRisk payout per bundle = N − 1
 
         if effective_cost >= payout:
             raise ClobApiError(
@@ -1023,6 +1023,7 @@ class PolyClient:
                 f"bundle is not profitable; skipping matchOrders",
             )
 
+        total_cost = sum(leg.bid * leg.size for leg in legs)
         if total_cost > _MAX_BUNDLE_USDC:
             raise ClobApiError(
                 0,

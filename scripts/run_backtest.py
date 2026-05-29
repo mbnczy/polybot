@@ -70,7 +70,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from dotenv import load_dotenv
 
-from backtest.data_handler import HistoricalDataFeed, OrderBookTick
+from backtest.data_handler import HistoricalDataFeed, OrderFilledDataFeed, OrderBookTick
 from backtest.simulator import PaperExecutionEngine, SimulatorState, DAILY_LOSS_LIMIT
 from strategy.arbitrage import (
     DutchBookPricer,
@@ -386,11 +386,29 @@ async def main(args: argparse.Namespace) -> int:
     load_dotenv(args.env_path, override=False)
 
     # ── Instantiate components ────────────────────────────────────────────────
-    feed = HistoricalDataFeed(
-        env_path=args.env_path,
-        max_rows=args.max_rows,
-        csv_path=Path(args.csv_path) if args.csv_path else None,
-    )
+    feed: HistoricalDataFeed | OrderFilledDataFeed
+
+    if args.orders_path:
+        if not args.markets_path:
+            logger.error("--markets-path is required when using --orders-path")
+            return 1
+        feed = OrderFilledDataFeed(
+            orders_path    = Path(args.orders_path),
+            markets_path   = Path(args.markets_path),
+            align_window_s = args.align_window,
+            max_rows       = args.max_rows,
+        )
+        logger.info(
+            "run_backtest | using OrderFilledDataFeed "
+            "(orders=%s, markets=%s, window=%.0fs)",
+            args.orders_path, args.markets_path, args.align_window,
+        )
+    else:
+        feed = HistoricalDataFeed(
+            env_path=args.env_path,
+            max_rows=args.max_rows,
+            csv_path=Path(args.csv_path) if args.csv_path else None,
+        )
     pricer  = DutchBookPricer(desired_net_margin=DESIRED_NET_MARGIN)
     rebates = MakerRebateEngine(default_rebate=DEFAULT_MAKER_REBATE)
     engine  = PaperExecutionEngine(daily_loss_limit=_DAILY_LOSS_LIMIT)
@@ -485,6 +503,31 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Path to a pre-downloaded polymarket_markets.csv.  "
             "Skips the Kaggle download entirely."
+        ),
+    )
+    p.add_argument(
+        "--orders-path",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to warproxxx/poly_data orderFilled.csv.  "
+            "When set, uses OrderFilledDataFeed instead of the Kaggle feed."
+        ),
+    )
+    p.add_argument(
+        "--markets-path",
+        default=None,
+        metavar="PATH",
+        help="Path to warproxxx/poly_data markets.csv (required with --orders-path).",
+    )
+    p.add_argument(
+        "--align-window",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help=(
+            "Max seconds between YES and NO fills to treat as a simultaneous "
+            "quote pair (default: 30).  Lower = stricter alignment."
         ),
     )
     p.add_argument(

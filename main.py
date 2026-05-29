@@ -95,12 +95,17 @@ from risk.circuit_breaker import (                                 # noqa: E402
     CircuitBreakerTripped,
     MAX_ARB_PAIR_USDC,
 )
+from core.clob_client import BundleLeg                             # noqa: E402
 from strategy.arbitrage import (                                   # noqa: E402
     ArbDetector,
     ArbSignal,
     DEFAULT_TAKER_FEE,
     DESIRED_NET_MARGIN,
+    DutchBookPricer,
     FeeEngine,
+    MakerRebateEngine,
+    NegRiskArbDetector,
+    NegRiskSignal,
 )
 from strategy.tuner import tuner_loop                               # noqa: E402
 from telemetry.db_logger import SignalLogger                        # noqa: E402
@@ -161,18 +166,26 @@ async def scanner_loop(scanner: MarketScanner) -> None:
 
 
 async def strategy_loop(
-    queue:       asyncio.Queue,
-    detector:    ArbDetector,
-    fee_engine:  FeeEngine,
-    breaker:     CircuitBreaker,
-    client:      PolyClient,
-    notifier:    TelegramNotifier,
-    sig_logger:  SignalLogger,
+    queue:          asyncio.Queue,
+    detector:       ArbDetector,
+    dutch_pricer:   DutchBookPricer,
+    neg_risk_det:   NegRiskArbDetector,
+    rebate_engine:  MakerRebateEngine,
+    fee_engine:     FeeEngine,
+    breaker:        CircuitBreaker,
+    client:         PolyClient,
+    notifier:       TelegramNotifier,
+    sig_logger:     SignalLogger,
 ) -> None:
     """
-    Consumes arb_tick snapshots from ALL active market feeds, fetches the
-    real-time taker fee, evaluates the fee-adjusted edge, and fires dual-leg
-    FOK orders when a viable signal is found.
+    Consumes arb_tick / neg_risk_tick snapshots from ALL active market feeds.
+
+    arb_tick path (binary market):
+      1. Taker arb — FeeEngine → ArbDetector → FOK execution
+      2. Maker arb fallback — MakerRebateEngine → DutchBookPricer → GTC execution
+
+    neg_risk_tick path (multi-outcome NegRisk market):
+      MakerRebateEngine → NegRiskArbDetector → matchOrders bundle execution
     """
     logger.info("strategy_loop started")
     try:
@@ -180,7 +193,81 @@ async def strategy_loop(
             tick: dict = await queue.get()
             queue.task_done()
 
-            if tick.get("type") != "arb_tick":
+            tick_type = tick.get("type")
+
+            # ── NegRisk multi-outcome path ────────────────────────────────────
+            if tick_type == "neg_risk_tick":
+                condition_id      = tick["condition_id"]
+                outcome_token_ids: list[str]   = tick["outcome_token_ids"]
+                no_asks:           list[float]  = tick["no_asks"]
+
+                WS_LATENCY_MS.set(
+                    (asyncio.get_event_loop().time() - tick.get("ts", 0)) * 1000
+                )
+
+                rebate = await rebate_engine.get_maker_rebate(condition_id)
+                nr_signal: Optional[NegRiskSignal] = neg_risk_det.evaluate_neg_risk(
+                    condition_id=condition_id,
+                    outcome_token_ids=outcome_token_ids,
+                    no_asks=no_asks,
+                    max_position_usdc=MAX_ARB_PAIR_USDC,
+                    maker_rebate=rebate,
+                )
+                if nr_signal is None:
+                    continue
+
+                bundle_cost = round(nr_signal.combined_bid * nr_signal.n_bundles, 6)
+                nr_intent = ArbOrderIntent(
+                    condition_id=condition_id,
+                    yes_token_id=nr_signal.legs[0].token_id,
+                    no_token_id=(
+                        nr_signal.legs[1].token_id if len(nr_signal.legs) > 1 else ""
+                    ),
+                    yes_price=nr_signal.legs[0].no_bid,
+                    no_price=(
+                        nr_signal.legs[1].no_bid if len(nr_signal.legs) > 1 else 0.0
+                    ),
+                    n_shares=nr_signal.n_bundles,
+                    combined_cost_usdc=bundle_cost,
+                )
+                if not breaker.check_arb(nr_intent):
+                    continue
+
+                bundle_legs = [
+                    BundleLeg(token_id=leg.token_id, bid=leg.no_bid, size=leg.size)
+                    for leg in nr_signal.legs
+                ]
+                try:
+                    await client.execute_arb_maker_bundle(bundle_legs)
+
+                    net_profit = round(nr_signal.n_bundles * nr_signal.net_edge, 6)
+                    breaker.on_arb_open()
+                    breaker.on_fill(pnl=net_profit)
+
+                    status = breaker.status_dict()
+                    CUMULATIVE_PNL.set(status["session_pnl"])
+                    USDC_BALANCE.set(
+                        status["starting_balance"] + status["session_pnl"]
+                    )
+
+                    await notifier.notify(
+                        f"NEG RISK ARB | condition={condition_id[:20]}\n"
+                        f"outcomes={nr_signal.n_outcomes} "
+                        f"bundles={nr_signal.n_bundles:.2f} "
+                        f"net_edge={nr_signal.net_edge:.4f} "
+                        f"profit={net_profit:.4f} USDC"
+                    )
+
+                except CircuitBreakerTripped:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("NegRisk bundle execution failed: %s", exc)
+                    await notifier.notify(f"NEG RISK EXECUTION ERROR: {exc}")
+
+                continue
+
+            # ── Binary market path (arb_tick) ─────────────────────────────────
+            if tick_type != "arb_tick":
                 continue
 
             condition_id: str   = tick["condition_id"]
@@ -189,15 +276,15 @@ async def strategy_loop(
             yes_ask:      float = tick["yes_ask"]
             no_ask:       float = tick["no_ask"]
 
-            # ── Metrics: WebSocket delivery latency (no I/O, pure arithmetic) ─
+            # ── Metrics: WebSocket delivery latency ───────────────────────────
             WS_LATENCY_MS.set(
                 (asyncio.get_event_loop().time() - tick["ts"]) * 1000
             )
 
-            # ── 1. Fetch real-time taker fee (cached, ~0 overhead) ────────
+            # ── 1. Fetch real-time taker fee (cached, ~0 overhead) ────────────
             fee_rate: float = await fee_engine.get_taker_fee(condition_id)
 
-            # ── 2. Fee-adjusted arb evaluation ────────────────────────────
+            # ── 2a. Taker arb evaluation ──────────────────────────────────────
             arb_signal: Optional[ArbSignal] = detector.evaluate(
                 condition_id=condition_id,
                 yes_token_id=yes_token_id,
@@ -207,14 +294,31 @@ async def strategy_loop(
                 max_position_usdc=MAX_ARB_PAIR_USDC,
                 fee_rate=fee_rate,
             )
+
+            # ── 2b. Maker arb fallback (DutchBookPricer) ──────────────────────
+            if arb_signal is None:
+                rebate = await rebate_engine.get_maker_rebate(condition_id)
+                arb_signal = dutch_pricer.evaluate_maker(
+                    condition_id=condition_id,
+                    yes_token_id=yes_token_id,
+                    no_token_id=no_token_id,
+                    yes_ask=yes_ask,
+                    no_ask=no_ask,
+                    max_position_usdc=MAX_ARB_PAIR_USDC,
+                    maker_rebate=rebate,
+                )
+
             if arb_signal is None:
                 continue
 
-            # ── 3. Persist signal — zero hot-path latency (fire-and-forget)
+            # ── 3. Persist signal ─────────────────────────────────────────────
             sig_logger.log_arb(arb_signal)
 
-            # ── 4. Size the position ─────────────────────────────────────
-            n_shares: float = breaker.calculate_position_size(yes_ask, no_ask)
+            # ── 4. Size the position ──────────────────────────────────────────
+            if arb_signal.is_maker_signal:
+                n_shares = arb_signal.yes_size
+            else:
+                n_shares = breaker.calculate_position_size(yes_ask, no_ask)
             if n_shares < 0.01:
                 logger.warning(
                     "Position size %.4f below minimum — skipping "
@@ -225,38 +329,44 @@ async def strategy_loop(
 
             combined_cost_usdc: float = round(n_shares * arb_signal.combined_cost, 6)
 
-            # ── 4. Circuit-breaker gate ───────────────────────────────────
+            # ── 5. Circuit-breaker gate ───────────────────────────────────────
             intent = ArbOrderIntent(
                 condition_id=condition_id,
                 yes_token_id=yes_token_id,
                 no_token_id=no_token_id,
-                yes_price=yes_ask,
-                no_price=no_ask,
+                yes_price=yes_ask if not arb_signal.is_maker_signal else arb_signal.yes_bid,
+                no_price=no_ask  if not arb_signal.is_maker_signal else arb_signal.no_bid,
                 n_shares=n_shares,
                 combined_cost_usdc=combined_cost_usdc,
             )
             if not breaker.check_arb(intent):
                 continue
 
-            # ── 5. Execute both legs simultaneously ───────────────────────
+            # ── 6. Execute ────────────────────────────────────────────────────
             try:
-                await client.execute_arb_pair(
-                    yes_token_id=yes_token_id,
-                    yes_price=yes_ask,
-                    yes_size=n_shares,
-                    no_token_id=no_token_id,
-                    no_price=no_ask,
-                    no_size=n_shares,
-                )
+                if arb_signal.is_maker_signal:
+                    await client.execute_arb_maker_pair(
+                        yes_token_id=yes_token_id,
+                        yes_bid=arb_signal.yes_bid,
+                        yes_size=n_shares,
+                        no_token_id=no_token_id,
+                        no_bid=arb_signal.no_bid,
+                        no_size=n_shares,
+                    )
+                else:
+                    await client.execute_arb_pair(
+                        yes_token_id=yes_token_id,
+                        yes_price=yes_ask,
+                        yes_size=n_shares,
+                        no_token_id=no_token_id,
+                        no_price=no_ask,
+                        no_size=n_shares,
+                    )
 
-                # Net profit = face value − all-in cost per share × n_shares
-                # all_in_cost_per_pair = combined_cost × (1 + fee_rate)
                 net_profit: float = round(n_shares * arb_signal.net_edge, 6)
-
                 breaker.on_arb_open()
                 breaker.on_fill(pnl=net_profit)
 
-                # ── Metrics: update PnL after confirmed fill ──────────────
                 status = breaker.status_dict()
                 CUMULATIVE_PNL.set(status["session_pnl"])
                 USDC_BALANCE.set(
@@ -368,21 +478,24 @@ def _register_shutdown_signals(
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def main() -> None:
-    logger.info("=== Polymarket ARB Bot — Phase 7 starting ===")
+    logger.info("=== Polymarket ARB Bot — Phase 8 starting ===")
     logger.info(
         "Config | balance=%.2f net_margin=%.3f default_fee=%.3f pair_cap=%.2f USDC",
         STARTING_BALANCE, _desired_margin, _default_fee, MAX_ARB_PAIR_USDC,
     )
 
     # ── initialise components ─────────────────────────────────────────────
-    client      = PolyClient()
-    breaker     = CircuitBreaker(starting_balance=STARTING_BALANCE)
-    notifier    = TelegramNotifier(on_status=breaker.status_dict)
-    fee_engine  = FeeEngine(default_fee=_default_fee)
-    detector    = ArbDetector(
-                      desired_net_margin=_desired_margin,
-                      default_fee_rate=_default_fee,
-                  )
+    client         = PolyClient()
+    breaker        = CircuitBreaker(starting_balance=STARTING_BALANCE)
+    notifier       = TelegramNotifier(on_status=breaker.status_dict)
+    fee_engine     = FeeEngine(default_fee=_default_fee)
+    rebate_engine  = MakerRebateEngine()
+    detector       = ArbDetector(
+                         desired_net_margin=_desired_margin,
+                         default_fee_rate=_default_fee,
+                     )
+    dutch_pricer   = DutchBookPricer(desired_net_margin=_desired_margin)
+    neg_risk_det   = NegRiskArbDetector(desired_net_margin=_desired_margin)
 
     # ── signal logger (async WAL-mode SQLite, zero hot-path latency) ──────
     sig_logger = SignalLogger()
@@ -471,8 +584,8 @@ async def main() -> None:
         asyncio.create_task(scanner_loop(scanner),                       name="scanner"),
         asyncio.create_task(
             strategy_loop(
-                market_queue, detector, fee_engine, breaker,
-                client, notifier, sig_logger,
+                market_queue, detector, dutch_pricer, neg_risk_det, rebate_engine,
+                fee_engine, breaker, client, notifier, sig_logger,
             ),
             name="strategy",
         ),
