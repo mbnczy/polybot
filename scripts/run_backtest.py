@@ -70,7 +70,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from dotenv import load_dotenv
 
-from backtest.data_handler import HistoricalDataFeed, OrderFilledDataFeed, OrderBookTick
+from backtest.data_handler import HistoricalDataFeed, OrderFilledDataFeed, TradesParquetDataFeed, OrderBookTick
 from backtest.simulator import PaperExecutionEngine, SimulatorState, DAILY_LOSS_LIMIT
 from strategy.arbitrage import (
     DutchBookPricer,
@@ -386,9 +386,19 @@ async def main(args: argparse.Namespace) -> int:
     load_dotenv(args.env_path, override=False)
 
     # ── Instantiate components ────────────────────────────────────────────────
-    feed: HistoricalDataFeed | OrderFilledDataFeed
+    feed: HistoricalDataFeed | OrderFilledDataFeed | TradesParquetDataFeed
 
-    if args.orders_path:
+    if args.hf_trades:
+        feed = TradesParquetDataFeed(
+            align_window_s = args.align_window,
+            max_rows       = args.max_rows,
+        )
+        logger.info(
+            "run_backtest | using TradesParquetDataFeed "
+            "(HuggingFace SII-WANGZJ/Polymarket_data, max_rows=%s, window=%.0fs)",
+            args.max_rows or "all", args.align_window,
+        )
+    elif args.orders_path:
         if not args.markets_path:
             logger.error("--markets-path is required when using --orders-path")
             return 1
@@ -503,6 +513,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Path to a pre-downloaded polymarket_markets.csv.  "
             "Skips the Kaggle download entirely."
+        ),
+    )
+    p.add_argument(
+        "--hf-trades",
+        action="store_true",
+        default=False,
+        help=(
+            "Stream trades.parquet from SII-WANGZJ/Polymarket_data on HuggingFace. "
+            "No download needed; uses the datasets streaming API."
         ),
     )
     p.add_argument(

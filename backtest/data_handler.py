@@ -566,8 +566,11 @@ class OrderFilledDataFeed:
         self,
         queue: "asyncio.Queue[Optional[OrderBookTick]]",
     ) -> None:
+        # on_bad_lines="skip": real Gamma exports embed nested JSON whose commas
+        # /quotes occasionally break a row; a crash-truncated last row is also
+        # possible. Skipping a handful of malformed rows out of millions is fine.
         markets_df = _normalise_columns(
-            pd.read_csv(self._markets_path, low_memory=False)
+            pd.read_csv(self._markets_path, low_memory=False, on_bad_lines="skip")
         )
 
         token_map = self._build_token_map(markets_df)
@@ -579,7 +582,12 @@ class OrderFilledDataFeed:
         # dtype=str preserves large token-ID integers that pandas would otherwise
         # convert to float (e.g. "1000...0" → 1e+76), breaking token map lookups.
         orders_df = _normalise_columns(
-            pd.read_csv(self._orders_path, nrows=self._max_rows, dtype=str)
+            pd.read_csv(
+                self._orders_path,
+                nrows=self._max_rows,
+                dtype=str,
+                on_bad_lines="skip",
+            )
         )
 
         logger.info("OrderFilledDataFeed | loaded %d fills", len(orders_df))
@@ -595,4 +603,204 @@ class OrderFilledDataFeed:
             "OrderFilledDataFeed | %d ticks generated (window=%.0fs)",
             tick_count, self._align_window_s,
         )
+        await queue.put(None)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TradesParquetDataFeed — SII-WANGZJ/Polymarket_data adapter
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_HF_DATASET = "SII-WANGZJ/Polymarket_data"
+
+# Best-effort event_slug → category mapping
+_SLUG_KEYWORDS: list[tuple[tuple[str, ...], str]] = [
+    (("crypto", "bitcoin", "btc", "eth", "solana", "sol", "xrp", "doge", "matic"), "crypto"),
+    (("politic", "election", "president", "congress", "senate", "vote", "democrat", "republican"), "politics"),
+    (("nba", "nfl", "mlb", "nhl", "soccer", "football", "basketball", "tennis", "golf",
+      "esport", "valorant", "counter-strike", "dota", "league-of-legends", "sport"), "sports"),
+    (("entertain", "movie", "film", "music", "award", "oscar", "grammy", "emmy"), "entertainment"),
+    (("econ", "gdp", "inflation", "fed", "rate", "recession"), "economy"),
+    (("science", "space", "nasa", "ai", "tech", "climate"), "science"),
+]
+
+
+def _slug_to_category(slug: str) -> str:
+    s = slug.lower()
+    for keywords, cat in _SLUG_KEYWORDS:
+        if any(k in s for k in keywords):
+            return cat
+    return "other"
+
+
+class TradesParquetDataFeed:
+    """
+    Synthetic OrderBookTick stream from SII-WANGZJ/Polymarket_data via
+    HuggingFace Datasets streaming — no full 28 GB download required.
+
+    Uses trades.parquet (price pre-computed, YES/NO explicit via nonusdc_side)
+    and markets.parquet (85 MB, loaded fully) for token1/token2 IDs.
+
+    trades.parquet key columns
+    ───────────────────────────
+      timestamp    uint64   Unix seconds
+      condition_id string   CTF condition ID
+      asset_id     string   Non-USDC token ID traded
+      price        float64  Trade price (0–1)
+      nonusdc_side string   "token1" = YES, "token2" = NO
+
+    markets.parquet key columns
+    ────────────────────────────
+      condition_id string
+      token1       string   YES token asset ID
+      token2       string   NO  token asset ID
+      event_slug   string   Used for category inference
+
+    Limitations (same as OrderFilledDataFeed)
+    ──────────────────────────────────────────
+    Trade prices approximate the ask at execution time, not live quotes.
+    Arb signals are sparse — most real-market combined costs stay ≥ 1.0.
+    """
+
+    def __init__(
+        self,
+        align_window_s: float = 30.0,
+        max_rows: Optional[int] = None,
+    ) -> None:
+        self._align_window_s = align_window_s
+        self._max_rows       = max_rows
+
+    # ── Token map ─────────────────────────────────────────────────────────────
+
+    def _build_token_map(self) -> dict[str, dict]:
+        """Download markets.parquet (85 MB) and build token_id → market info."""
+        from datasets import load_dataset  # deferred import
+
+        logger.info("TradesParquetDataFeed | loading markets.parquet from HuggingFace …")
+        ds = load_dataset(_HF_DATASET, data_files="markets.parquet", split="train")
+        df = ds.to_pandas()  # Arrow → pandas: vectorised, much faster than row iteration
+        df = _normalise_columns(df)
+
+        # Vectorised category derivation
+        df["category"] = df.get("event_slug", pd.Series("", index=df.index)) \
+                           .fillna("").apply(_slug_to_category)
+
+        token_map: dict[str, dict] = {}
+        needed = ["condition_id", "token1", "token2", "category"]
+        available = [c for c in needed if c in df.columns]
+        if "token1" not in df.columns or "token2" not in df.columns:
+            raise ValueError("markets.parquet missing token1/token2 columns")
+
+        for rec in df[available].dropna(subset=["condition_id", "token1", "token2"]) \
+                                 .to_dict("records"):
+            cid    = str(rec["condition_id"]).strip().lower()
+            token1 = str(rec["token1"]).strip()
+            token2 = str(rec["token2"]).strip()
+            if not cid or not token1 or not token2:
+                continue
+            cat  = rec.get("category", "other")
+            base = {"condition_id": cid, "category": cat,
+                    "yes_token_id": token1, "no_token_id": token2}
+            token_map[token1] = {**base, "is_yes": True}
+            token_map[token2] = {**base, "is_yes": False}
+
+        logger.info("TradesParquetDataFeed | token map: %d tokens", len(token_map))
+        return token_map
+
+    # ── Tick generator ────────────────────────────────────────────────────────
+
+    def _generate_ticks(
+        self,
+        trades_iter,
+        token_map: dict[str, dict],
+    ):
+        last_price: dict[str, tuple[float, float]] = {}
+
+        for idx, row in enumerate(trades_iter):
+            if self._max_rows and idx >= self._max_rows:
+                break
+
+            asset_id     = str(row.get("asset_id")     or "").strip()
+            nonusdc_side = str(row.get("nonusdc_side")  or "").strip()
+            price_raw    = row.get("price")
+            ts_raw       = row.get("timestamp")
+
+            if price_raw is None:
+                continue
+            try:
+                price  = float(price_raw)
+                ts_val = float(ts_raw) if ts_raw is not None else float(idx)
+            except (TypeError, ValueError):
+                continue
+
+            if not (0.01 <= price <= 0.99):
+                continue
+            if asset_id not in token_map:
+                continue
+
+            info = token_map[asset_id]
+
+            # Sanity-check nonusdc_side against token_map
+            expected_yes = nonusdc_side == "token1"
+            if expected_yes != info["is_yes"]:
+                continue  # token map disagrees with nonusdc_side — skip
+
+            last_price[asset_id] = (ts_val, price)
+
+            complement = info["no_token_id"] if info["is_yes"] else info["yes_token_id"]
+            if complement not in last_price:
+                continue
+
+            comp_ts, comp_price = last_price[complement]
+            if abs(ts_val - comp_ts) > self._align_window_s:
+                continue
+
+            yes_ask = price      if info["is_yes"] else comp_price
+            no_ask  = comp_price if info["is_yes"] else price
+
+            if not (0.01 <= yes_ask <= 0.99 and 0.01 <= no_ask <= 0.99):
+                continue
+
+            yield OrderBookTick(
+                timestamp    = str(int(ts_val)),
+                condition_id = info["condition_id"],
+                yes_token_id = info["yes_token_id"],
+                no_token_id  = info["no_token_id"],
+                yes_bid      = round(max(0.01, yes_ask - 0.001), 4),
+                yes_ask      = round(yes_ask, 4),
+                no_bid       = round(max(0.01, no_ask  - 0.001), 4),
+                no_ask       = round(no_ask,  4),
+                category     = info["category"],
+                row_index    = idx,
+            )
+
+    # ── Async stream ──────────────────────────────────────────────────────────
+
+    async def stream(
+        self,
+        queue: "asyncio.Queue[Optional[OrderBookTick]]",
+    ) -> None:
+        from datasets import load_dataset  # deferred import
+
+        token_map = self._build_token_map()
+
+        logger.info(
+            "TradesParquetDataFeed | streaming trades.parquet "
+            "(max_rows=%s, window=%.0fs) …",
+            self._max_rows or "all", self._align_window_s,
+        )
+        trades_ds = load_dataset(
+            _HF_DATASET,
+            data_files="trades.parquet",
+            split="train",
+            streaming=True,
+        )
+
+        tick_count = 0
+        for i, tick in enumerate(self._generate_ticks(iter(trades_ds), token_map)):
+            await queue.put(tick)
+            tick_count += 1
+            if i % 100 == 0:
+                await asyncio.sleep(0)
+
+        logger.info("TradesParquetDataFeed | %d ticks enqueued", tick_count)
         await queue.put(None)
