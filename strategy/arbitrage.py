@@ -148,6 +148,22 @@ MAX_TAKER_FEE:      float = 0.0400   # sanity clamp for implausibly high API val
 DESIRED_NET_MARGIN: float = 0.0050   # 0.50 % minimum guaranteed profit per pair
 TICK_SIZE:          float = 0.001    # Polymarket minimum price increment (0.1 cent)
 
+# ── Signal-quality guards (efficiency-and-reliability) ───────────────────────
+# Near-resolved markets (one outcome ~certain) produce "signals" whose edge is
+# dominated by the maker-rebate subsidy on thin, rarely-filled books — not a
+# durable, capturable price gap.  Skip a market when either leg's ask sits
+# outside [EXTREME_PRICE_LO, EXTREME_PRICE_HI].  Default band is wide enough to
+# leave all genuinely contested markets untouched.
+EXTREME_PRICE_LO: float = 0.05   # skip if yes_ask or no_ask < this (≈ resolved)
+EXTREME_PRICE_HI: float = 0.95   # skip if yes_ask or no_ask > this (≈ resolved)
+
+# Minimum *real* (pre-rebate) Dutch-book gap on the maker path, measured on the
+# observed asks: real_edge = 1 − (yes_ask + no_ask).  0.0 = OFF (legacy: allow
+# rebate-funded entries where combined asks may exceed $1).  Set > 0 (e.g.
+# 0.002 = 20 bps) to require a genuine sub-$1 combined cost so the rebate is
+# upside, not the sole justification.
+MIN_REAL_EDGE: float = 0.0
+
 # ── API endpoints ─────────────────────────────────────────────────────────────
 _CLOB_HOST   = "https://clob.polymarket.com"
 _GAMMA_HOST  = "https://gamma-api.polymarket.com"
@@ -406,6 +422,9 @@ class DutchBookPricer:
         self,
         desired_net_margin:  float = DESIRED_NET_MARGIN,
         default_rebate_rate: float = DEFAULT_MAKER_REBATE,
+        extreme_lo:          float = EXTREME_PRICE_LO,
+        extreme_hi:          float = EXTREME_PRICE_HI,
+        min_real_edge:       float = MIN_REAL_EDGE,
     ) -> None:
         if not (0.0 < desired_net_margin < 1.0):
             raise ValueError(
@@ -413,6 +432,9 @@ class DutchBookPricer:
             )
         self._net_margin     = desired_net_margin
         self._default_rebate = max(0.0, min(default_rebate_rate, MAX_MAKER_REBATE))
+        self._extreme_lo     = extreme_lo
+        self._extreme_hi     = extreme_hi
+        self._min_real_edge  = min_real_edge
 
     def evaluate_maker(
         self,
@@ -447,6 +469,29 @@ class DutchBookPricer:
             logger.debug(
                 "DutchBookPricer | invalid asks yes=%.4f no=%.4f — skip",
                 yes_ask, no_ask,
+            )
+            return None
+
+        # ── 1a. Signal-quality guards ─────────────────────────────────────────
+        # Reject near-resolved / extreme markets: their edge is rebate-driven on
+        # thin books that rarely fill, not a durable price gap.
+        if not (self._extreme_lo <= yes_ask <= self._extreme_hi
+                and self._extreme_lo <= no_ask <= self._extreme_hi):
+            logger.debug(
+                "DutchBookPricer | extreme/near-resolved yes=%.4f no=%.4f "
+                "(band [%.3f, %.3f]) — skip",
+                yes_ask, no_ask, self._extreme_lo, self._extreme_hi,
+            )
+            return None
+
+        # Require a genuine pre-rebate gap when MIN_REAL_EDGE is enabled (> 0):
+        # real_edge = 1 − (yes_ask + no_ask). Keeps the rebate as upside, not the
+        # sole justification for entering.
+        real_edge = 1.0 - (yes_ask + no_ask)
+        if self._min_real_edge > 0.0 and real_edge < self._min_real_edge:
+            logger.debug(
+                "DutchBookPricer | real_edge=%.6f < min_real_edge=%.6f "
+                "(rebate-only) — skip", real_edge, self._min_real_edge,
             )
             return None
 
@@ -675,6 +720,8 @@ class ArbDetector:
         self,
         desired_net_margin: float = DESIRED_NET_MARGIN,
         default_fee_rate:   float = DEFAULT_TAKER_FEE,
+        extreme_lo:         float = EXTREME_PRICE_LO,
+        extreme_hi:         float = EXTREME_PRICE_HI,
     ) -> None:
         if not (0.0 < desired_net_margin < 1.0):
             raise ValueError(
@@ -686,6 +733,8 @@ class ArbDetector:
             )
         self._net_margin  = desired_net_margin
         self._default_fee = default_fee_rate
+        self._extreme_lo  = extreme_lo
+        self._extreme_hi  = extreme_hi
 
     def evaluate(
         self,
@@ -706,6 +755,15 @@ class ArbDetector:
         if not (0.01 <= yes_ask <= 0.99 and 0.01 <= no_ask <= 0.99):
             logger.debug(
                 "ArbDetector | invalid prices yes=%.4f no=%.4f — skip",
+                yes_ask, no_ask,
+            )
+            return None
+
+        # Signal-quality guard: skip near-resolved / extreme markets.
+        if not (self._extreme_lo <= yes_ask <= self._extreme_hi
+                and self._extreme_lo <= no_ask <= self._extreme_hi):
+            logger.debug(
+                "ArbDetector | extreme/near-resolved yes=%.4f no=%.4f — skip",
                 yes_ask, no_ask,
             )
             return None

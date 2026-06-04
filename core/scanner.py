@@ -84,8 +84,10 @@ _END_CURSOR  = "LTE="
 SCAN_INTERVAL: float = 300.0   # seconds between full market-list polls (5 min)
 
 # Callable signature for the market-added callback.
-# Async: async def cb(condition_id: str, yes_token_id: str, no_token_id: str) -> None
-MarketCallback = Callable[[str, str, str], Awaitable[None]]
+# Async: async def cb(condition_id, yes_token_id, no_token_id) -> bool | None
+# Returns False when the market was NOT registered (e.g. global feed cap hit);
+# any other value (None/True) is treated as success by the scanner.
+MarketCallback = Callable[[str, str, str], Awaitable[object]]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -108,10 +110,15 @@ class FeedRegistry:
         Number of live feed tasks.
     """
 
-    def __init__(self, queue: asyncio.Queue) -> None:
+    def __init__(self, queue: asyncio.Queue, max_feeds: int = 0) -> None:
         self._queue = queue
         # condition_id → (MarketFeed, asyncio.Task)
         self._feeds: dict[str, tuple[MarketFeed, asyncio.Task]] = {}
+        # Global hard cap on concurrently-active feeds (0 = unlimited). This is
+        # the real ceiling on WebSocket connections; the scanner's per-scan
+        # admission limit is separate and must not be allowed to grow feeds
+        # without bound across re-scans.
+        self._max_feeds = max(0, max_feeds)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public API
@@ -122,15 +129,24 @@ class FeedRegistry:
         condition_id:  str,
         yes_token_id:  str,
         no_token_id:   str,
-    ) -> None:
+    ) -> bool:
         """
         Register a market and start its WebSocket feed task.
 
-        Idempotent — silently returns if condition_id is already tracked.
-        Logs an error (and does not crash) if the task cannot be created.
+        Idempotent — returns True if already tracked.  Returns False (without
+        starting a feed) when the global max_feeds cap is reached, so the caller
+        can avoid marking the market as permanently seen and retry it later.
+        Returns False and logs (does not crash) if the feed task cannot start.
         """
         if condition_id in self._feeds:
-            return
+            return True
+
+        if self._max_feeds and len(self._feeds) >= self._max_feeds:
+            logger.debug(
+                "FeedRegistry | at cap (%d) — rejecting condition=%s",
+                self._max_feeds, condition_id[:16],
+            )
+            return False
 
         try:
             feed = MarketFeed(
@@ -150,11 +166,37 @@ class FeedRegistry:
                 condition_id[:16], yes_token_id[:12], no_token_id[:12],
                 len(self._feeds),
             )
+            return True
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "FeedRegistry | failed to start feed for condition=%s: %s",
                 condition_id[:16], exc,
             )
+            return False
+
+    async def prune_stale(self, max_idle_s: float) -> list[str]:
+        """
+        Remove feeds that have not produced a two-sided arb_tick within
+        `max_idle_s` seconds (dead / illiquid / one-sided markets).
+
+        Returns the list of pruned condition_ids so the caller can also forget
+        them and free the slot for a fresher candidate.
+        """
+        if max_idle_s <= 0 or not self._feeds:
+            return []
+        now   = time.monotonic()
+        stale = [
+            cid for cid, (feed, _task) in self._feeds.items()
+            if feed.idle_seconds(now) > max_idle_s
+        ]
+        for cid in stale:
+            await self.remove_market(cid)
+        if stale:
+            logger.info(
+                "FeedRegistry | pruned %d stale feed(s) (idle > %.0fs) | remaining=%d",
+                len(stale), max_idle_s, len(self._feeds),
+            )
+        return stale
 
     async def remove_market(self, condition_id: str) -> None:
         """
@@ -283,6 +325,9 @@ class MarketScanner:
         scan_interval:      float = SCAN_INTERVAL,
         seed_condition_ids: set[str] | None = None,
         max_feeds:          int = 50,
+        feed_registry:      "FeedRegistry | None" = None,
+        prune_idle_s:       float = 0.0,
+        min_volume_24h:     float = 0.0,
     ) -> None:
         self._on_market_added = on_market_added
         self._scan_interval   = scan_interval
@@ -290,6 +335,13 @@ class MarketScanner:
         self._running         = False
         self._max_feeds       = max(0, max_feeds)
         self._scorer          = MarketScorer()
+        # Optional registry reference enables a GLOBAL active-feed cap and
+        # stale-feed pruning (prevents unbounded feed growth across re-scans).
+        self._registry        = feed_registry
+        self._prune_idle_s    = max(0.0, prune_idle_s)
+        # Liquidity floor: skip candidates whose 24h volume is below this (dead
+        # books waste a feed slot and rarely offer capturable arbs). 0 = off.
+        self._min_volume_24h  = max(0.0, min_volume_24h)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public control
@@ -347,6 +399,13 @@ class MarketScanner:
             SCANNER_SCAN_DURATION.observe(time.perf_counter() - _t0)
 
     async def _scan_once_inner(self) -> None:
+        # Prune dead/illiquid feeds before admitting new ones so freed slots can
+        # be reused and forgotten markets become eligible again.
+        if self._registry is not None and self._prune_idle_s > 0:
+            pruned = await self._registry.prune_stale(self._prune_idle_s)
+            for cid in pruned:
+                self._known.discard(cid)
+
         markets = await self._fetch_all_active()
         SCANNER_FEEDS_FETCHED.inc(len(markets))
 
@@ -410,6 +469,17 @@ class MarketScanner:
                     condition_id[:16],
                 )
                 continue
+            # Liquidity floor — skip dead books that would waste a feed slot.
+            if self._min_volume_24h > 0:
+                vol = float(
+                    m.get("volume24hr") or m.get("volume_24h") or m.get("volume") or 0.0
+                )
+                if not math.isfinite(vol) or vol < self._min_volume_24h:
+                    logger.debug(
+                        "MarketScanner | %s skipped — volume %.0f < floor %.0f",
+                        condition_id[:16], vol, self._min_volume_24h,
+                    )
+                    continue
             scored_pairs.append((self._scorer.score(m), m, condition_id, yes_id, no_id))
 
         scored_pairs.sort(key=lambda t: t[0], reverse=True)
@@ -446,22 +516,34 @@ class MarketScanner:
                 vol, days, rebate * 100, daily_rebate,
             )
 
-        admitted = scored_pairs[: self._max_feeds]
+        # Respect the GLOBAL active-feed cap when a registry is wired: only fill
+        # the slots actually free right now, instead of admitting max_feeds NEW
+        # markets every scan (which previously grew feeds without bound).
+        if self._registry is not None:
+            free_slots = max(0, self._max_feeds - self._registry.active_count)
+        else:
+            free_slots = self._max_feeds
+        admitted = scored_pairs[:free_slots]
         SCANNER_ADMITTED.set(len(admitted))
         logger.info(
-            "MarketScorer | total_candidates=%d admitted=%d (max_feeds=%d)",
-            total_candidates, len(admitted), self._max_feeds,
+            "MarketScorer | total_candidates=%d admitted=%d "
+            "(max_feeds=%d, free_slots=%d)",
+            total_candidates, len(admitted), self._max_feeds, free_slots,
         )
 
         new_count = 0
         for score, m, condition_id, yes_id, no_id in admitted:
+            # Mark known only on a successful add so cap-rejected markets remain
+            # eligible on a later scan (after pruning frees a slot).
+            result = await self._on_market_added(condition_id, yes_id, no_id)
+            if result is False:
+                continue
             self._known.add(condition_id)
             new_count += 1
             logger.info(
                 "MarketScanner | new market condition=%s yes=%s no=%s score=%.4f",
                 condition_id[:16], yes_id[:12], no_id[:12], score,
             )
-            await self._on_market_added(condition_id, yes_id, no_id)
 
         logger.debug(
             "MarketScanner scan done | new=%d total_known=%d",

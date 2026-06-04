@@ -106,6 +106,41 @@ _PAPER_TRADE: bool = (
     os.environ.get("PAPER_TRADE_MODE", "false").strip().lower() == "true"
 )
 
+# ── Fill classification (leg-reconciliation) ──────────────────────────────────
+# A leg counts as filled when its order response status is one of these. FOK
+# orders either match in full or are killed; "paper" is the simulated fill.
+_FILLED_STATUSES: frozenset[str] = frozenset({"matched", "filled", "paper"})
+
+
+def _resp_filled(resp: dict | None) -> bool:
+    """True if an order response indicates the leg was fully filled."""
+    if not isinstance(resp, dict):
+        return False
+    return str(resp.get("status", "")).strip().lower() in _FILLED_STATUSES
+
+
+def classify_fills(yes_resp: dict | None, no_resp: dict | None) -> str:
+    """
+    Reconcile a two-leg arb execution into one of four states:
+
+        "both"     — both legs filled (the hedged, profitable case)
+        "yes_only" — only YES filled  → naked long YES exposure, must unwind
+        "no_only"  — only NO filled   → naked long NO exposure, must unwind
+        "none"     — neither filled    → no position, no P&L
+
+    This is the safety gate that prevents a single-leg fill from being booked
+    as guaranteed arbitrage profit (it is not — it is unhedged directional risk).
+    """
+    yes_ok = _resp_filled(yes_resp)
+    no_ok  = _resp_filled(no_resp)
+    if yes_ok and no_ok:
+        return "both"
+    if yes_ok:
+        return "yes_only"
+    if no_ok:
+        return "no_only"
+    return "none"
+
 # ── Synthetic Post-Only constants ─────────────────────────────────────────────
 TICK_SIZE: float = 0.001   # Polymarket minimum price increment
 
@@ -797,6 +832,40 @@ class PolyClient:
         logger.info("ARB PAIR submitted | YES=%s | NO=%s", yes_resp, no_resp)
         MATCH_ORDERS_TOTAL.inc()
         return yes_resp, no_resp
+
+    async def unwind_leg(
+        self,
+        token_id: str,
+        size:     float,
+        price:    float = 0.0,
+    ) -> dict:
+        """
+        Flatten a naked leg by market-SELLING `size` shares of `token_id`.
+
+        Called when a two-leg arb only half-fills: holding one leg unhedged is
+        directional risk, so we immediately sell it back rather than book a
+        non-existent guaranteed profit.  `price` is an optional floor/limit hint
+        (0.0 → take whatever the book offers).
+
+        Paper mode: simulates the unwind with no network call.
+        """
+        if _PAPER_TRADE:
+            logger.warning(
+                "PAPER UNWIND | SELL %.2f of %s (naked leg flattened)",
+                size, token_id[:16],
+            )
+            return {
+                "status": "paper", "order_id": f"paper-unwind-{uuid.uuid4()}",
+                "token_id": token_id, "side": "SELL", "size": size,
+            }
+
+        sell_args = MarketOrderArgs(
+            token_id=token_id, amount=size, side="SELL", price=price,
+        )
+        signed = await self._run_with_retry(self._client.create_market_order, sell_args)
+        resp   = await self._run_with_retry(self._client.post_order, signed, OrderType.FOK)
+        logger.warning("UNWIND submitted | SELL %s of %s | resp=%s", size, token_id[:16], resp)
+        return resp
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public async API — dual-leg maker arbitrage (GTC limit, synthetic post-only)
