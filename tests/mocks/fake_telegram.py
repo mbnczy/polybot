@@ -33,6 +33,13 @@ class FakeTelegramNotifier:
     async def send_trade_execution(self, **kwargs: Any) -> None:
         self.trade_executions.append(kwargs)
 
+    def send_arb_detected(self, **kwargs: Any) -> None:
+        # Mirror the real notifier: synchronous, fire-and-forget detection alert.
+        self.arb_detections: list[dict]
+        if not hasattr(self, "arb_detections"):
+            self.arb_detections = []
+        self.arb_detections.append(kwargs)
+
     async def send_critical_error(self, error_message: str) -> None:
         self.critical_errors.append(error_message)
 
