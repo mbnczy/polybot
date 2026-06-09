@@ -320,7 +320,7 @@ def _resolve_rebate(category: str) -> float:
 # ArbSignal (extended for both taker and maker paths)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ArbSignal:
     """
     Describes a viable arbitrage opportunity on a Polymarket binary market.
@@ -359,7 +359,7 @@ class ArbSignal:
 # NegRisk data structures (Phase 9)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ArbLeg:
     """
     A single NO-side leg in a NegRisk multi-outcome arbitrage bundle.
@@ -373,7 +373,7 @@ class ArbLeg:
     size:     float   # shares per bundle (= n_bundles)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class NegRiskSignal:
     """
     Describes a viable NegRisk arbitrage opportunity across N mutually

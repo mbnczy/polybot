@@ -7,6 +7,7 @@ Telegram trade notification.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import aiosqlite
@@ -104,7 +105,7 @@ async def test_full_pipeline_paper_arb(
                 n_shares=n, net_profit=round(n * sig.net_edge, 6),
             )
             inv_mgr.register_matched_pair(
-                ArbSignal(**{**sig.__dict__, "yes_size": n, "no_size": n}),
+                replace(sig, yes_size=n, no_size=n),   # slots-safe copy-with-overrides
                 tx_hash="0x" + "de" * 32,
             )
             return    # one cycle is enough for E2E

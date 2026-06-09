@@ -68,6 +68,19 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
+# ── Fast JSON parse ───────────────────────────────────────────────────────────
+# orjson is ~2–5× faster than stdlib json on the per-message WS hot path. It is
+# optional: when absent we fall back to stdlib json with zero behavioural change
+# (add `orjson` to requirements.txt to activate the speedup in production).
+try:
+    import orjson
+
+    def _loads(raw: "str | bytes"):
+        return orjson.loads(raw)
+except ImportError:  # pragma: no cover - fallback path
+    def _loads(raw: "str | bytes"):
+        return json.loads(raw)
+
 _WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 _INITIAL_BACKOFF = 1.0    # seconds
@@ -224,7 +237,7 @@ class MarketFeed:
     async def _dispatch(self, raw: str) -> None:
         """Parse one raw WS text frame and update best-ask state."""
         try:
-            data = json.loads(raw)
+            data = _loads(raw)
         except json.JSONDecodeError:
             logger.warning("Non-JSON WS message dropped: %s", raw[:120])
             return
