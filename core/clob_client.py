@@ -74,6 +74,7 @@ import os
 import random
 import re
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -86,7 +87,7 @@ from web3 import Web3
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, LimitOrderArgs, MarketOrderArgs, OrderType
 
-from telemetry.metrics import MATCH_ORDERS_TOTAL
+from telemetry.metrics import MATCH_ORDERS_TOTAL, SIGN_SECONDS, SUBMIT_SECONDS
 from strategy.arbitrage import TICK_SIZE   # single source of truth for tick size
 
 logger = logging.getLogger(__name__)
@@ -820,16 +821,20 @@ class PolyClient:
         no_args  = MarketOrderArgs(token_id=no_token_id,  amount=no_size,  side="BUY", price=no_price)
 
         # Step 1 — sign both concurrently (CPU-bound ECDSA in executor)
+        _sign_t0 = time.monotonic()
         yes_signed, no_signed = await asyncio.gather(
             self._run_with_retry(self._client.create_market_order, yes_args),
             self._run_with_retry(self._client.create_market_order, no_args),
         )
+        SIGN_SECONDS.observe(time.monotonic() - _sign_t0)
 
         # Step 2 — submit both FOK orders simultaneously
+        _submit_t0 = time.monotonic()
         yes_resp, no_resp = await asyncio.gather(
             self._run_with_retry(self._client.post_order, yes_signed, OrderType.FOK),
             self._run_with_retry(self._client.post_order, no_signed,  OrderType.FOK),
         )
+        SUBMIT_SECONDS.observe(time.monotonic() - _submit_t0)
 
         logger.info("ARB PAIR submitted | YES=%s | NO=%s", yes_resp, no_resp)
         MATCH_ORDERS_TOTAL.inc()

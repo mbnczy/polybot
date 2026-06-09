@@ -66,6 +66,8 @@ from typing import Optional
 
 import aiohttp
 
+from telemetry.metrics import WS_PARSE_SECONDS
+
 logger = logging.getLogger(__name__)
 
 # ── Fast JSON parse ───────────────────────────────────────────────────────────
@@ -236,11 +238,13 @@ class MarketFeed:
 
     async def _dispatch(self, raw: str) -> None:
         """Parse one raw WS text frame and update best-ask state."""
+        _parse_t0 = time.monotonic()
         try:
             data = _loads(raw)
         except json.JSONDecodeError:
             logger.warning("Non-JSON WS message dropped: %s", raw[:120])
             return
+        WS_PARSE_SECONDS.observe(time.monotonic() - _parse_t0)
 
         # Polymarket may send a single dict or an array of event dicts.
         events: list[dict] = data if isinstance(data, list) else [data]

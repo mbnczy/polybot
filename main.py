@@ -123,6 +123,7 @@ from telemetry.metrics import (                                    # noqa: E402
     EVAL_LATENCY,
     REAL_EDGE_BPS,
     STALE_TICKS_SKIPPED,
+    TICK_TO_ACK_SECONDS,
     USDC_BALANCE,
     WS_LATENCY_MS,
     metrics_server,
@@ -432,6 +433,9 @@ async def strategy_loop(
                         no_price=no_ask,
                         no_size=n_shares,
                     )
+
+                # End-to-end latency: arb_tick timestamp → order submission ack.
+                TICK_TO_ACK_SECONDS.observe(time.monotonic() - tick["ts"])
 
                 # ── 6a. Reconcile fills — never book a half-fill as profit ──────
                 # A single-leg fill is naked directional risk, not arbitrage.

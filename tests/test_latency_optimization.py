@@ -15,6 +15,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from prometheus_client import REGISTRY
 
 from strategy.arbitrage import FeeEngine, MakerRebateEngine, _CACHE_TTL
 
@@ -132,3 +133,30 @@ async def test_on_admit_fires_and_prewarms(monkeypatch):
     assert rebate_engine.peek_maker_rebate("0xcrypto") == 0.0144
     assert fee_engine.peek_taker_fee("0xcrypto") == 0.015
     await real_reg.stop_all()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 0 — per-hop instrumentation
+# ═══════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_ws_parse_metric_observes():
+    """_dispatch must record a WS_PARSE_SECONDS sample per parsed message."""
+    from core.ws_feed import MarketFeed
+
+    before = REGISTRY.get_sample_value("polly_ws_parse_seconds_count") or 0.0
+    feed = MarketFeed("Y", "N", "0xc", asyncio.Queue())
+    await feed._dispatch(
+        '{"event_type":"book","asset_id":"Y","asks":[{"price":"0.47","size":"10"}]}'
+    )
+    after = REGISTRY.get_sample_value("polly_ws_parse_seconds_count") or 0.0
+    assert after - before == pytest.approx(1.0)
+
+
+def test_orjson_jsondecodeerror_is_caught():
+    """orjson.JSONDecodeError subclasses json.JSONDecodeError, so the existing
+    _dispatch except clause still catches malformed frames."""
+    import json
+    from core.ws_feed import _loads
+    with pytest.raises(json.JSONDecodeError):
+        _loads("{not json")
