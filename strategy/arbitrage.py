@@ -227,6 +227,20 @@ class MakerRebateEngine:
         self._cache[condition_id] = (rate, time.monotonic())
         return rate
 
+    def peek_maker_rebate(self, condition_id: str) -> float | None:
+        """
+        Synchronous cache peek — returns the fresh cached rebate or None.
+
+        Never fetches.  Lets the hot path avoid an event-loop bounce
+        (`await`) when the cache is warm (the common case after pre-warming).
+        """
+        cached = self._cache.get(condition_id)
+        if cached is not None:
+            rate, ts = cached
+            if time.monotonic() - ts < _CACHE_TTL:
+                return rate
+        return None
+
     def prime_cache(
         self,
         condition_id:  str,
@@ -619,6 +633,18 @@ class FeeEngine:
         fee = await self._fetch_fee(condition_id)
         self._cache[condition_id] = (fee, time.monotonic())
         return fee
+
+    def peek_taker_fee(self, condition_id: str) -> float | None:
+        """
+        Synchronous cache peek — returns the fresh cached fee or None (no fetch).
+        Lets the hot path skip an `await` when the cache is warm.
+        """
+        cached = self._cache.get(condition_id)
+        if cached is not None:
+            fee, ts = cached
+            if time.monotonic() - ts < _CACHE_TTL:
+                return fee
+        return None
 
     def prime_cache(self, condition_id: str, fee_rate: float) -> None:
         self._cache[condition_id] = (fee_rate, time.monotonic())

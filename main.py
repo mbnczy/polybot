@@ -110,6 +110,7 @@ from strategy.arbitrage import (                                   # noqa: E402
     MakerRebateEngine,
     NegRiskArbDetector,
     NegRiskSignal,
+    _normalise_fee,
 )
 from strategy.tuner import tuner_loop                               # noqa: E402
 from telemetry.db_logger import SignalLogger                        # noqa: E402
@@ -119,6 +120,7 @@ from telemetry.metrics import (                                    # noqa: E402
     ARB_HALF_FILLS,
     ARB_UNWIND_FAILURES,
     CUMULATIVE_PNL,
+    EVAL_LATENCY,
     REAL_EDGE_BPS,
     STALE_TICKS_SKIPPED,
     USDC_BALANCE,
@@ -226,7 +228,9 @@ async def strategy_loop(
                     (asyncio.get_event_loop().time() - tick.get("ts", 0)) * 1000
                 )
 
-                rebate = await rebate_engine.get_maker_rebate(condition_id)
+                rebate = rebate_engine.peek_maker_rebate(condition_id)
+                if rebate is None:
+                    rebate = await rebate_engine.get_maker_rebate(condition_id)
                 nr_signal: Optional[NegRiskSignal] = neg_risk_det.evaluate_neg_risk(
                     condition_id=condition_id,
                     outcome_token_ids=outcome_token_ids,
@@ -312,8 +316,14 @@ async def strategy_loop(
                 )
                 continue
 
-            # ── 1. Fetch real-time taker fee (cached, ~0 overhead) ────────────
-            fee_rate: float = await fee_engine.get_taker_fee(condition_id)
+            # ── 1. Fetch real-time taker fee ──────────────────────────────────
+            # Peek the cache synchronously first (no event-loop bounce); only
+            # await a network fetch on a cold miss. After scanner pre-warming the
+            # peek almost always hits, keeping the hot path fully synchronous.
+            _eval_t0 = time.monotonic()
+            fee_rate = fee_engine.peek_taker_fee(condition_id)
+            if fee_rate is None:
+                fee_rate = await fee_engine.get_taker_fee(condition_id)
 
             # ── 2a. Taker arb evaluation ──────────────────────────────────────
             arb_signal: Optional[ArbSignal] = detector.evaluate(
@@ -328,7 +338,9 @@ async def strategy_loop(
 
             # ── 2b. Maker arb fallback (DutchBookPricer) ──────────────────────
             if arb_signal is None:
-                rebate = await rebate_engine.get_maker_rebate(condition_id)
+                rebate = rebate_engine.peek_maker_rebate(condition_id)
+                if rebate is None:
+                    rebate = await rebate_engine.get_maker_rebate(condition_id)
                 arb_signal = dutch_pricer.evaluate_maker(
                     condition_id=condition_id,
                     yes_token_id=yes_token_id,
@@ -338,6 +350,9 @@ async def strategy_loop(
                     max_position_usdc=MAX_ARB_PAIR_USDC,
                     maker_rebate=rebate,
                 )
+
+            # Record dequeue→decision latency (covers both taker + maker paths).
+            EVAL_LATENCY.observe(time.monotonic() - _eval_t0)
 
             if arb_signal is None:
                 continue
@@ -620,6 +635,18 @@ async def main() -> None:
         )
         seed_cond = None
 
+    # ── cache pre-warm: prime fee+rebate the moment a market is admitted, so
+    #    the first arb_tick is a cache hit (no network round-trip in the hot
+    #    path).  Synchronous dict writes only — no network here.
+    def _prewarm_caches(condition_id: str, market: dict) -> None:
+        category = str(market.get("category") or "")
+        rebate_engine.prime_cache(condition_id, category_slug=category)
+        fee_raw = market.get("feeRate")
+        if fee_raw is not None:
+            fee = _normalise_fee(fee_raw)
+            if fee is not None:
+                fee_engine.prime_cache(condition_id, fee)
+
     # ── scanner: pre-populate known set with any ENV-seeded condition ─────
     seed_ids: set[str] = {seed_cond} if seed_cond and CONDITION_ID else set()
     scanner = MarketScanner(
@@ -630,6 +657,7 @@ async def main() -> None:
         feed_registry=feed_registry,
         prune_idle_s=_prune_idle_s,
         min_volume_24h=_min_volume_24h,
+        on_admit=_prewarm_caches,
     )
 
     # ── auto redeemer ─────────────────────────────────────────────────────

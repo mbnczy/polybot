@@ -128,6 +128,12 @@ REAL_EDGE_BPS = Gauge(
     "Real (pre-rebate) Dutch-book edge of the latest detected signal, in bps "
     "[= (1 - (yes_ask + no_ask)) * 10000]",
 )
+EVAL_LATENCY = Histogram(
+    "polly_eval_latency_seconds",
+    "Hot-path latency from arb_tick dequeue to signal decision (lower = faster "
+    "reaction to fleeting arbs)",
+    buckets=[1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2, 1e-1],
+)
 
 
 # ── Async HTTP server ─────────────────────────────────────────────────────────

@@ -356,6 +356,7 @@ class MarketScanner:
         feed_registry:      "FeedRegistry | None" = None,
         prune_idle_s:       float = 0.0,
         min_volume_24h:     float = 0.0,
+        on_admit:           "Callable[[str, dict], None] | None" = None,
     ) -> None:
         self._on_market_added = on_market_added
         self._scan_interval   = scan_interval
@@ -370,6 +371,10 @@ class MarketScanner:
         # Liquidity floor: skip candidates whose 24h volume is below this (dead
         # books waste a feed slot and rarely offer capturable arbs). 0 = off.
         self._min_volume_24h  = max(0.0, min_volume_24h)
+        # Latency: fired (condition_id, market_dict) on each admitted market so
+        # callers can pre-warm fee/rebate caches BEFORE the first tick arrives,
+        # removing a network round-trip from the hot path. Synchronous + cheap.
+        self._on_admit        = on_admit
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public control
@@ -455,6 +460,8 @@ class MarketScanner:
 
                 self._known.add(condition_id)
                 new_count += 1
+                if self._on_admit is not None:
+                    self._on_admit(condition_id, m)   # pre-warm caches
                 logger.info(
                     "MarketScanner | new market condition=%s yes=%s no=%s",
                     condition_id[:16], yes_id[:12], no_id[:12],
@@ -568,6 +575,8 @@ class MarketScanner:
                 continue
             self._known.add(condition_id)
             new_count += 1
+            if self._on_admit is not None:
+                self._on_admit(condition_id, m)   # pre-warm caches off the hot path
             logger.info(
                 "MarketScanner | new market condition=%s yes=%s no=%s score=%.4f",
                 condition_id[:16], yes_id[:12], no_id[:12], score,
