@@ -160,6 +160,11 @@ TICK_TO_ACK_SECONDS = Histogram(
     "End-to-end latency from arb_tick timestamp to order submission ack",
     buckets=_LAT_BUCKETS,
 )
+CAPITAL_RECYCLED_TOTAL = Counter(
+    "polly_capital_recycled_total",
+    "Positions settled via mergePositions (collateral recycled to USDC, freeing "
+    "capital for new arbs instead of waiting for market resolution)",
+)
 
 
 # ── Async HTTP server ─────────────────────────────────────────────────────────

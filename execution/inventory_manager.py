@@ -59,6 +59,7 @@ from risk.circuit_breaker import (
     CircuitBreaker,
     CircuitBreakerTripped,
 )
+from telemetry.metrics import CAPITAL_RECYCLED_TOTAL
 
 if TYPE_CHECKING:
     from core.clob_client import PolyClient
@@ -185,6 +186,11 @@ class Position:
     no_fill:   LegFill | None = field(default=None)
     status:    str            = field(default="PENDING")
     is_negrisk: bool          = field(default=False)
+    # True  → _on_settled books P&L into the breaker (matchOrders/NegRisk path
+    #         where the strategy loop did NOT book it).
+    # False → P&L was already booked at fill time (binary FOK/maker path); the
+    #         settlement here only recycles collateral via mergePositions.
+    book_pnl_on_settle: bool  = field(default=True)
 
     @property
     def is_paired(self) -> bool:
@@ -349,6 +355,53 @@ class InventoryManager:
         # Schedule settlement immediately — no hedge timer needed
         asyncio.ensure_future(self._settle(pos))
 
+    def register_paired_fill(
+        self,
+        signal:     "ArbSignal",
+        *,
+        is_negrisk: bool = False,
+    ) -> None:
+        """
+        Register a binary FOK/maker arb pair whose BOTH legs are already filled,
+        for **capital recycling only** (mergePositions → USDC now, instead of
+        waiting until market resolution).
+
+        Unlike `register_matched_pair`, P&L is NOT booked at settlement here —
+        the strategy loop already booked it at fill time. Set via
+        `book_pnl_on_settle=False` to avoid double-counting.
+        """
+        if signal.condition_id in self._positions:
+            return   # already tracked
+        synthetic_id = f"fill-{signal.condition_id[:16]}-{int(time.monotonic()*1e3)}"
+        pos = Position(
+            condition_id=signal.condition_id,
+            yes_token_id=signal.yes_token_id,
+            no_token_id=signal.no_token_id,
+            yes_order_id=synthetic_id,
+            no_order_id=synthetic_id,
+            n_shares=signal.yes_size,
+            submitted_at=time.monotonic(),
+            yes_fill=LegFill(
+                token_id=signal.yes_token_id, side="YES",
+                fill_price=signal.yes_ask, shares=signal.yes_size,
+                fill_time=time.monotonic(),
+            ),
+            no_fill=LegFill(
+                token_id=signal.no_token_id, side="NO",
+                fill_price=signal.no_ask, shares=signal.yes_size,
+                fill_time=time.monotonic(),
+            ),
+            status="PAIRED",
+            is_negrisk=is_negrisk,
+            book_pnl_on_settle=False,   # P&L already booked at fill
+        )
+        self._positions[signal.condition_id] = pos
+        logger.info(
+            "Position registered (paired fill, recycle-only) | condition=%s shares=%.2f",
+            signal.condition_id[:16], signal.yes_size,
+        )
+        asyncio.ensure_future(self._settle(pos))
+
     # ──────────────────────────────────────────────────────────────────────────
     # Fill polling (detects on-chain confirmations for registered positions)
     # ──────────────────────────────────────────────────────────────────────────
@@ -469,21 +522,32 @@ class InventoryManager:
             )
 
     def _on_settled(self, pos: Position) -> None:
-        """Book the guaranteed profit into the circuit breaker and clean up."""
+        """
+        Finalise a settled position: recycle capital (already merged on-chain by
+        the caller) and — only when this path owns P&L — book the guaranteed
+        profit into the circuit breaker.
+
+        `book_pnl_on_settle` is False for the binary FOK/maker path, where the
+        strategy loop already booked P&L at fill time; settling there merely
+        recycles collateral, so we must NOT double-count.
+        """
         yes_paid   = pos.yes_fill.fill_price * pos.n_shares if pos.yes_fill else 0.0
         no_paid    = pos.no_fill.fill_price  * pos.n_shares if pos.no_fill  else 0.0
         total_paid = yes_paid + no_paid
         net_pnl    = round(pos.n_shares - total_paid, 6)
 
-        try:
-            self._breaker.on_fill(pnl=net_pnl)
-        except CircuitBreakerTripped:
-            raise
+        if pos.book_pnl_on_settle:
+            try:
+                self._breaker.on_fill(pnl=net_pnl)
+            except CircuitBreakerTripped:
+                raise
 
+        CAPITAL_RECYCLED_TOTAL.inc()
         logger.info(
             "Position settled | condition=%s n_shares=%.2f total_paid=%.6f "
-            "net_pnl=%.6f USDC",
+            "net_pnl=%.6f USDC booked_pnl=%s",
             pos.condition_id[:16], pos.n_shares, total_paid, net_pnl,
+            pos.book_pnl_on_settle,
         )
         self._positions.pop(pos.condition_id, None)
 

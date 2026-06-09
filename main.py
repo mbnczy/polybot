@@ -90,6 +90,7 @@ load_dotenv()
 from core.clob_client import PolyClient, classify_fills            # noqa: E402
 from core.scanner import FeedRegistry, MarketScanner               # noqa: E402
 from execution.auto_redeem import AutoRedeemer                     # noqa: E402
+from execution.inventory_manager import InventoryManager           # noqa: E402
 from risk.circuit_breaker import (                                 # noqa: E402
     ArbOrderIntent,
     CircuitBreaker,
@@ -200,6 +201,7 @@ async def strategy_loop(
     client:         PolyClient,
     notifier:       TelegramNotifier,
     sig_logger:     SignalLogger,
+    inventory:      "InventoryManager | None" = None,
 ) -> None:
     """
     Consumes arb_tick / neg_risk_tick snapshots from ALL active market feeds.
@@ -463,6 +465,12 @@ async def strategy_loop(
                         guaranteed_profit=net_profit,
                     )
 
+                    # Recycle capital immediately: merge the complete YES+NO set
+                    # back to USDC now instead of waiting for resolution. P&L is
+                    # already booked above (register_paired_fill won't re-book).
+                    if inventory is not None:
+                        inventory.register_paired_fill(arb_signal)
+
                 elif fill_state in ("yes_only", "no_only"):
                     # Naked single-leg exposure — flatten immediately, book no profit.
                     ARB_HALF_FILLS.inc()
@@ -670,6 +678,11 @@ async def main() -> None:
         notifier=notifier,
     )
 
+    # ── inventory manager: recycles paired-fill collateral via mergePositions
+    #    (instant USDC instead of waiting for resolution → higher capital
+    #    velocity). P&L is booked at fill time; this only recycles capital.
+    inventory = InventoryManager(client, breaker, notifier)
+
     await notifier.notify(
         f"Polymarket ARB Bot v7 online\n"
         f"balance={STARTING_BALANCE} USDC | margin={_desired_margin:.3f} "
@@ -718,10 +731,12 @@ async def main() -> None:
             strategy_loop(
                 market_queue, detector, dutch_pricer, neg_risk_det, rebate_engine,
                 fee_engine, breaker, client, notifier, sig_logger,
+                inventory=inventory,
             ),
             name="strategy",
         ),
         asyncio.create_task(auto_redeem_loop(redeemer),                        name="auto_redeem"),
+        asyncio.create_task(inventory.run(),                                   name="inventory"),
         asyncio.create_task(heartbeat_loop(breaker, notifier, feed_registry),  name="heartbeat"),
         asyncio.create_task(telegram_loop(notifier),                           name="telegram"),
         asyncio.create_task(sig_logger.run(),                                  name="sig_logger"),

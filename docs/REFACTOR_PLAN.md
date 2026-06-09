@@ -277,7 +277,7 @@ position, integration suite green.
 | 1 | Hot-path micro-opts (orjson, slots) | low | **✅ implemented** |
 | 2 | Decouple detection/execution | medium | planned |
 | 3 | Execution-path latency | medium | planned |
-| 4 | Capital recycling (InventoryManager) | med-high | planned (biggest $) |
+| 4 | Capital recycling (InventoryManager) | med-high | **✅ implemented** (binary path = recycle-only; P&L stays booked at fill; NegRisk path books at settle) |
 | 5 | Structural refactor / typed Config | low | planned |
 
 Recommended order: **0 → 1 (done) → 2 → 3 → 4 → 5**, doing 0 first so 2–4 are
