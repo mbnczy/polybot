@@ -1,3 +1,28 @@
+# ── Secrets — NEVER commit ────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+
+# ── Generated / runtime data (reproducible; not source) ───────────────────────
+data/
+signals.db
+*.log
+
+# ── Local scratch / IDE ───────────────────────────────────────────────────────
+asd
+
+# ── Vendored / nested repos & skill bundles ───────────────────────────────────
 .github
 docs
 claude-trading-skills
+skills/
