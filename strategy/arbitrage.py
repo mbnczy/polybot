@@ -211,6 +211,19 @@ class MakerRebateEngine:
         self._default = max(0.0, min(default_rebate, MAX_MAKER_REBATE))
         # condition_id → (rebate_rate, cached_at_monotonic)
         self._cache: dict[str, tuple[float, float]] = {}
+        # Persistent keep-alive session — reused across cold-miss fetches (e.g.
+        # cache TTL expiry) to avoid a fresh TCP/TLS handshake each time.
+        self._session: "aiohttp.ClientSession | None" = None
+
+    def _get_session(self) -> "aiohttp.ClientSession":
+        if self._session is None or getattr(self._session, "closed", False):
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def close(self) -> None:
+        """Close the keep-alive session (call on shutdown)."""
+        if self._session is not None and not getattr(self._session, "closed", False):
+            await self._session.close()
 
     async def get_maker_rebate(self, condition_id: str) -> float:
         """
@@ -267,15 +280,15 @@ class MakerRebateEngine:
     async def _fetch_rebate(self, condition_id: str) -> float:
         """Query Gamma API for market category, then look up the rebate."""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{_GAMMA_HOST}/markets",
-                    params={"conditionId": condition_id},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    if resp.status != 200:
-                        return self._default
-                    data = await resp.json(content_type=None)
+            session = self._get_session()
+            async with session.get(
+                f"{_GAMMA_HOST}/markets",
+                params={"conditionId": condition_id},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    return self._default
+                data = await resp.json(content_type=None)
 
             markets = data if isinstance(data, list) else data.get("data", [])
             if not markets:
@@ -621,6 +634,18 @@ class FeeEngine:
     def __init__(self, default_fee: float = DEFAULT_TAKER_FEE) -> None:
         self._default = default_fee
         self._cache: dict[str, tuple[float, float]] = {}
+        # Persistent keep-alive session — reused across cold-miss fee fetches.
+        self._session: "aiohttp.ClientSession | None" = None
+
+    def _get_session(self) -> "aiohttp.ClientSession":
+        if self._session is None or getattr(self._session, "closed", False):
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def close(self) -> None:
+        """Close the keep-alive session (call on shutdown)."""
+        if self._session is not None and not getattr(self._session, "closed", False):
+            await self._session.close()
 
     async def get_taker_fee(self, condition_id: str) -> float:
         """Return the taker fee rate as a fraction (0.02 = 2.0 %)."""
@@ -672,15 +697,15 @@ class FeeEngine:
 
     async def _try_gamma(self, condition_id: str) -> float | None:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{_GAMMA_HOST}/markets",
-                    params={"conditionId": condition_id},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    if resp.status != 200:
-                        return None
-                    data = await resp.json(content_type=None)
+            session = self._get_session()
+            async with session.get(
+                f"{_GAMMA_HOST}/markets",
+                params={"conditionId": condition_id},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
             markets = data if isinstance(data, list) else data.get("data", [])
             if not markets:
                 return None
@@ -695,14 +720,14 @@ class FeeEngine:
 
     async def _try_clob(self, condition_id: str) -> float | None:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{_CLOB_HOST}/markets/{condition_id}",
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    if resp.status != 200:
-                        return None
-                    data = await resp.json(content_type=None)
+            session = self._get_session()
+            async with session.get(
+                f"{_CLOB_HOST}/markets/{condition_id}",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
             for fld in ("takerBaseFee", "taker_base_fee"):
                 raw = data.get(fld)
                 if raw is not None:

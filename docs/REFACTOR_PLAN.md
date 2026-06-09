@@ -273,15 +273,26 @@ position, integration suite green.
 
 | Phase | Title | Risk | Status |
 |------:|-------|------|--------|
-| 0 | Measurement & baseline | none | planned (next) |
+| 0 | Measurement & baseline | none | **✅ implemented** (per-hop histograms + `bench_hotpath.py`) |
 | 1 | Hot-path micro-opts (orjson, slots) | low | **✅ implemented** |
-| 2 | Decouple detection/execution | medium | planned |
-| 3 | Execution-path latency | medium | planned |
+| 2 | Decouple detection/execution | medium | **DEFERRED — safety** (see note below) |
+| 3 | Execution-path latency | medium | **◑ partial** (keep-alive sessions done; pre-signing/threadpool tuning planned) |
 | 4 | Capital recycling (InventoryManager) | med-high | **✅ implemented** (binary path = recycle-only; P&L stays booked at fill; NegRisk path books at settle) |
 | 5 | Structural refactor / typed Config | low | planned |
 
-Recommended order: **0 → 1 (done) → 2 → 3 → 4 → 5**, doing 0 first so 2–4 are
-measured, not guessed.
+Recommended order: **0 → 1 → 2 → 3 → 4 → 5**, doing 0 first so 2–4 are
+measured, not guessed. **Done so far: 0, 1, 4, and Phase 3 (keep-alive).**
+
+> **⚠ Phase 2 safety finding (why it is DEFERRED).** Fully decoupling execution
+> into detached background tasks would move `breaker.on_fill` — and with it the
+> **daily-loss `CircuitBreakerTripped` emergency halt** — into a fire-and-forget
+> task. A trip raised there would NOT propagate to `main`'s `asyncio.gather`
+> (which is the mechanism that halts the bot), silently defeating the kill
+> switch. For a **rare-arb** strategy the consumer almost never blocks (executions
+> are infrequent), so the throughput upside is largely theoretical while the
+> safety downside is real. Phase 2 should only be done with a design that
+> preserves halt propagation (e.g. a shared shutdown event the execution workers
+> set on trip, which `main` awaits) — deferred until that is in place.
 
 ---
 
