@@ -79,6 +79,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -86,7 +87,7 @@ from dotenv import load_dotenv
 # ── load .env before any module that reads os.environ ──────────────────────
 load_dotenv()
 
-from core.clob_client import PolyClient                            # noqa: E402
+from core.clob_client import PolyClient, classify_fills            # noqa: E402
 from core.scanner import FeedRegistry, MarketScanner               # noqa: E402
 from execution.auto_redeem import AutoRedeemer                     # noqa: E402
 from risk.circuit_breaker import (                                 # noqa: E402
@@ -101,17 +102,27 @@ from strategy.arbitrage import (                                   # noqa: E402
     ArbSignal,
     DEFAULT_TAKER_FEE,
     DESIRED_NET_MARGIN,
+    EXTREME_PRICE_HI,
+    EXTREME_PRICE_LO,
+    MIN_REAL_EDGE,
     DutchBookPricer,
     FeeEngine,
     MakerRebateEngine,
     NegRiskArbDetector,
     NegRiskSignal,
+    _normalise_fee,
 )
 from strategy.tuner import tuner_loop                               # noqa: E402
 from telemetry.db_logger import SignalLogger                        # noqa: E402
 from telemetry.metrics import (                                    # noqa: E402
     ACTIVE_MARKETS,
+    ARB_DETECTED_TOTAL,
+    ARB_HALF_FILLS,
+    ARB_UNWIND_FAILURES,
     CUMULATIVE_PNL,
+    EVAL_LATENCY,
+    REAL_EDGE_BPS,
+    STALE_TICKS_SKIPPED,
     USDC_BALANCE,
     WS_LATENCY_MS,
     metrics_server,
@@ -140,6 +151,18 @@ _desired_margin = float(os.environ.get("DESIRED_NET_MARGIN", DESIRED_NET_MARGIN)
 _default_fee    = float(os.environ.get("DEFAULT_TAKER_FEE",  DEFAULT_TAKER_FEE))
 _scan_interval  = float(os.environ.get("SCAN_INTERVAL",      300.0))
 _max_feeds      = int(os.environ.get("MAX_FEEDS",            50))
+# Efficiency controls — drop feeds idle longer than this (0 = never prune) and
+# skip markets below this 24h volume floor (0 = no floor).
+_prune_idle_s   = float(os.environ.get("FEED_PRUNE_IDLE_S",  600.0))
+_min_volume_24h = float(os.environ.get("MIN_VOLUME_24H",     0.0))
+# Reject ticks that waited longer than this in the queue (stale quote → adverse
+# selection). 0 = disabled. Default 2s tolerates bursts without acting on stale.
+_max_tick_age_s = float(os.environ.get("MAX_TICK_AGE_S",     2.0))
+# Signal-quality guards — skip near-resolved/extreme markets and (optionally)
+# require a genuine pre-rebate gap on the maker path.
+_extreme_lo     = float(os.environ.get("EXTREME_PRICE_LO",   EXTREME_PRICE_LO))
+_extreme_hi     = float(os.environ.get("EXTREME_PRICE_HI",   EXTREME_PRICE_HI))
+_min_real_edge  = float(os.environ.get("MIN_REAL_EDGE",      MIN_REAL_EDGE))
 
 # Optional single-market seed (backward-compatible with Phase ≤ 6 .env files)
 YES_TOKEN_ID: str = os.environ.get("YES_TOKEN_ID", "").strip()
@@ -205,7 +228,9 @@ async def strategy_loop(
                     (asyncio.get_event_loop().time() - tick.get("ts", 0)) * 1000
                 )
 
-                rebate = await rebate_engine.get_maker_rebate(condition_id)
+                rebate = rebate_engine.peek_maker_rebate(condition_id)
+                if rebate is None:
+                    rebate = await rebate_engine.get_maker_rebate(condition_id)
                 nr_signal: Optional[NegRiskSignal] = neg_risk_det.evaluate_neg_risk(
                     condition_id=condition_id,
                     outcome_token_ids=outcome_token_ids,
@@ -277,12 +302,28 @@ async def strategy_loop(
             no_ask:       float = tick["no_ask"]
 
             # ── Metrics: WebSocket delivery latency ───────────────────────────
-            WS_LATENCY_MS.set(
-                (asyncio.get_event_loop().time() - tick["ts"]) * 1000
-            )
+            # ws_feed stamps tick["ts"] with time.monotonic(); compare on the
+            # SAME clock (NOT loop.time(), which differs under uvloop).
+            tick_age = time.monotonic() - tick["ts"]
+            WS_LATENCY_MS.set(tick_age * 1000)
 
-            # ── 1. Fetch real-time taker fee (cached, ~0 overhead) ────────────
-            fee_rate: float = await fee_engine.get_taker_fee(condition_id)
+            # ── Freshness guard: skip stale quotes (likely already moved) ──────
+            if _max_tick_age_s > 0 and tick_age > _max_tick_age_s:
+                STALE_TICKS_SKIPPED.inc()
+                logger.debug(
+                    "Stale tick for %s — age=%.3fs > %.3fs, skipping",
+                    condition_id[:16], tick_age, _max_tick_age_s,
+                )
+                continue
+
+            # ── 1. Fetch real-time taker fee ──────────────────────────────────
+            # Peek the cache synchronously first (no event-loop bounce); only
+            # await a network fetch on a cold miss. After scanner pre-warming the
+            # peek almost always hits, keeping the hot path fully synchronous.
+            _eval_t0 = time.monotonic()
+            fee_rate = fee_engine.peek_taker_fee(condition_id)
+            if fee_rate is None:
+                fee_rate = await fee_engine.get_taker_fee(condition_id)
 
             # ── 2a. Taker arb evaluation ──────────────────────────────────────
             arb_signal: Optional[ArbSignal] = detector.evaluate(
@@ -297,7 +338,9 @@ async def strategy_loop(
 
             # ── 2b. Maker arb fallback (DutchBookPricer) ──────────────────────
             if arb_signal is None:
-                rebate = await rebate_engine.get_maker_rebate(condition_id)
+                rebate = rebate_engine.peek_maker_rebate(condition_id)
+                if rebate is None:
+                    rebate = await rebate_engine.get_maker_rebate(condition_id)
                 arb_signal = dutch_pricer.evaluate_maker(
                     condition_id=condition_id,
                     yes_token_id=yes_token_id,
@@ -308,11 +351,38 @@ async def strategy_loop(
                     maker_rebate=rebate,
                 )
 
+            # Record dequeue→decision latency (covers both taker + maker paths).
+            EVAL_LATENCY.observe(time.monotonic() - _eval_t0)
+
             if arb_signal is None:
                 continue
 
             # ── 3. Persist signal ─────────────────────────────────────────────
             sig_logger.log_arb(arb_signal)
+
+            # Observability: count detections and track the *real* (pre-rebate)
+            # edge so dashboards can distinguish quality from rebate-inflation.
+            ARB_DETECTED_TOTAL.inc()
+            REAL_EDGE_BPS.set(round((1.0 - (yes_ask + no_ask)) * 10_000, 1))
+
+            # ── 3b. Real-time detection alert (throttled, fill-independent) ────
+            # Fires the moment an arb is detected, before sizing/breaker gating,
+            # so opportunities blocked downstream are still surfaced. The
+            # notifier self-throttles per-market (ARB_ALERT_COOLDOWN_S) and by
+            # minimum edge (ARB_ALERT_MIN_BPS) to avoid flooding the chat.
+            display_edge = (
+                arb_signal.maker_net_edge
+                if arb_signal.is_maker_signal
+                else arb_signal.net_edge
+            )
+            notifier.send_arb_detected(
+                condition_id=condition_id,
+                combined_cost=arb_signal.combined_cost,
+                net_edge=display_edge,
+                is_maker=arb_signal.is_maker_signal,
+                yes_price=yes_ask,
+                no_price=no_ask,
+            )
 
             # ── 4. Size the position ──────────────────────────────────────────
             if arb_signal.is_maker_signal:
@@ -345,7 +415,7 @@ async def strategy_loop(
             # ── 6. Execute ────────────────────────────────────────────────────
             try:
                 if arb_signal.is_maker_signal:
-                    await client.execute_arb_maker_pair(
+                    yes_resp, no_resp = await client.execute_arb_maker_pair(
                         yes_token_id=yes_token_id,
                         yes_bid=arb_signal.yes_bid,
                         yes_size=n_shares,
@@ -354,7 +424,7 @@ async def strategy_loop(
                         no_size=n_shares,
                     )
                 else:
-                    await client.execute_arb_pair(
+                    yes_resp, no_resp = await client.execute_arb_pair(
                         yes_token_id=yes_token_id,
                         yes_price=yes_ask,
                         yes_size=n_shares,
@@ -363,26 +433,61 @@ async def strategy_loop(
                         no_size=n_shares,
                     )
 
-                net_profit: float = round(n_shares * arb_signal.net_edge, 6)
-                breaker.on_arb_open()
-                breaker.on_fill(pnl=net_profit)
+                # ── 6a. Reconcile fills — never book a half-fill as profit ──────
+                # A single-leg fill is naked directional risk, not arbitrage.
+                fill_state = classify_fills(yes_resp, no_resp)
 
-                status = breaker.status_dict()
-                CUMULATIVE_PNL.set(status["session_pnl"])
-                USDC_BALANCE.set(
-                    status["starting_balance"] + status["session_pnl"]
-                )
+                if fill_state == "both":
+                    net_profit: float = round(n_shares * arb_signal.net_edge, 6)
+                    breaker.on_arb_open()
+                    breaker.on_fill(pnl=net_profit)
 
-                await notifier.send_trade_execution(
-                    condition_id=condition_id,
-                    yes_token_id=yes_token_id,
-                    no_token_id=no_token_id,
-                    yes_ask=yes_ask,
-                    no_ask=no_ask,
-                    n_shares=n_shares,
-                    combined_cost=arb_signal.combined_cost,
-                    guaranteed_profit=net_profit,
-                )
+                    status = breaker.status_dict()
+                    CUMULATIVE_PNL.set(status["session_pnl"])
+                    USDC_BALANCE.set(
+                        status["starting_balance"] + status["session_pnl"]
+                    )
+
+                    await notifier.send_trade_execution(
+                        condition_id=condition_id,
+                        yes_token_id=yes_token_id,
+                        no_token_id=no_token_id,
+                        yes_ask=yes_ask,
+                        no_ask=no_ask,
+                        n_shares=n_shares,
+                        combined_cost=arb_signal.combined_cost,
+                        guaranteed_profit=net_profit,
+                    )
+
+                elif fill_state in ("yes_only", "no_only"):
+                    # Naked single-leg exposure — flatten immediately, book no profit.
+                    ARB_HALF_FILLS.inc()
+                    naked_token = (
+                        yes_token_id if fill_state == "yes_only" else no_token_id
+                    )
+                    logger.error(
+                        "HALF-FILL (%s) on %s — flattening naked leg %s (%.2f shares)",
+                        fill_state, condition_id[:16], naked_token[:16], n_shares,
+                    )
+                    try:
+                        await client.unwind_leg(naked_token, n_shares)
+                        await notifier.notify(
+                            f"⚠️ Half-fill on {condition_id[:16]} ({fill_state}) — "
+                            f"naked leg flattened, no profit booked."
+                        )
+                    except Exception as uexc:  # noqa: BLE001
+                        ARB_UNWIND_FAILURES.inc()
+                        logger.error("Unwind failed for %s: %s", naked_token[:16], uexc)
+                        await notifier.send_critical_error(
+                            f"HALF-FILL UNWIND FAILED {condition_id[:16]} "
+                            f"({fill_state}) — MANUAL INTERVENTION REQUIRED"
+                        )
+
+                else:  # "none"
+                    logger.info(
+                        "No immediate fill for %s — maker orders may be resting; "
+                        "P&L deferred to fill confirmation.", condition_id[:16],
+                    )
 
             except CircuitBreakerTripped:
                 raise
@@ -493,8 +598,15 @@ async def main() -> None:
     detector       = ArbDetector(
                          desired_net_margin=_desired_margin,
                          default_fee_rate=_default_fee,
+                         extreme_lo=_extreme_lo,
+                         extreme_hi=_extreme_hi,
                      )
-    dutch_pricer   = DutchBookPricer(desired_net_margin=_desired_margin)
+    dutch_pricer   = DutchBookPricer(
+                         desired_net_margin=_desired_margin,
+                         extreme_lo=_extreme_lo,
+                         extreme_hi=_extreme_hi,
+                         min_real_edge=_min_real_edge,
+                     )
     neg_risk_det   = NegRiskArbDetector(desired_net_margin=_desired_margin)
 
     # ── signal logger (async WAL-mode SQLite, zero hot-path latency) ──────
@@ -502,7 +614,7 @@ async def main() -> None:
     await sig_logger.init()
 
     market_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
-    feed_registry = FeedRegistry(queue=market_queue)
+    feed_registry = FeedRegistry(queue=market_queue, max_feeds=_max_feeds)
 
     # ── seed with ENV-configured market (backward-compatible) ────────────
     if YES_TOKEN_ID and NO_TOKEN_ID:
@@ -523,6 +635,18 @@ async def main() -> None:
         )
         seed_cond = None
 
+    # ── cache pre-warm: prime fee+rebate the moment a market is admitted, so
+    #    the first arb_tick is a cache hit (no network round-trip in the hot
+    #    path).  Synchronous dict writes only — no network here.
+    def _prewarm_caches(condition_id: str, market: dict) -> None:
+        category = str(market.get("category") or "")
+        rebate_engine.prime_cache(condition_id, category_slug=category)
+        fee_raw = market.get("feeRate")
+        if fee_raw is not None:
+            fee = _normalise_fee(fee_raw)
+            if fee is not None:
+                fee_engine.prime_cache(condition_id, fee)
+
     # ── scanner: pre-populate known set with any ENV-seeded condition ─────
     seed_ids: set[str] = {seed_cond} if seed_cond and CONDITION_ID else set()
     scanner = MarketScanner(
@@ -530,6 +654,10 @@ async def main() -> None:
         scan_interval=_scan_interval,
         seed_condition_ids=seed_ids,
         max_feeds=_max_feeds,
+        feed_registry=feed_registry,
+        prune_idle_s=_prune_idle_s,
+        min_volume_24h=_min_volume_24h,
+        on_admit=_prewarm_caches,
     )
 
     # ── auto redeemer ─────────────────────────────────────────────────────

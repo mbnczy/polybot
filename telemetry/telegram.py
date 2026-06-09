@@ -50,6 +50,7 @@ import asyncio
 import html
 import logging
 import os
+import time
 from typing import Callable, Coroutine, Optional
 
 import aiohttp
@@ -104,6 +105,18 @@ class TelegramNotifier:
         # Callbacks — on_halt is set after construction to avoid circular refs
         self._on_status: Optional[Callable[[], dict]]           = on_status
         self._on_halt:   Optional[Callable[[], Coroutine]]      = None
+
+        # ── Arb-detection alert throttling ────────────────────────────────────
+        # At high signal frequency, alerting on every detection would flood the
+        # chat and trip Telegram's rate limit. Gate alerts behind a per-market
+        # cooldown and a minimum-edge floor (both env-tunable).
+        self._arb_cooldown_s: float = float(
+            os.environ.get("ARB_ALERT_COOLDOWN_S", "300")
+        )
+        self._arb_min_bps: float = float(
+            os.environ.get("ARB_ALERT_MIN_BPS", "0")
+        )
+        self._last_arb_alert: dict[str, float] = {}   # condition_id → monotonic ts
 
         # python-telegram-bot Application (command listener only)
         self._app: Optional[Application] = None
@@ -248,6 +261,64 @@ class TelegramNotifier:
         """Non-blocking critical error notification (circuit trip, timeout, etc.)."""
         text = f"<b>CRITICAL ERROR</b>\n<code>{_h(error_message)}</code>"
         self._fire(text, parse_mode="HTML")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Real-time arb DETECTION alert (fires on signal, before/independent of fill)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def send_arb_detected(
+        self,
+        condition_id:  str,
+        combined_cost: float,
+        net_edge:      float,
+        is_maker:      bool,
+        yes_price:     float,
+        no_price:      float,
+        *,
+        category:      str = "",
+    ) -> None:
+        """
+        Fire a non-blocking alert the moment an arbitrage signal is detected —
+        independent of whether it later executes or is blocked by the circuit
+        breaker.  Distinct from `send_trade_execution` (which fires only on a
+        confirmed fill).
+
+        Throttling
+        ──────────
+        • Per-market cooldown (ARB_ALERT_COOLDOWN_S, default 300 s): the same
+          condition_id will not alert again until the cooldown elapses.
+        • Minimum-edge floor (ARB_ALERT_MIN_BPS, default 0): signals below this
+          edge are not alerted (still traded — this only gates the notification).
+
+        Returns immediately; delivery is detached via `_fire`.
+        """
+        if not self._enabled:
+            return
+
+        edge_bps = round(net_edge * 10_000, 1)
+        if edge_bps < self._arb_min_bps:
+            return
+
+        now = time.monotonic()
+        last = self._last_arb_alert.get(condition_id)
+        if last is not None and (now - last) < self._arb_cooldown_s:
+            return   # still in cooldown for this market
+        self._last_arb_alert[condition_id] = now
+
+        path = "MAKER" if is_maker else "TAKER"
+        lines = [
+            f"<b>ARB DETECTED</b> ({path})",
+            f"<b>Market:</b>   <code>{_h(condition_id[:24])}…</code>",
+        ]
+        if category:
+            lines.append(f"<b>Category:</b> <code>{_h(category)}</code>")
+        lines += [
+            f"<b>YES:</b>      <code>{yes_price:.4f}</code>",
+            f"<b>NO:</b>       <code>{no_price:.4f}</code>",
+            f"<b>Combined:</b> <code>{combined_cost:.6f} USDC/pair</code>",
+            f"<b>Edge:</b>     <code>{edge_bps:.1f} bps</code>",
+        ]
+        self._fire("\n".join(lines), parse_mode="HTML")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Inbound command handlers (python-telegram-bot)

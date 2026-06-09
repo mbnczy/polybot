@@ -108,11 +108,30 @@ class MarketFeed:
         self._ping_interval = ping_interval
         self._running      = False
 
+        # Liveness tracking — used by FeedRegistry.prune_stale to drop feeds on
+        # dead/illiquid markets that never produce a two-sided quote.
+        self._created_monotonic   = time.monotonic()
+        self._last_tick_monotonic = self._created_monotonic
+
         # Live best-ask state: None until we receive a confirmed ask price
         self._best_ask: dict[str, Optional[float]] = {
             yes_token_id: None,
             no_token_id:  None,
         }
+
+        # Dedup: the WS emits an event on every book/price_change even when the
+        # best ask is unchanged.  Remember the last pushed pair so we never
+        # enqueue an identical tick (saves downstream re-evaluation + alerts).
+        self._last_pushed: tuple[Optional[float], Optional[float]] = (None, None)
+
+    def idle_seconds(self, now: Optional[float] = None) -> float:
+        """Seconds since this feed last pushed a two-sided arb_tick.
+
+        For a feed that has never produced a tick this measures time since
+        construction, so persistently one-sided / dead markets become prunable.
+        """
+        ref = now if now is not None else time.monotonic()
+        return ref - self._last_tick_monotonic
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public control
@@ -360,6 +379,13 @@ class MarketFeed:
         if yes_ask is None or no_ask is None:
             return  # still waiting for one or both legs
 
+        # Dedup — skip if neither leg's best ask changed since the last push.
+        if (yes_ask, no_ask) == self._last_pushed:
+            return
+        self._last_pushed = (yes_ask, no_ask)
+
+        now = time.monotonic()
+        self._last_tick_monotonic = now   # liveness marker for stale-feed pruning
         tick: dict = {
             "type":         "arb_tick",
             "condition_id": self._condition_id,
@@ -367,7 +393,7 @@ class MarketFeed:
             "no_token_id":  self._no_token_id,
             "yes_ask":      yes_ask,
             "no_ask":       no_ask,
-            "ts":           time.monotonic(),
+            "ts":           now,
         }
 
         try:
