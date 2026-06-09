@@ -278,7 +278,7 @@ position, integration suite green.
 | 2 | Decouple detection/execution | medium | **DEFERRED — safety** (see note below) |
 | 3 | Execution-path latency | medium | **◑ partial** (keep-alive sessions done; pre-signing/threadpool tuning planned) |
 | 4 | Capital recycling (InventoryManager) | med-high | **✅ implemented** (binary path = recycle-only; P&L stays booked at fill; NegRisk path books at settle) |
-| 5 | Structural refactor / typed Config | low | planned |
+| 5 | Structural refactor / typed Config | low | **◑ partial** (typed, validated `BotConfig.from_env` wired into `main`; pure-strategy-layer extraction still planned) |
 
 Recommended order: **0 → 1 → 2 → 3 → 4 → 5**, doing 0 first so 2–4 are
 measured, not guessed. **Done so far: 0, 1, 4, and Phase 3 (keep-alive).**

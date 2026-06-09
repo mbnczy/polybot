@@ -87,6 +87,7 @@ from dotenv import load_dotenv
 # ── load .env before any module that reads os.environ ──────────────────────
 load_dotenv()
 
+from config import BotConfig                                       # noqa: E402
 from core.clob_client import PolyClient, classify_fills            # noqa: E402
 from core.scanner import FeedRegistry, MarketScanner               # noqa: E402
 from execution.auto_redeem import AutoRedeemer                     # noqa: E402
@@ -144,32 +145,28 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 # ── configuration ──────────────────────────────────────────────────────────
-STARTING_BALANCE:    float = float(os.environ.get("STARTING_BALANCE",    500.0))
+# Single, validated source of truth — fails fast at startup on any bad value.
+_cfg = BotConfig.from_env()
+
+STARTING_BALANCE:    float = _cfg.starting_balance
 HEARTBEAT_INTERVAL:  float = 60.0
 QUEUE_MAXSIZE:       int   = 2048
 
-# Fee / margin — override defaults from strategy/arbitrage.py via ENV
-_desired_margin = float(os.environ.get("DESIRED_NET_MARGIN", DESIRED_NET_MARGIN))
-_default_fee    = float(os.environ.get("DEFAULT_TAKER_FEE",  DEFAULT_TAKER_FEE))
-_scan_interval  = float(os.environ.get("SCAN_INTERVAL",      300.0))
-_max_feeds      = int(os.environ.get("MAX_FEEDS",            50))
-# Efficiency controls — drop feeds idle longer than this (0 = never prune) and
-# skip markets below this 24h volume floor (0 = no floor).
-_prune_idle_s   = float(os.environ.get("FEED_PRUNE_IDLE_S",  600.0))
-_min_volume_24h = float(os.environ.get("MIN_VOLUME_24H",     0.0))
-# Reject ticks that waited longer than this in the queue (stale quote → adverse
-# selection). 0 = disabled. Default 2s tolerates bursts without acting on stale.
-_max_tick_age_s = float(os.environ.get("MAX_TICK_AGE_S",     2.0))
-# Signal-quality guards — skip near-resolved/extreme markets and (optionally)
-# require a genuine pre-rebate gap on the maker path.
-_extreme_lo     = float(os.environ.get("EXTREME_PRICE_LO",   EXTREME_PRICE_LO))
-_extreme_hi     = float(os.environ.get("EXTREME_PRICE_HI",   EXTREME_PRICE_HI))
-_min_real_edge  = float(os.environ.get("MIN_REAL_EDGE",      MIN_REAL_EDGE))
+_desired_margin = _cfg.desired_net_margin
+_default_fee    = _cfg.default_taker_fee
+_scan_interval  = _cfg.scan_interval
+_max_feeds      = _cfg.max_feeds
+_prune_idle_s   = _cfg.prune_idle_s
+_min_volume_24h = _cfg.min_volume_24h
+_max_tick_age_s = _cfg.max_tick_age_s
+_extreme_lo     = _cfg.extreme_lo
+_extreme_hi     = _cfg.extreme_hi
+_min_real_edge  = _cfg.min_real_edge
 
 # Optional single-market seed (backward-compatible with Phase ≤ 6 .env files)
-YES_TOKEN_ID: str = os.environ.get("YES_TOKEN_ID", "").strip()
-NO_TOKEN_ID:  str = os.environ.get("NO_TOKEN_ID",  "").strip()
-CONDITION_ID: str = os.environ.get("CONDITION_ID", "").strip()
+YES_TOKEN_ID: str = _cfg.yes_token_id
+NO_TOKEN_ID:  str = _cfg.no_token_id
+CONDITION_ID: str = _cfg.condition_id
 
 # ── global shutdown event ──────────────────────────────────────────────────
 _shutdown_event: asyncio.Event = asyncio.Event()
