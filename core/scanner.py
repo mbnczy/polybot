@@ -63,6 +63,7 @@ import aiohttp
 from core.ws_feed import MarketFeed
 from strategy.arbitrage import _resolve_rebate
 from telemetry.metrics import (
+    FEEDS_PRUNED,
     SCANNER_ADMITTED,
     SCANNER_CANDIDATES,
     SCANNER_FEEDS_FETCHED,
@@ -192,6 +193,7 @@ class FeedRegistry:
         for cid in stale:
             await self.remove_market(cid)
         if stale:
+            FEEDS_PRUNED.inc(len(stale))
             logger.info(
                 "FeedRegistry | pruned %d stale feed(s) (idle > %.0fs) | remaining=%d",
                 len(stale), max_idle_s, len(self._feeds),
@@ -274,25 +276,51 @@ class MarketScorer:
         if not math.isfinite(volume_24h):
             volume_24h = 0.0
         rebate_rate = _resolve_rebate(str(market.get("category") or "")) or 0.0
+        # _days_to_close is floored at 1.0, so this is a safe denominator that
+        # never explodes near expiry. Expired markets are filtered out earlier
+        # via _is_expired(), so they never reach scoring.
         days        = self._days_to_close(market)
-        if days <= 0:
-            return 0.0
         return (volume_24h * rebate_rate) / days
 
     @staticmethod
     def _days_to_close(market: dict) -> float:
         """
-        Return calendar days until market expiry, or 0.0 if expired/unknown.
+        Calendar days until market expiry, **floored at 1.0**.
+
+        The floor makes this a safe scoring denominator (avoids dividing by a
+        sub-1 value, which would explode the score in the final hours) and gives
+        a neutral 1.0 for missing / unparseable / already-expired dates.
+
+        Expiry *gating* (dropping dead markets) is a separate concern handled by
+        `_is_expired()`; this function therefore never returns < 1.0.
         """
         raw = market.get("endDate") or market.get("end_date")
         if not raw:
-            return 0.0
+            return 1.0
         try:
             end_dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
             delta  = (end_dt - datetime.now(timezone.utc)).total_seconds()
-            return max(delta / 86_400.0, 0.0)
+            return max(delta / 86_400.0, 1.0)
         except (ValueError, TypeError):
-            return 0.0
+            return 1.0
+
+    @staticmethod
+    def _is_expired(market: dict) -> bool:
+        """
+        True only if the market has a parseable endDate in the past.
+
+        Missing / unparseable dates are treated as NOT expired — Gamma is already
+        queried with active=true&closed=false, so we never drop a market merely
+        because its date could not be read.
+        """
+        raw = market.get("endDate") or market.get("end_date")
+        if not raw:
+            return False
+        try:
+            end_dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            return (end_dt - datetime.now(timezone.utc)).total_seconds() <= 0
+        except (ValueError, TypeError):
+            return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -456,7 +484,7 @@ class MarketScanner:
             if not condition_id or condition_id in self._known:
                 continue
             # Skip expired markets before scoring.
-            if MarketScorer._days_to_close(m) <= 0:
+            if MarketScorer._is_expired(m):
                 logger.debug(
                     "MarketScanner | %s skipped — market expired",
                     condition_id[:16],

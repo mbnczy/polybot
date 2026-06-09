@@ -164,6 +164,21 @@ EXTREME_PRICE_HI: float = 0.95   # skip if yes_ask or no_ask > this (≈ resolve
 # upside, not the sole justification.
 MIN_REAL_EDGE: float = 0.0
 
+
+def _within_quality_band(
+    yes_ask: float,
+    no_ask:  float,
+    lo:      float,
+    hi:      float,
+) -> bool:
+    """
+    True iff BOTH legs' asks sit inside [lo, hi] — i.e. the market is genuinely
+    contested rather than near-resolved.  Shared by the taker (ArbDetector) and
+    maker (DutchBookPricer) paths so the quality rule lives in exactly one place.
+    """
+    return lo <= yes_ask <= hi and lo <= no_ask <= hi
+
+
 # ── API endpoints ─────────────────────────────────────────────────────────────
 _CLOB_HOST   = "https://clob.polymarket.com"
 _GAMMA_HOST  = "https://gamma-api.polymarket.com"
@@ -475,8 +490,7 @@ class DutchBookPricer:
         # ── 1a. Signal-quality guards ─────────────────────────────────────────
         # Reject near-resolved / extreme markets: their edge is rebate-driven on
         # thin books that rarely fill, not a durable price gap.
-        if not (self._extreme_lo <= yes_ask <= self._extreme_hi
-                and self._extreme_lo <= no_ask <= self._extreme_hi):
+        if not _within_quality_band(yes_ask, no_ask, self._extreme_lo, self._extreme_hi):
             logger.debug(
                 "DutchBookPricer | extreme/near-resolved yes=%.4f no=%.4f "
                 "(band [%.3f, %.3f]) — skip",
@@ -760,8 +774,7 @@ class ArbDetector:
             return None
 
         # Signal-quality guard: skip near-resolved / extreme markets.
-        if not (self._extreme_lo <= yes_ask <= self._extreme_hi
-                and self._extreme_lo <= no_ask <= self._extreme_hi):
+        if not _within_quality_band(yes_ask, no_ask, self._extreme_lo, self._extreme_hi):
             logger.debug(
                 "ArbDetector | extreme/near-resolved yes=%.4f no=%.4f — skip",
                 yes_ask, no_ask,

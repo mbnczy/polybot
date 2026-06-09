@@ -115,7 +115,12 @@ from strategy.tuner import tuner_loop                               # noqa: E402
 from telemetry.db_logger import SignalLogger                        # noqa: E402
 from telemetry.metrics import (                                    # noqa: E402
     ACTIVE_MARKETS,
+    ARB_DETECTED_TOTAL,
+    ARB_HALF_FILLS,
+    ARB_UNWIND_FAILURES,
     CUMULATIVE_PNL,
+    REAL_EDGE_BPS,
+    STALE_TICKS_SKIPPED,
     USDC_BALANCE,
     WS_LATENCY_MS,
     metrics_server,
@@ -300,6 +305,7 @@ async def strategy_loop(
 
             # ── Freshness guard: skip stale quotes (likely already moved) ──────
             if _max_tick_age_s > 0 and tick_age > _max_tick_age_s:
+                STALE_TICKS_SKIPPED.inc()
                 logger.debug(
                     "Stale tick for %s — age=%.3fs > %.3fs, skipping",
                     condition_id[:16], tick_age, _max_tick_age_s,
@@ -338,6 +344,11 @@ async def strategy_loop(
 
             # ── 3. Persist signal ─────────────────────────────────────────────
             sig_logger.log_arb(arb_signal)
+
+            # Observability: count detections and track the *real* (pre-rebate)
+            # edge so dashboards can distinguish quality from rebate-inflation.
+            ARB_DETECTED_TOTAL.inc()
+            REAL_EDGE_BPS.set(round((1.0 - (yes_ask + no_ask)) * 10_000, 1))
 
             # ── 3b. Real-time detection alert (throttled, fill-independent) ────
             # Fires the moment an arb is detected, before sizing/breaker gating,
@@ -435,6 +446,7 @@ async def strategy_loop(
 
                 elif fill_state in ("yes_only", "no_only"):
                     # Naked single-leg exposure — flatten immediately, book no profit.
+                    ARB_HALF_FILLS.inc()
                     naked_token = (
                         yes_token_id if fill_state == "yes_only" else no_token_id
                     )
@@ -449,6 +461,7 @@ async def strategy_loop(
                             f"naked leg flattened, no profit booked."
                         )
                     except Exception as uexc:  # noqa: BLE001
+                        ARB_UNWIND_FAILURES.inc()
                         logger.error("Unwind failed for %s: %s", naked_token[:16], uexc)
                         await notifier.send_critical_error(
                             f"HALF-FILL UNWIND FAILED {condition_id[:16]} "

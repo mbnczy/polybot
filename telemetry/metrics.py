@@ -99,6 +99,36 @@ SCANNER_ADMITTED = Gauge(
     "Number of markets whose on_market_added callback was fired in the last scan",
 )
 
+# ── Reliability / efficiency metrics ──────────────────────────────────────────
+# Surface the new safety/efficiency paths so half-fills, unwinds, pruning, stale
+# ticks and signal quality are measurable (not just logged).
+
+ARB_DETECTED_TOTAL = Counter(
+    "polly_arb_detected_total",
+    "Arbitrage signals detected (taker + maker) before execution/risk gating",
+)
+ARB_HALF_FILLS = Counter(
+    "polly_arb_half_fills_total",
+    "Two-leg executions where only one leg filled (naked exposure → unwind)",
+)
+ARB_UNWIND_FAILURES = Counter(
+    "polly_arb_unwind_failures_total",
+    "Half-fill unwind attempts that failed (manual intervention required)",
+)
+FEEDS_PRUNED = Counter(
+    "polly_feeds_pruned_total",
+    "Market feeds pruned for staleness (no two-sided quote within window)",
+)
+STALE_TICKS_SKIPPED = Counter(
+    "polly_stale_ticks_skipped_total",
+    "arb_ticks skipped because their age exceeded MAX_TICK_AGE_S",
+)
+REAL_EDGE_BPS = Gauge(
+    "polly_real_edge_bps",
+    "Real (pre-rebate) Dutch-book edge of the latest detected signal, in bps "
+    "[= (1 - (yes_ask + no_ask)) * 10000]",
+)
+
 
 # ── Async HTTP server ─────────────────────────────────────────────────────────
 

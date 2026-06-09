@@ -87,6 +87,7 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, LimitOrderArgs, MarketOrderArgs, OrderType
 
 from telemetry.metrics import MATCH_ORDERS_TOTAL
+from strategy.arbitrage import TICK_SIZE   # single source of truth for tick size
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +143,8 @@ def classify_fills(yes_resp: dict | None, no_resp: dict | None) -> str:
     return "none"
 
 # ── Synthetic Post-Only constants ─────────────────────────────────────────────
-TICK_SIZE: float = 0.001   # Polymarket minimum price increment
+# TICK_SIZE single source of truth is strategy/arbitrage.py — imported at the top
+# of this module and re-exported here for callers importing it from clob_client.
 
 # ── Retry policy ──────────────────────────────────────────────────────────────
 _MAX_RETRIES:    int   = 5
