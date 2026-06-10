@@ -75,6 +75,7 @@ except ImportError:
     pass  # Windows: standard asyncio event loop used
 
 import asyncio
+import contextlib
 import logging
 import os
 import signal
@@ -151,6 +152,9 @@ _cfg = BotConfig.from_env()
 STARTING_BALANCE:    float = _cfg.starting_balance
 HEARTBEAT_INTERVAL:  float = 60.0
 QUEUE_MAXSIZE:       int   = 2048
+# Phase 2: max concurrent in-flight executions dispatched off the consumer so a
+# slow order RTT never stalls evaluation of other markets' ticks.
+_EXEC_CONCURRENCY:   int   = int(os.environ.get("EXEC_CONCURRENCY", "6"))
 
 _desired_margin = _cfg.desired_net_margin
 _default_fee    = _cfg.default_taker_fee
@@ -211,9 +215,124 @@ async def strategy_loop(
       MakerRebateEngine → NegRiskArbDetector → matchOrders bundle execution
     """
     logger.info("strategy_loop started")
+
+    # ── Phase 2: non-blocking execution dispatch ──────────────────────────────
+    # Evaluation stays in this consumer (fast, synchronous on a warm cache), but
+    # the slow execution (sign + network RTT) runs in bounded background tasks so
+    # one order never stalls evaluation of other markets. A daily-loss
+    # CircuitBreakerTripped raised inside a background task is funnelled into
+    # `trip_future`, which this consumer awaits alongside the tick queue and
+    # re-raises — so the kill switch still propagates to main()'s gather even if
+    # no further ticks arrive.
+    loop = asyncio.get_event_loop()
+    trip_future: asyncio.Future = loop.create_future()
+    inflight: set[asyncio.Task] = set()
+    exec_sem = asyncio.Semaphore(_EXEC_CONCURRENCY)
+
+    def _on_exec_done(t: asyncio.Task) -> None:
+        inflight.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if isinstance(exc, CircuitBreakerTripped) and not trip_future.done():
+            trip_future.set_exception(exc)
+
+    async def _execute_and_settle(
+        arb_signal, n_shares, yes_ask, no_ask, tick_ts,
+        condition_id, yes_token_id, no_token_id,
+    ) -> None:
+        # The slot was already reserved (gate + on_arb_open) by the consumer.
+        async with exec_sem:
+            try:
+                if arb_signal.is_maker_signal:
+                    yes_resp, no_resp = await client.execute_arb_maker_pair(
+                        yes_token_id=yes_token_id, yes_bid=arb_signal.yes_bid,
+                        yes_size=n_shares,
+                        no_token_id=no_token_id, no_bid=arb_signal.no_bid,
+                        no_size=n_shares,
+                    )
+                else:
+                    yes_resp, no_resp = await client.execute_arb_pair(
+                        yes_token_id=yes_token_id, yes_price=yes_ask,
+                        yes_size=n_shares,
+                        no_token_id=no_token_id, no_price=no_ask,
+                        no_size=n_shares,
+                    )
+
+                TICK_TO_ACK_SECONDS.observe(time.monotonic() - tick_ts)
+                fill_state = classify_fills(yes_resp, no_resp)
+
+                if fill_state == "both":
+                    net_profit = round(n_shares * arb_signal.net_edge, 6)
+                    breaker.on_fill(pnl=net_profit)   # books P&L + releases reserve
+                    status = breaker.status_dict()
+                    CUMULATIVE_PNL.set(status["session_pnl"])
+                    USDC_BALANCE.set(
+                        status["starting_balance"] + status["session_pnl"]
+                    )
+                    await notifier.send_trade_execution(
+                        condition_id=condition_id, yes_token_id=yes_token_id,
+                        no_token_id=no_token_id, yes_ask=yes_ask, no_ask=no_ask,
+                        n_shares=n_shares, combined_cost=arb_signal.combined_cost,
+                        guaranteed_profit=net_profit,
+                    )
+                    if inventory is not None:
+                        inventory.register_paired_fill(arb_signal)
+
+                elif fill_state in ("yes_only", "no_only"):
+                    breaker.release_open()
+                    ARB_HALF_FILLS.inc()
+                    naked_token = (
+                        yes_token_id if fill_state == "yes_only" else no_token_id
+                    )
+                    logger.error(
+                        "HALF-FILL (%s) on %s — flattening naked leg %s (%.2f shares)",
+                        fill_state, condition_id[:16], naked_token[:16], n_shares,
+                    )
+                    try:
+                        await client.unwind_leg(naked_token, n_shares)
+                        await notifier.notify(
+                            f"⚠️ Half-fill on {condition_id[:16]} ({fill_state}) — "
+                            f"naked leg flattened, no profit booked."
+                        )
+                    except Exception as uexc:  # noqa: BLE001
+                        ARB_UNWIND_FAILURES.inc()
+                        logger.error("Unwind failed for %s: %s", naked_token[:16], uexc)
+                        await notifier.send_critical_error(
+                            f"HALF-FILL UNWIND FAILED {condition_id[:16]} "
+                            f"({fill_state}) — MANUAL INTERVENTION REQUIRED"
+                        )
+
+                else:  # "none"
+                    breaker.release_open()
+                    logger.info(
+                        "No immediate fill for %s — maker orders may be resting; "
+                        "P&L deferred to fill confirmation.", condition_id[:16],
+                    )
+
+            except CircuitBreakerTripped:
+                raise   # captured by _on_exec_done → trip_future → main halt
+            except Exception as exc:  # noqa: BLE001
+                breaker.release_open()
+                logger.error("Arb pair execution failed: %s", exc)
+                await notifier.notify(f"ARB EXECUTION ERROR: {exc}")
+
+    def _dispatch_exec(*args) -> None:
+        t = asyncio.create_task(_execute_and_settle(*args))
+        inflight.add(t)
+        t.add_done_callback(_on_exec_done)
+
     try:
         while True:
-            tick: dict = await queue.get()
+            if trip_future.done():
+                raise trip_future.exception()
+            _getter = asyncio.ensure_future(queue.get())
+            await asyncio.wait({_getter, trip_future},
+                               return_when=asyncio.FIRST_COMPLETED)
+            if trip_future.done():
+                _getter.cancel()
+                raise trip_future.exception()
+            tick: dict = _getter.result()
             queue.task_done()
 
             tick_type = tick.get("type")
@@ -412,101 +531,30 @@ async def strategy_loop(
             if not breaker.check_arb(intent):
                 continue
 
-            # ── 6. Execute ────────────────────────────────────────────────────
-            try:
-                if arb_signal.is_maker_signal:
-                    yes_resp, no_resp = await client.execute_arb_maker_pair(
-                        yes_token_id=yes_token_id,
-                        yes_bid=arb_signal.yes_bid,
-                        yes_size=n_shares,
-                        no_token_id=no_token_id,
-                        no_bid=arb_signal.no_bid,
-                        no_size=n_shares,
-                    )
-                else:
-                    yes_resp, no_resp = await client.execute_arb_pair(
-                        yes_token_id=yes_token_id,
-                        yes_price=yes_ask,
-                        yes_size=n_shares,
-                        no_token_id=no_token_id,
-                        no_price=no_ask,
-                        no_size=n_shares,
-                    )
-
-                # End-to-end latency: arb_tick timestamp → order submission ack.
-                TICK_TO_ACK_SECONDS.observe(time.monotonic() - tick["ts"])
-
-                # ── 6a. Reconcile fills — never book a half-fill as profit ──────
-                # A single-leg fill is naked directional risk, not arbitrage.
-                fill_state = classify_fills(yes_resp, no_resp)
-
-                if fill_state == "both":
-                    net_profit: float = round(n_shares * arb_signal.net_edge, 6)
-                    breaker.on_arb_open()
-                    breaker.on_fill(pnl=net_profit)
-
-                    status = breaker.status_dict()
-                    CUMULATIVE_PNL.set(status["session_pnl"])
-                    USDC_BALANCE.set(
-                        status["starting_balance"] + status["session_pnl"]
-                    )
-
-                    await notifier.send_trade_execution(
-                        condition_id=condition_id,
-                        yes_token_id=yes_token_id,
-                        no_token_id=no_token_id,
-                        yes_ask=yes_ask,
-                        no_ask=no_ask,
-                        n_shares=n_shares,
-                        combined_cost=arb_signal.combined_cost,
-                        guaranteed_profit=net_profit,
-                    )
-
-                    # Recycle capital immediately: merge the complete YES+NO set
-                    # back to USDC now instead of waiting for resolution. P&L is
-                    # already booked above (register_paired_fill won't re-book).
-                    if inventory is not None:
-                        inventory.register_paired_fill(arb_signal)
-
-                elif fill_state in ("yes_only", "no_only"):
-                    # Naked single-leg exposure — flatten immediately, book no profit.
-                    ARB_HALF_FILLS.inc()
-                    naked_token = (
-                        yes_token_id if fill_state == "yes_only" else no_token_id
-                    )
-                    logger.error(
-                        "HALF-FILL (%s) on %s — flattening naked leg %s (%.2f shares)",
-                        fill_state, condition_id[:16], naked_token[:16], n_shares,
-                    )
-                    try:
-                        await client.unwind_leg(naked_token, n_shares)
-                        await notifier.notify(
-                            f"⚠️ Half-fill on {condition_id[:16]} ({fill_state}) — "
-                            f"naked leg flattened, no profit booked."
-                        )
-                    except Exception as uexc:  # noqa: BLE001
-                        ARB_UNWIND_FAILURES.inc()
-                        logger.error("Unwind failed for %s: %s", naked_token[:16], uexc)
-                        await notifier.send_critical_error(
-                            f"HALF-FILL UNWIND FAILED {condition_id[:16]} "
-                            f"({fill_state}) — MANUAL INTERVENTION REQUIRED"
-                        )
-
-                else:  # "none"
-                    logger.info(
-                        "No immediate fill for %s — maker orders may be resting; "
-                        "P&L deferred to fill confirmation.", condition_id[:16],
-                    )
-
-            except CircuitBreakerTripped:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                logger.error("Arb pair execution failed: %s", exc)
-                await notifier.notify(f"ARB EXECUTION ERROR: {exc}")
+            # ── 6. Reserve the slot + dispatch execution off the consumer ─────
+            # on_arb_open reserves the position now so concurrent dispatches
+            # respect MAX_POSITIONS; the background task books P&L on a confirmed
+            # both-fill or releases the reservation otherwise. Detection never
+            # blocks on the order round-trip.
+            breaker.on_arb_open()
+            _dispatch_exec(
+                arb_signal, n_shares, yes_ask, no_ask, tick["ts"],
+                condition_id, yes_token_id, no_token_id,
+            )
 
     except asyncio.CancelledError:
         logger.info("strategy_loop stopped")
         raise
+    finally:
+        # Drain in-flight executions so confirmed fills are booked/recycled before
+        # exit (bounded, so a slow live execution can't hang shutdown).
+        _pending = [t for t in inflight if not t.done()]
+        if _pending:
+            with contextlib.suppress(Exception):
+                await asyncio.wait(_pending, timeout=2.0)
+        for t in _pending:
+            if not t.done():
+                t.cancel()
 
 
 async def auto_redeem_loop(redeemer: AutoRedeemer) -> None:

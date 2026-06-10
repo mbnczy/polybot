@@ -59,3 +59,22 @@ def test_drawdown_block(monkeypatch):
     breaker = CircuitBreaker(starting_balance=500.0)
     breaker._state.session_pnl = -75.0   # 15% drawdown > 10% cap
     assert breaker.check_arb(_intent(cost=10.0)) is False
+
+
+def test_release_open_balances_reservation():
+    """Phase 2: a reserved slot (on_arb_open) is freed by release_open without
+    booking P&L — keeps open_positions balanced for half-fills / errors."""
+    b = CircuitBreaker(starting_balance=500.0)
+    assert b._state.open_positions == 0
+    b.on_arb_open()                       # reserve before dispatch
+    assert b._state.open_positions == 1
+    b.release_open()                      # half-fill / error → release, no P&L
+    assert b._state.open_positions == 0
+    assert b._state.session_pnl == 0.0
+
+
+def test_release_open_never_negative():
+    b = CircuitBreaker(starting_balance=500.0)
+    b.release_open()
+    b.release_open()
+    assert b._state.open_positions == 0

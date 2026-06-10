@@ -275,7 +275,7 @@ position, integration suite green.
 |------:|-------|------|--------|
 | 0 | Measurement & baseline | none | **✅ implemented** (per-hop histograms + `bench_hotpath.py`) |
 | 1 | Hot-path micro-opts (orjson, slots) | low | **✅ implemented** |
-| 2 | Decouple detection/execution | medium | **DEFERRED — safety** (see note below) |
+| 2 | Decouple detection/execution | medium | **✅ implemented — halt-preserving** (bg execution dispatch + `trip_future` re-raise; see note below) |
 | 3 | Execution-path latency | medium | **◑ partial** (keep-alive sessions done; pre-signing/threadpool tuning planned) |
 | 4 | Capital recycling (InventoryManager) | med-high | **✅ implemented** (binary path = recycle-only; P&L stays booked at fill; NegRisk path books at settle) |
 | 5 | Structural refactor / typed Config | low | **◑ partial** (typed, validated `BotConfig.from_env` wired into `main`; pure-strategy-layer extraction still planned) |
@@ -283,16 +283,24 @@ position, integration suite green.
 Recommended order: **0 → 1 → 2 → 3 → 4 → 5**, doing 0 first so 2–4 are
 measured, not guessed. **Done so far: 0, 1, 4, and Phase 3 (keep-alive).**
 
-> **⚠ Phase 2 safety finding (why it is DEFERRED).** Fully decoupling execution
-> into detached background tasks would move `breaker.on_fill` — and with it the
-> **daily-loss `CircuitBreakerTripped` emergency halt** — into a fire-and-forget
-> task. A trip raised there would NOT propagate to `main`'s `asyncio.gather`
-> (which is the mechanism that halts the bot), silently defeating the kill
-> switch. For a **rare-arb** strategy the consumer almost never blocks (executions
-> are infrequent), so the throughput upside is largely theoretical while the
-> safety downside is real. Phase 2 should only be done with a design that
-> preserves halt propagation (e.g. a shared shutdown event the execution workers
-> set on trip, which `main` awaits) — deferred until that is in place.
+> **✓ Phase 2 — halt-preserving design (implemented).** The earlier concern was
+> that decoupling execution into detached tasks would move the daily-loss
+> `CircuitBreakerTripped` emergency halt into a fire-and-forget task, defeating
+> the kill switch. The implemented design solves this:
+> - Evaluation stays in the consumer (fast). Execution (sign + RTT) runs in
+>   **bounded background tasks** (`_EXEC_CONCURRENCY` semaphore), so a slow order
+>   never stalls evaluation of other markets.
+> - The slot is **reserved synchronously** (`check_arb` gate + `on_arb_open`)
+>   before dispatch, so concurrent executions respect `MAX_POSITIONS`. The bg task
+>   books P&L on a confirmed both-fill, or calls the new `release_open()` on a
+>   half-fill / no-fill / error to free the reservation.
+> - **Kill-switch preserved:** a background task's `CircuitBreakerTripped` is
+>   funnelled (via a done-callback) into a `trip_future` that the consumer awaits
+>   alongside the tick queue; the consumer re-raises it — propagating to `main`'s
+>   `gather` and halting the bot **even if no further ticks arrive**. The
+>   `test_main_mock_circuit_breaker_tripped` integration test verifies this.
+> - On shutdown the consumer **drains in-flight executions** (bounded) so
+>   confirmed fills are booked/recycled before exit.
 
 ---
 
