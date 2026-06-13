@@ -135,6 +135,37 @@ EVAL_LATENCY = Histogram(
     buckets=[1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2, 1e-1],
 )
 
+# ── Phase 0: per-hop latency budget ───────────────────────────────────────────
+# Fine-grained spans so the tick→ack path can be profiled hop-by-hop and each
+# later refactor phase is measured rather than guessed.
+_LAT_BUCKETS = [1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2, 1e-1, 5e-1, 1.0]
+
+WS_PARSE_SECONDS = Histogram(
+    "polly_ws_parse_seconds",
+    "Time to JSON-parse one inbound WebSocket message (orjson when available)",
+    buckets=[1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3],
+)
+SIGN_SECONDS = Histogram(
+    "polly_sign_seconds",
+    "Time to ECDSA-sign both arb legs (concurrent) before submission",
+    buckets=_LAT_BUCKETS,
+)
+SUBMIT_SECONDS = Histogram(
+    "polly_submit_seconds",
+    "Time to submit both arb legs to the CLOB (network round-trip)",
+    buckets=_LAT_BUCKETS,
+)
+TICK_TO_ACK_SECONDS = Histogram(
+    "polly_tick_to_ack_seconds",
+    "End-to-end latency from arb_tick timestamp to order submission ack",
+    buckets=_LAT_BUCKETS,
+)
+CAPITAL_RECYCLED_TOTAL = Counter(
+    "polly_capital_recycled_total",
+    "Positions settled via mergePositions (collateral recycled to USDC, freeing "
+    "capital for new arbs instead of waiting for market resolution)",
+)
+
 
 # ── Async HTTP server ─────────────────────────────────────────────────────────
 

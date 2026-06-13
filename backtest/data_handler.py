@@ -64,7 +64,7 @@ _CSV_FILENAME   = "polymarket_markets.csv"
 # OrderBookTick — one historical snapshot for a single binary market
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class OrderBookTick:
     """
     A single point-in-time order-book snapshot for one Polymarket binary market.

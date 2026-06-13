@@ -340,6 +340,17 @@ class CircuitBreaker:
         """Call when an arb pair has been submitted (both legs sent)."""
         self._state.open_positions += 1
 
+    def release_open(self) -> None:
+        """
+        Release an on_arb_open reservation WITHOUT booking P&L.
+
+        Used when an arb that was reserved before dispatch (gate + on_arb_open)
+        does not result in a booked fill — a half-fill that was unwound, a
+        no-fill (resting maker order), or an execution error — so open_positions
+        accounting stays balanced and the slot is freed.
+        """
+        self._state.open_positions = max(0, self._state.open_positions - 1)
+
     def on_open(self) -> None:
         """Alias for on_arb_open() (API compatibility)."""
         self.on_arb_open()

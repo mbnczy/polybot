@@ -25,3 +25,7 @@ kagglehub>=0.3.0
 
 # DataFrame parsing for Kaggle CSV ingestion (backtest/data_handler.py)
 pandas>=2.1.0
+
+# Fast JSON parsing for the WebSocket hot path (optional; ws_feed falls back
+# to stdlib json if unavailable).
+orjson>=3.9

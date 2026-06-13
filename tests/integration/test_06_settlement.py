@@ -66,3 +66,41 @@ async def test_merge_complementary_set_live_calls_web3(
     assert any(name == "mergePositions" for name, _args in fake_w3.eth._contracts[
         next(iter(fake_w3.eth._contracts))
     ].functions.calls)
+
+
+@pytest.mark.asyncio
+async def test_register_paired_fill_recycles_without_double_booking(
+    patched_web3, patched_clob, fake_telegram, tmp_path, monkeypatch,
+):
+    """Binary FOK/maker path: settlement recycles capital but does NOT book P&L
+    (the strategy loop already booked it at fill time)."""
+    monkeypatch.setattr(
+        "risk.circuit_breaker._DAILY_STATE_PATH", str(tmp_path / "daily.json"),
+    )
+    from prometheus_client import REGISTRY
+    from core.clob_client            import PolyClient
+    from execution.inventory_manager import InventoryManager
+
+    client  = PolyClient()
+    breaker = CircuitBreaker(starting_balance=500.0)
+    invmgr  = InventoryManager(client, breaker, fake_telegram)
+
+    sig = ArbSignal(
+        condition_id="0x" + "cd" * 32,
+        yes_token_id="Y", no_token_id="N",
+        yes_ask=0.47, no_ask=0.50,
+        combined_cost=0.97, fee_rate=0.0, fee_cost=0.0, net_edge=0.03,
+        yes_size=10.0, no_size=10.0,
+    )
+
+    recycled_before = REGISTRY.get_sample_value("polly_capital_recycled_total") or 0.0
+    invmgr.register_paired_fill(sig)
+    await asyncio.sleep(0.05)   # let fire-and-forget _settle run (paper)
+
+    # Position settled + popped …
+    assert invmgr._positions.get(sig.condition_id) is None
+    # … capital recycled metric incremented …
+    recycled_after = REGISTRY.get_sample_value("polly_capital_recycled_total") or 0.0
+    assert recycled_after - recycled_before == pytest.approx(1.0)
+    # … but P&L was NOT booked here (no double-count).
+    assert breaker._state.session_pnl == pytest.approx(0.0, abs=1e-9)
