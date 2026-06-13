@@ -37,8 +37,12 @@ def _market(
     volume: float = 10_000.0,
     days_until_close: float | None = 10.0,
     end_date: str | None = None,
+    liquidity: float = 8_000.0,
+    best_bid: float = 0.47,
+    best_ask: float = 0.52,
+    outcome_prices: str | None = '["0.52", "0.50"]',
 ) -> dict[str, Any]:
-    """Minimal Gamma API market dict for testing."""
+    """Minimal Gamma API market dict for testing (V2 scoring fields included)."""
     m: dict[str, Any] = {
         "conditionId":   condition_id,
         "clobTokenIds":  [f"0xYES_{condition_id}", f"0xNO_{condition_id}"],
@@ -46,7 +50,12 @@ def _market(
         "closed":        False,
         "category":      category,
         "volume24hr":    volume,
+        "liquidityNum":  liquidity,
+        "bestBid":       best_bid,
+        "bestAsk":       best_ask,
     }
+    if outcome_prices is not None:
+        m["outcomePrices"] = outcome_prices
     if end_date is not None:
         m["endDate"] = end_date
     elif days_until_close is not None:
@@ -59,41 +68,75 @@ def _market(
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestMarketScorerFormula:
-    def test_score_basic(self) -> None:
-        """score = (volume × rebate) / days_to_close"""
-        scorer = MarketScorer()
-        m = _market(category="crypto", volume=10_000.0, days_until_close=10.0)
-        # crypto rebate = 0.0144; days = 10
-        expected = (10_000.0 * 0.0144) / 10.0
-        assert abs(scorer.score(m) - expected) < 1e-3
+    """V2: SCORE = (L_factor × I_factor × P_eff) / sqrt(days_to_close)."""
 
-    def test_score_politics_category(self) -> None:
-        scorer = MarketScorer()
-        m = _market(category="politics", volume=5_000.0, days_until_close=5.0)
-        # politics rebate = 0.0100
-        expected = (5_000.0 * 0.0100) / 5.0
-        assert abs(scorer.score(m) - expected) < 1e-3
+    @staticmethod
+    def _expected(volume, liquidity, bid, ask, yes, no, days) -> float:
+        import core.scanner as sc
+        L = (volume ** sc.V2_VOL_EXP) * (liquidity ** sc.V2_LIQ_EXP)
+        mid = (ask + bid) / 2.0
+        rel_spread = (ask - bid) / mid
+        ineff = abs((yes + no) - 1.0)
+        I = rel_spread * sc.V2_SPREAD_WEIGHT + ineff * sc.V2_INEFF_WEIGHT
+        P = 1.0 / (1.0 + (volume / sc.V2_PENALTY_PIVOT) ** 2)
+        return (L * I * P) / (max(days, 1.0) ** 0.5)
 
-    def test_score_unknown_category_uses_default(self) -> None:
+    def test_score_matches_formula(self) -> None:
         scorer = MarketScorer()
-        m = _market(category="unknown_xyz", volume=1_000.0, days_until_close=2.0)
-        # DEFAULT_MAKER_REBATE = 0.0050
-        expected = (1_000.0 * 0.0050) / 2.0
-        assert abs(scorer.score(m) - expected) < 1e-3
+        m = _market(volume=5_000.0, days_until_close=16.0, liquidity=8_000.0,
+                    best_bid=0.45, best_ask=0.52, outcome_prices='["0.52", "0.50"]')
+        exp = self._expected(5_000.0, 8_000.0, 0.45, 0.52, 0.52, 0.50, 16.0)
+        assert scorer.score(m) == pytest.approx(exp, rel=1e-6)
 
-    def test_score_zero_volume_is_zero(self) -> None:
+    def test_inefficient_midsize_beats_huge_efficient(self) -> None:
+        """The whole point: a liquid-but-inefficient market outranks a giant
+        efficient one."""
         scorer = MarketScorer()
-        m = _market(category="crypto", volume=0.0, days_until_close=5.0)
+        good = _market(volume=5_000.0, liquidity=8_000.0, best_bid=0.45,
+                       best_ask=0.52, outcome_prices='["0.52", "0.50"]')
+        huge = _market(volume=5_000_000.0, liquidity=2_000_000.0, best_bid=0.499,
+                       best_ask=0.501, outcome_prices='["0.50", "0.50"]')
+        assert scorer.score(good) > scorer.score(huge) * 100
+
+    def test_excluded_below_liquidity_floor(self) -> None:
+        scorer = MarketScorer()
+        m = _market(volume=5_000.0, liquidity=499.0)   # < V2_MIN_LIQUIDITY (500)
         assert scorer.score(m) == 0.0
 
-    def test_score_volume_fallback_field(self) -> None:
+    def test_excluded_below_volume_floor(self) -> None:
+        scorer = MarketScorer()
+        m = _market(volume=99.0, liquidity=8_000.0)    # < V2_MIN_VOLUME_24H (100)
+        assert scorer.score(m) == 0.0
+
+    def test_higher_inefficiency_scores_higher(self) -> None:
+        scorer = MarketScorer()
+        base = _market(outcome_prices='["0.50", "0.50"]')           # edge 0.00
+        ineff = _market(outcome_prices='["0.55", "0.50"]')          # edge 0.05
+        assert scorer.score(ineff) > scorer.score(base)
+
+    def test_volume_penalty_suppresses_giants(self) -> None:
+        scorer = MarketScorer()
+        small = _market(volume=10_000.0)
+        giant = _market(volume=1_000_000.0)
+        # Same inefficiency/liquidity shape, but the penalty crushes the giant
+        # despite its larger L_factor.
+        assert scorer.score(giant) < scorer.score(small)
+
+    def test_volume_fallback_field(self) -> None:
         """Falls back to 'volume' when 'volume24hr' is absent."""
         scorer = MarketScorer()
-        m = _market(volume=2_000.0, days_until_close=4.0)
+        m = _market(volume=2_000.0)
         m.pop("volume24hr")
         m["volume"] = 2_000.0
-        expected = (2_000.0 * 0.0144) / 4.0
-        assert abs(scorer.score(m) - expected) < 1e-3
+        assert scorer.score(m) > 0.0
+
+    def test_liquidity_string_field(self) -> None:
+        """Gamma returns liquidity as a string too — must coerce."""
+        scorer = MarketScorer()
+        m = _market(liquidity=8_000.0)
+        m.pop("liquidityNum")
+        m["liquidity"] = "8000.0"
+        assert scorer.score(m) > 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════

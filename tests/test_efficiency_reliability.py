@@ -188,6 +188,9 @@ async def test_scanner_volume_floor(_no_network_feed):
             "volume24hr": vol,
             "endDate": future,
             "active": True, "closed": False,
+            # V2 scoring fields so the market is admittable (above floors).
+            "liquidityNum": 8_000.0, "bestBid": 0.47, "bestAsk": 0.52,
+            "outcomePrices": '["0.52", "0.50"]',
         }
 
     markets = [_mkt("0xhigh", 100_000), _mkt("0xlow", 100)]

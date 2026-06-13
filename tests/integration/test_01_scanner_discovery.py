@@ -46,8 +46,18 @@ async def test_scanner_admits_top_n_markets(monkeypatch, patched_aiohttp_ws):
     await registry.stop_all()
 
 
-def test_market_scorer_orders_by_volume_x_rebate_per_day():
+def test_market_scorer_v2_ranking():
+    """V2: with equal inefficiency, more volume scores higher up to the penalty
+    pivot; and a more inefficient market outranks a more efficient one."""
     scorer = MarketScorer()
     hi = make_market("0x" + "aa" * 32, "y", "n", volume_24h=100_000, days_until_close=10)
     lo = make_market("0x" + "bb" * 32, "y", "n", volume_24h=  1_000, days_until_close=10)
     assert scorer.score(hi) > scorer.score(lo)
+
+    # Inefficiency dominates: a wider YES+NO dislocation outranks a tight one
+    # even at the same volume.
+    ineff = make_market("0x" + "cc" * 32, "y", "n", volume_24h=10_000,
+                        outcome_prices='["0.56", "0.50"]')   # edge 0.06
+    eff   = make_market("0x" + "dd" * 32, "y", "n", volume_24h=10_000,
+                        outcome_prices='["0.50", "0.50"]')   # edge 0.00
+    assert scorer.score(ineff) > scorer.score(eff)

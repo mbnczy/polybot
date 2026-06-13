@@ -78,10 +78,15 @@ class TestExpiry:
         assert MarketScorer._is_expired({"endDate": "not-a-date"}) is False
 
     def test_score_not_inflated_near_expiry(self):
-        """A market 30 min from close must not get an exploded score."""
-        m = {"endDate": _iso(1 / 48), "category": "crypto", "volume24hr": 1_000.0}
-        # days floored to 1.0 → score == volume*rebate/1.0, not /0.02
-        assert MarketScorer().score(m) == pytest.approx(1_000.0 * 0.0144, rel=1e-3)
+        """A market 30 min from close must not get an exploded score: the
+        sqrt(days) divisor is floored via _days_to_close==1.0, so a near-expiry
+        market scores the same as a 1-day one (not blown up by /0.02)."""
+        common = dict(category="crypto", volume24hr=5_000.0, liquidityNum=8_000.0,
+                      bestBid=0.47, bestAsk=0.52, outcomePrices='["0.52", "0.50"]')
+        near = MarketScorer().score({**common, "endDate": _iso(1 / 48)})   # 30 min
+        one_day = MarketScorer().score({**common, "endDate": _iso(1.0)})
+        assert near == pytest.approx(one_day, rel=1e-6)   # floored, not exploded
+        assert near > 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════

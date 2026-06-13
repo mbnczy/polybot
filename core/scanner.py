@@ -84,6 +84,19 @@ _END_CURSOR  = "LTE="
 # ── Scanner defaults ────────────────────────────────────────────────────────
 SCAN_INTERVAL: float = 300.0   # seconds between full market-list polls (5 min)
 
+# ── V2 market-scoring parameters (docs/Scorer machine spec) ──────────────────
+# Target markets liquid enough for $100–500 positions but NOT yet fully
+# efficient — NOT simply the biggest markets. Score = Liquidity × Inefficiency ×
+# Penalty / sqrt(days_to_close), computed from a single Gamma /markets response
+# (no per-market CLOB /book calls — the scanner layer must stay fast).
+V2_VOL_EXP:        float = 0.30     # volume24h exponent (dampened)
+V2_LIQ_EXP:        float = 0.20     # liquidity exponent (dampened)
+V2_MIN_LIQUIDITY:  float = 500.0    # exclude markets below this liquidity ($)
+V2_MIN_VOLUME_24H: float = 100.0    # exclude markets below this 24h volume ($)
+V2_SPREAD_WEIGHT:  float = 100.0    # weight on relative spread in I_factor
+V2_INEFF_WEIGHT:   float = 1000.0   # weight on YES+NO arb edge in I_factor
+V2_PENALTY_PIVOT:  float = 100_000.0  # 24h volume at which P_eff halves-ish
+
 # Callable signature for the market-added callback.
 # Async: async def cb(condition_id, yes_token_id, no_token_id) -> bool | None
 # Returns False when the market was NOT registered (e.g. global feed cap hit);
@@ -254,33 +267,113 @@ class FeedRegistry:
 
 class MarketScorer:
     """
-    Scores Gamma API market dicts by estimated maker-rebate yield per day.
+    V2 market scorer — ranks Gamma API market dicts by *capturable arbitrage
+    potential* rather than raw size (docs/Scorer machine spec).
 
-    Formula::
+    The biggest markets (e.g. the US presidential election) carry huge capital
+    but are extremely efficient — tight spreads, pro market makers, low-latency
+    algos — leaving almost no real arbitrage. The goal is markets liquid enough
+    for $100–500 positions yet not yet fully efficient.
 
-        score = (volume_24h × maker_rebate_rate) / max(days_to_close, 1)
+    Three independent components, multiplied::
 
-    Higher score indicates more daily rebate income before expiry.
-    Used by MarketScanner to rank candidates when max_feeds > 0.
+        SCORE = (L_factor × I_factor × P_eff) / sqrt(days_to_close)
+
+      L_factor (liquidity)    = volume24h^0.3 × liquidity^0.2   (dampened so giant
+                                markets don't dominate); excluded entirely below
+                                the liquidity / volume floors.
+      I_factor (inefficiency) = rel_spread×100 + ineff_edge×1000
+                                rel_spread = (ask−bid)/mid
+                                ineff_edge = |yes_price + no_price − 1.0|
+      P_eff    (penalty)      = 1 / (1 + (volume24h / 100000)^2)  — suppresses
+                                too-big / too-efficient markets.
+
+    Crucially, **every input comes from a single Gamma /markets response**
+    (volume24hr, liquidityNum, bestBid/bestAsk/spread, outcomePrices). No
+    per-market CLOB /book calls are made here — order-book depth and live arb
+    analysis happen only for the admitted top-N feeds, over WebSocket.
     """
 
     def score(self, market: dict) -> float:
-        """Return the priority score for a single Gamma API market object."""
-        raw_vol    = (
-            market.get("volume24hr")
-            or market.get("volume_24h")
-            or market.get("volume")
-            or 0.0
+        """Return the V2 priority score for a single Gamma API market object."""
+        volume_24h = self._volume_24h(market)
+        liquidity  = self._liquidity(market)
+
+        # Hard exclusions — not tradeable for $100–500 positions.
+        if liquidity < V2_MIN_LIQUIDITY or volume_24h < V2_MIN_VOLUME_24H:
+            return 0.0
+
+        l_factor = (volume_24h ** V2_VOL_EXP) * (liquidity ** V2_LIQ_EXP)
+        i_factor = (
+            self._relative_spread(market) * V2_SPREAD_WEIGHT
+            + self._inefficiency_edge(market) * V2_INEFF_WEIGHT
         )
-        volume_24h  = float(raw_vol)
-        if not math.isfinite(volume_24h):
-            volume_24h = 0.0
-        rebate_rate = _resolve_rebate(str(market.get("category") or "")) or 0.0
-        # _days_to_close is floored at 1.0, so this is a safe denominator that
-        # never explodes near expiry. Expired markets are filtered out earlier
-        # via _is_expired(), so they never reach scoring.
-        days        = self._days_to_close(market)
-        return (volume_24h * rebate_rate) / days
+        p_eff    = 1.0 / (1.0 + (volume_24h / V2_PENALTY_PIVOT) ** 2)
+
+        # _days_to_close is floored at 1.0; sqrt keeps near-expiry markets
+        # favoured without letting them dominate the ranking.
+        days = self._days_to_close(market)
+        score = (l_factor * i_factor * p_eff) / math.sqrt(days)
+        return score if math.isfinite(score) else 0.0
+
+    # ── Field extraction (robust to Gamma string/number variants) ─────────────
+
+    @staticmethod
+    def _num(value: object) -> float:
+        """Coerce a Gamma field (float or numeric string) to a finite float."""
+        try:
+            f = float(value)  # type: ignore[arg-type]
+            return f if math.isfinite(f) else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    @classmethod
+    def _volume_24h(cls, m: dict) -> float:
+        return cls._num(
+            m.get("volume24hr")
+            if m.get("volume24hr") is not None
+            else (m.get("volume_24h") or m.get("volume") or 0.0)
+        )
+
+    @classmethod
+    def _liquidity(cls, m: dict) -> float:
+        return cls._num(
+            m.get("liquidityNum")
+            if m.get("liquidityNum") is not None
+            else (m.get("liquidity") or m.get("liquidityClob") or 0.0)
+        )
+
+    @classmethod
+    def _relative_spread(cls, m: dict) -> float:
+        """(best_ask − best_bid) / mid_price — 0.0 when unavailable."""
+        bid = cls._num(m.get("bestBid"))
+        ask = cls._num(m.get("bestAsk"))
+        if bid > 0.0 and ask > 0.0 and ask >= bid:
+            mid = (ask + bid) / 2.0
+            return (ask - bid) / mid if mid > 0.0 else 0.0
+        # Fallback: raw `spread` field over the last/mid price.
+        spread = cls._num(m.get("spread"))
+        ref    = cls._num(m.get("lastTradePrice")) or 0.5
+        return spread / ref if (spread > 0.0 and ref > 0.0) else 0.0
+
+    @classmethod
+    def _inefficiency_edge(cls, m: dict) -> float:
+        """
+        |yes_price + no_price − 1.0| from outcomePrices — how far the combined
+        binary price strays from the theoretical $1.00 (larger = more arb-prone).
+        """
+        raw = m.get("outcomePrices")
+        prices: list[float] = []
+        if isinstance(raw, str):
+            try:
+                prices = [float(x) for x in json.loads(raw)]
+            except (json.JSONDecodeError, TypeError, ValueError):
+                prices = []
+        elif isinstance(raw, (list, tuple)):
+            prices = [cls._num(x) for x in raw]
+        if len(prices) >= 2:
+            return abs((prices[0] + prices[1]) - 1.0)
+        return 0.0
 
     @staticmethod
     def _days_to_close(market: dict) -> float:
@@ -515,7 +608,12 @@ class MarketScanner:
                         condition_id[:16], vol, self._min_volume_24h,
                     )
                     continue
-            scored_pairs.append((self._scorer.score(m), m, condition_id, yes_id, no_id))
+            score = self._scorer.score(m)
+            # V2: a 0 score means excluded (below liquidity/volume floors or
+            # perfectly efficient) — never admit it, even if feed slots are free.
+            if score <= 0.0:
+                continue
+            scored_pairs.append((score, m, condition_id, yes_id, no_id))
 
         scored_pairs.sort(key=lambda t: t[0], reverse=True)
         total_candidates = len(scored_pairs)
