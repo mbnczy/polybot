@@ -70,10 +70,12 @@ from strategy.arbitrage import (                                # noqa: E402
     EXTREME_PRICE_HI,
     MIN_REAL_EDGE,
 )
+from strategy.arb_duration import ArbDurationTracker           # noqa: E402
 from telemetry.telegram import TelegramNotifier                 # noqa: E402
 
 # ── Settings (same env vars as the live bot) ──────────────────────────────────
 _MARGIN       = float(os.environ.get("DESIRED_NET_MARGIN", DESIRED_NET_MARGIN))
+_DURATION_MIN_S = float(os.environ.get("ARB_DURATION_MIN_S", "0"))
 _DEFAULT_FEE  = float(os.environ.get("DEFAULT_TAKER_FEE", "0.02"))
 _SCAN_INTERVAL = float(os.environ.get("SCAN_INTERVAL", "300"))
 _MAX_FEEDS    = int(os.environ.get("MAX_FEEDS", "50"))
@@ -95,6 +97,7 @@ async def _consume(
     rebates:  MakerRebateEngine,
     notifier: TelegramNotifier,
     stats:    dict,
+    duration: "ArbDurationTracker",
 ) -> None:
     """Evaluate every live tick; alert on each detected arb (throttled)."""
     while True:
@@ -137,6 +140,18 @@ async def _consume(
             if sig is not None:
                 display_edge = sig.maker_net_edge
                 is_maker = True
+
+        # Arb-duration tracking — runs for arb AND no-arb ticks so it can detect
+        # when the window opens and closes; reports the duration on close.
+        _window = duration.update(
+            cid, in_arb=(sig is not None), ts=tick.get("ts", time.monotonic()),
+            edge_bps=(display_edge or 0.0) * 10_000, is_maker=is_maker,
+        )
+        if _window is not None:
+            notifier.send_arb_duration(
+                _window.condition_id, _window.duration_s,
+                _window.peak_edge_bps, _window.ticks, _window.is_maker_peak,
+            )
 
         if sig is None:
             continue
@@ -230,8 +245,10 @@ async def main() -> None:
             pass
 
     scan_task = asyncio.create_task(scanner.run(), name="scanner")
+    duration = ArbDurationTracker(min_duration_s=_DURATION_MIN_S)
     cons_task = asyncio.create_task(
-        _consume(queue, detector, dutch, rebates, notifier, stats), name="consumer"
+        _consume(queue, detector, dutch, rebates, notifier, stats, duration),
+        name="consumer"
     )
     hb_task   = asyncio.create_task(_heartbeat(registry, notifier, stats), name="heartbeat")
 

@@ -110,6 +110,7 @@ from strategy.arbitrage import (                                   # noqa: E402
     NegRiskSignal,
     _normalise_fee,
 )
+from strategy.arb_duration import ArbDurationTracker               # noqa: E402
 from strategy.tuner import tuner_loop                               # noqa: E402
 from telemetry.db_logger import SignalLogger                        # noqa: E402
 from telemetry.metrics import (                                    # noqa: E402
@@ -161,6 +162,7 @@ _max_tick_age_s = _cfg.max_tick_age_s
 _extreme_lo     = _cfg.extreme_lo
 _extreme_hi     = _cfg.extreme_hi
 _min_real_edge  = _cfg.min_real_edge
+_arb_duration_min_s = _cfg.arb_duration_min_s
 
 # Optional single-market seed (backward-compatible with Phase ≤ 6 .env files)
 YES_TOKEN_ID: str = _cfg.yes_token_id
@@ -223,6 +225,9 @@ async def strategy_loop(
     trip_future: asyncio.Future = loop.create_future()
     inflight: set[asyncio.Task] = set()
     exec_sem = asyncio.Semaphore(_EXEC_CONCURRENCY)
+
+    # Arb-duration tracking — how long each market stays in an arb window.
+    duration_tracker = ArbDurationTracker(min_duration_s=_arb_duration_min_s)
 
     def _on_exec_done(t: asyncio.Task) -> None:
         inflight.discard(t)
@@ -467,6 +472,27 @@ async def strategy_loop(
 
             # Record dequeue→decision latency (covers both taker + maker paths).
             EVAL_LATENCY.observe(time.monotonic() - _eval_t0)
+
+            # ── Arb-duration tracking ─────────────────────────────────────────
+            # Update on EVERY tick (arb + no-arb) so the tracker can detect when
+            # a market's arb window opens and closes. On close it returns the
+            # window → report how long the opportunity lasted on Telegram.
+            if arb_signal is not None:
+                _dur_is_maker = arb_signal.is_maker_signal
+                _dur_edge_bps = (
+                    arb_signal.maker_net_edge if _dur_is_maker else arb_signal.net_edge
+                ) * 10_000
+            else:
+                _dur_is_maker, _dur_edge_bps = False, 0.0
+            _window = duration_tracker.update(
+                condition_id, in_arb=(arb_signal is not None), ts=tick["ts"],
+                edge_bps=_dur_edge_bps, is_maker=_dur_is_maker,
+            )
+            if _window is not None:
+                notifier.send_arb_duration(
+                    _window.condition_id, _window.duration_s,
+                    _window.peak_edge_bps, _window.ticks, _window.is_maker_peak,
+                )
 
             if arb_signal is None:
                 continue

@@ -74,6 +74,8 @@ class BotConfig:
     min_volume_24h:     float
     # Execution concurrency (Phase 2 non-blocking dispatch)
     exec_concurrency:   int
+    # Arb-duration reporting: only report windows lasting at least this long
+    arb_duration_min_s: float
     # Single-market ENV seed (optional, backward-compatible)
     yes_token_id:       str
     no_token_id:        str
@@ -94,6 +96,7 @@ class BotConfig:
             prune_idle_s       = _f("FEED_PRUNE_IDLE_S",  600.0),
             min_volume_24h     = _f("MIN_VOLUME_24H",     0.0),
             exec_concurrency   = _i("EXEC_CONCURRENCY",   6),
+            arb_duration_min_s = _f("ARB_DURATION_MIN_S", 0.0),
             yes_token_id       = os.environ.get("YES_TOKEN_ID", "").strip(),
             no_token_id        = os.environ.get("NO_TOKEN_ID",  "").strip(),
             condition_id       = os.environ.get("CONDITION_ID", "").strip(),
@@ -132,3 +135,7 @@ class BotConfig:
             raise ValueError(f"MIN_VOLUME_24H must be ≥ 0; got {self.min_volume_24h}")
         if self.exec_concurrency < 1:
             raise ValueError(f"EXEC_CONCURRENCY must be ≥ 1; got {self.exec_concurrency}")
+        if self.arb_duration_min_s < 0.0:
+            raise ValueError(
+                f"ARB_DURATION_MIN_S must be ≥ 0; got {self.arb_duration_min_s}"
+            )

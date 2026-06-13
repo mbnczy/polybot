@@ -320,6 +320,34 @@ class TelegramNotifier:
         ]
         self._fire("\n".join(lines), parse_mode="HTML")
 
+    def send_arb_duration(
+        self,
+        condition_id:  str,
+        duration_s:    float,
+        peak_edge_bps: float,
+        ticks:         int,
+        is_maker:      bool,
+        *,
+        still_open:    bool = False,
+    ) -> None:
+        """
+        Non-blocking alert reporting how long a market's arbitrage window lasted
+        (first detected → closed).  Fired by the duration tracker on close (or,
+        with still_open=True, for windows still open at shutdown).
+        """
+        if not self._enabled:
+            return
+        path  = "MAKER" if is_maker else "TAKER"
+        title = "ARB WINDOW OPEN AT SHUTDOWN" if still_open else "ARB WINDOW CLOSED"
+        text = (
+            f"<b>{title}</b> ({path})\n"
+            f"<b>Market:</b>    <code>{_h(condition_id[:24])}…</code>\n"
+            f"<b>Duration:</b>  <code>{duration_s:.2f} s</code>\n"
+            f"<b>Peak edge:</b> <code>{peak_edge_bps:.1f} bps</code>\n"
+            f"<b>Ticks:</b>     <code>{ticks}</code>"
+        )
+        self._fire(text, parse_mode="HTML")
+
     # ──────────────────────────────────────────────────────────────────────────
     # Inbound command handlers (python-telegram-bot)
     # ──────────────────────────────────────────────────────────────────────────
