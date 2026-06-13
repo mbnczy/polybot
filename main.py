@@ -103,11 +103,6 @@ from core.clob_client import BundleLeg                             # noqa: E402
 from strategy.arbitrage import (                                   # noqa: E402
     ArbDetector,
     ArbSignal,
-    DEFAULT_TAKER_FEE,
-    DESIRED_NET_MARGIN,
-    EXTREME_PRICE_HI,
-    EXTREME_PRICE_LO,
-    MIN_REAL_EDGE,
     DutchBookPricer,
     FeeEngine,
     MakerRebateEngine,
@@ -153,8 +148,8 @@ STARTING_BALANCE:    float = _cfg.starting_balance
 HEARTBEAT_INTERVAL:  float = 60.0
 QUEUE_MAXSIZE:       int   = 2048
 # Phase 2: max concurrent in-flight executions dispatched off the consumer so a
-# slow order RTT never stalls evaluation of other markets' ticks.
-_EXEC_CONCURRENCY:   int   = int(os.environ.get("EXEC_CONCURRENCY", "6"))
+# slow order RTT never stalls evaluation of other markets' ticks (validated).
+_EXEC_CONCURRENCY:   int   = _cfg.exec_concurrency
 
 _desired_margin = _cfg.desired_net_margin
 _default_fee    = _cfg.default_taker_fee

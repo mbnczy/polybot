@@ -99,9 +99,15 @@ _CHAIN_ID  = 137   # Polygon mainnet
 # ── Proxy constants ───────────────────────────────────────────────────────────
 _PROXY_SESSION_PLACEHOLDER = "{session}"   # embedded in residential proxy URLs
 
-# ── Thread pool — 4 workers lets two concurrent signing ops run in parallel
-#    (YES signing + NO signing) with headroom for order submission overlap.
-_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="clob-worker")
+# ── Thread pool for blocking SDK calls (ECDSA signing + order submission) ──────
+# Each arb execution signs two legs concurrently; with Phase 2 dispatching up to
+# EXEC_CONCURRENCY executions in parallel, a fixed 4-worker pool becomes a
+# contention point. Size via CLOB_SIGNER_THREADS (default 8) to keep signing off
+# the critical path under concurrent execution.
+_SIGNER_THREADS = max(2, int(os.environ.get("CLOB_SIGNER_THREADS", "8")))
+_executor = ThreadPoolExecutor(
+    max_workers=_SIGNER_THREADS, thread_name_prefix="clob-worker"
+)
 
 # ── Paper-trade toggle — evaluated once at module load; never changes at runtime
 _PAPER_TRADE: bool = (

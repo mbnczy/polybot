@@ -72,6 +72,8 @@ class BotConfig:
     max_feeds:          int
     prune_idle_s:       float
     min_volume_24h:     float
+    # Execution concurrency (Phase 2 non-blocking dispatch)
+    exec_concurrency:   int
     # Single-market ENV seed (optional, backward-compatible)
     yes_token_id:       str
     no_token_id:        str
@@ -91,6 +93,7 @@ class BotConfig:
             max_feeds          = _i("MAX_FEEDS",          50),
             prune_idle_s       = _f("FEED_PRUNE_IDLE_S",  600.0),
             min_volume_24h     = _f("MIN_VOLUME_24H",     0.0),
+            exec_concurrency   = _i("EXEC_CONCURRENCY",   6),
             yes_token_id       = os.environ.get("YES_TOKEN_ID", "").strip(),
             no_token_id        = os.environ.get("NO_TOKEN_ID",  "").strip(),
             condition_id       = os.environ.get("CONDITION_ID", "").strip(),
@@ -127,3 +130,5 @@ class BotConfig:
             raise ValueError(f"FEED_PRUNE_IDLE_S must be ≥ 0; got {self.prune_idle_s}")
         if self.min_volume_24h < 0.0:
             raise ValueError(f"MIN_VOLUME_24H must be ≥ 0; got {self.min_volume_24h}")
+        if self.exec_concurrency < 1:
+            raise ValueError(f"EXEC_CONCURRENCY must be ≥ 1; got {self.exec_concurrency}")
