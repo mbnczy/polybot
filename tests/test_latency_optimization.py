@@ -97,6 +97,9 @@ async def test_on_admit_fires_and_prewarms(monkeypatch):
         "volume24hr": 100_000.0,
         "endDate": _future(10),
         "feeRate": 0.015,
+        # V2 scoring fields so the market scores > 0 and is admitted.
+        "liquidityNum": 8_000.0, "bestBid": 0.47, "bestAsk": 0.52,
+        "outcomePrices": '["0.52", "0.50"]',
     }
 
     async def _fake_fetch(self):

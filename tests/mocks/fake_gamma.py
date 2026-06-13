@@ -23,6 +23,10 @@ def make_market(
     resolved: bool = False,
     winner: str = "",
     fee_rate: float = 0.02,
+    liquidity: float = 8_000.0,
+    best_bid: float = 0.47,
+    best_ask: float = 0.52,
+    outcome_prices: str = '["0.52", "0.50"]',
 ) -> dict[str, Any]:
     return {
         "conditionId":  condition_id,
@@ -35,6 +39,11 @@ def make_market(
         "resolved":     resolved,
         "winner":       winner,
         "feeRate":      fee_rate,
+        # V2 scoring fields (Gamma /markets returns these on a single query).
+        "liquidityNum": liquidity,
+        "bestBid":      best_bid,
+        "bestAsk":      best_ask,
+        "outcomePrices": outcome_prices,
     }
 
 
