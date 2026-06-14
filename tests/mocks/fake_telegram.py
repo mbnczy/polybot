@@ -35,10 +35,15 @@ class FakeTelegramNotifier:
 
     def send_arb_detected(self, **kwargs: Any) -> None:
         # Mirror the real notifier: synchronous, fire-and-forget detection alert.
-        self.arb_detections: list[dict]
         if not hasattr(self, "arb_detections"):
             self.arb_detections = []
         self.arb_detections.append(kwargs)
+
+    def send_arb_duration(self, *args: Any, **kwargs: Any) -> None:
+        # Synchronous, fire-and-forget arb-window-closed alert.
+        if not hasattr(self, "arb_durations"):
+            self.arb_durations = []
+        self.arb_durations.append((args, kwargs))
 
     async def send_critical_error(self, error_message: str) -> None:
         self.critical_errors.append(error_message)
