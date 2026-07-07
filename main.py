@@ -57,6 +57,8 @@ Environment variables
   PAPER_TRADE_MODE        "true" → simulate orders locally
   REDEEM_POLL_INTERVAL    seconds between redemption scans (default 300)
   SCAN_INTERVAL           seconds between Gamma API market scans (default 300)
+  NEGRISK_EXEC_MODE       "off" (detect+alert only, default) | "onchain"
+                          (matchOrders — registered operator wallets only)
 
   Optional single-market seed (backward-compatible):
   YES_TOKEN_ID, NO_TOKEN_ID, CONDITION_ID
@@ -164,6 +166,9 @@ _extreme_lo     = _cfg.extreme_lo
 _extreme_hi     = _cfg.extreme_hi
 _min_real_edge  = _cfg.min_real_edge
 _arb_duration_min_s = _cfg.arb_duration_min_s
+# NegRisk execution mode — "off" (detect+alert only, default) or "onchain"
+# (matchOrders; requires the wallet to be a registered CTF Exchange operator).
+_negrisk_exec_mode = _cfg.negrisk_exec_mode
 
 # Optional single-market seed (backward-compatible with Phase ≤ 6 .env files)
 YES_TOKEN_ID: str = _cfg.yes_token_id
@@ -373,6 +378,31 @@ async def strategy_loop(
                     maker_rebate=rebate,
                 )
                 if nr_signal is None:
+                    continue
+
+                if _negrisk_exec_mode != "onchain":
+                    # Detect-and-alert only: matchOrders would revert for a
+                    # non-operator wallet, so we surface the opportunity on
+                    # Telegram (throttled) without submitting anything.
+                    logger.info(
+                        "NEG RISK signal (exec %s) | condition=%s outcomes=%d "
+                        "combined_bid=%.4f relative_edge=%.4f — not executed",
+                        _negrisk_exec_mode, condition_id[:16],
+                        nr_signal.n_outcomes, nr_signal.combined_bid,
+                        nr_signal.relative_edge,
+                    )
+                    notifier.send_arb_detected(
+                        condition_id=condition_id,
+                        combined_cost=nr_signal.combined_bid,
+                        net_edge=nr_signal.relative_edge,
+                        is_maker=True,
+                        yes_price=nr_signal.legs[0].no_ask,
+                        no_price=(
+                            nr_signal.legs[1].no_ask
+                            if len(nr_signal.legs) > 1 else 0.0
+                        ),
+                        category=f"negrisk×{nr_signal.n_outcomes} (exec off)",
+                    )
                     continue
 
                 bundle_cost = round(nr_signal.combined_bid * nr_signal.n_bundles, 6)
@@ -678,9 +708,17 @@ def _register_shutdown_signals(
 async def main() -> None:
     logger.info("=== Polymarket ARB Bot — Phase 8 starting ===")
     logger.info(
-        "Config | balance=%.2f net_margin=%.3f default_fee=%.3f pair_cap=%.2f USDC",
+        "Config | balance=%.2f net_margin=%.3f default_fee=%.3f pair_cap=%.2f USDC "
+        "negrisk_exec=%s",
         STARTING_BALANCE, _desired_margin, _default_fee, MAX_ARB_PAIR_USDC,
+        _negrisk_exec_mode,
     )
+    if _negrisk_exec_mode == "onchain":
+        logger.warning(
+            "NEGRISK_EXEC_MODE=onchain — matchOrders requires the wallet to be "
+            "a REGISTERED CTF Exchange V2 operator; a normal user wallet will "
+            "revert every NegRisk bundle."
+        )
 
     # ── initialise components ─────────────────────────────────────────────
     client         = PolyClient()

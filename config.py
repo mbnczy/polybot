@@ -74,6 +74,13 @@ class BotConfig:
     min_volume_24h:     float
     # Execution concurrency (Phase 2 non-blocking dispatch)
     exec_concurrency:   int
+    # NegRisk multi-outcome execution mode:
+    #   "off"     — detect + alert only (default).  The live NegRisk path calls
+    #               CTF Exchange V2 matchOrders directly, which REVERTS unless
+    #               the wallet is a registered exchange operator — a normal
+    #               user wallet is not, so execution is disabled by default.
+    #   "onchain" — legacy matchOrders execution (operator wallets only).
+    negrisk_exec_mode:  str
     # Arb-duration reporting: only report windows lasting at least this long
     arb_duration_min_s: float
     # Single-market ENV seed (optional, backward-compatible)
@@ -96,6 +103,7 @@ class BotConfig:
             prune_idle_s       = _f("FEED_PRUNE_IDLE_S",  600.0),
             min_volume_24h     = _f("MIN_VOLUME_24H",     0.0),
             exec_concurrency   = _i("EXEC_CONCURRENCY",   6),
+            negrisk_exec_mode  = os.environ.get("NEGRISK_EXEC_MODE", "off").strip().lower(),
             arb_duration_min_s = _f("ARB_DURATION_MIN_S", 0.0),
             yes_token_id       = os.environ.get("YES_TOKEN_ID", "").strip(),
             no_token_id        = os.environ.get("NO_TOKEN_ID",  "").strip(),
@@ -135,6 +143,11 @@ class BotConfig:
             raise ValueError(f"MIN_VOLUME_24H must be ≥ 0; got {self.min_volume_24h}")
         if self.exec_concurrency < 1:
             raise ValueError(f"EXEC_CONCURRENCY must be ≥ 1; got {self.exec_concurrency}")
+        if self.negrisk_exec_mode not in ("off", "onchain"):
+            raise ValueError(
+                f"NEGRISK_EXEC_MODE must be 'off' or 'onchain'; "
+                f"got {self.negrisk_exec_mode!r}"
+            )
         if self.arb_duration_min_s < 0.0:
             raise ValueError(
                 f"ARB_DURATION_MIN_S must be ≥ 0; got {self.arb_duration_min_s}"

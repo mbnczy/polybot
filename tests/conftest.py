@@ -32,6 +32,9 @@ os.environ.setdefault("MAX_FEEDS",          "10")
 os.environ.setdefault("MAX_POSITIONS",      "5")
 os.environ.setdefault("METRICS_PORT",       "0")
 os.environ.setdefault("LOG_LEVEL",          "WARNING")
+# Keep the NegRisk execution path exercised by the integration suite (paper
+# mode — no real matchOrders tx).  Live default is "off"; see config.py.
+os.environ.setdefault("NEGRISK_EXEC_MODE",  "onchain")
 
 # ── 2. Shim missing SDK names ────────────────────────────────────────────────
 try:

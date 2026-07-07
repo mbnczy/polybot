@@ -64,3 +64,21 @@ def test_non_numeric_fails(monkeypatch):
     monkeypatch.setenv("MAX_FEEDS", "lots")
     with pytest.raises(ValueError):
         BotConfig.from_env()
+
+
+def test_negrisk_exec_mode_defaults_off(monkeypatch):
+    # conftest sets NEGRISK_EXEC_MODE=onchain for the integration suite;
+    # remove it to observe the true production default.
+    _clear(monkeypatch, "NEGRISK_EXEC_MODE")
+    assert BotConfig.from_env().negrisk_exec_mode == "off"
+
+
+def test_negrisk_exec_mode_accepts_onchain(monkeypatch):
+    monkeypatch.setenv("NEGRISK_EXEC_MODE", "  OnChain ")
+    assert BotConfig.from_env().negrisk_exec_mode == "onchain"
+
+
+def test_negrisk_exec_mode_rejects_unknown(monkeypatch):
+    monkeypatch.setenv("NEGRISK_EXEC_MODE", "clob")
+    with pytest.raises(ValueError):
+        BotConfig.from_env()

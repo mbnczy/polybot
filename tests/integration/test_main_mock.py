@@ -601,3 +601,63 @@ async def test_main_mock_negrisk_path(monkeypatch, patched_clob, patched_web3, t
     assert breaker.status_dict()["orders_passed"] == 1
     assert breaker._state.session_pnl > 0.0
     assert any("NEG RISK" in m for m in notifier.messages)
+
+
+@pytest.mark.asyncio
+async def test_main_mock_negrisk_exec_off_alerts_without_trading(monkeypatch, tmp_path):
+    """
+    NEGRISK_EXEC_MODE=off (the live default): a NegRisk signal must be
+    detected and alerted, but NOTHING may be submitted — matchOrders would
+    revert for a non-operator wallet.
+    """
+    import risk.circuit_breaker as cb_mod
+    monkeypatch.setattr(cb_mod, "_DAILY_STATE_PATH", str(tmp_path / "daily.json"))
+    monkeypatch.setattr("main._negrisk_exec_mode", "off", raising=True)
+
+    breaker       = CircuitBreaker(starting_balance=500.0)
+    notifier      = FakeTelegramNotifier(on_status=breaker.status_dict)
+    fee_engine    = FeeEngine(default_fee=0.0)
+    rebate_engine = MakerRebateEngine()
+    rebate_engine.prime_cache(NR_CID, rebate_rate=0.0)
+
+    class _NoTradeClient:
+        """Any order/tx attempt fails the test."""
+        def __getattr__(self, name):
+            raise AssertionError(
+                f"client.{name} must not be touched when NegRisk exec is off"
+            )
+
+    class _NoopSigLogger:
+        def log_arb(self, *_a, **_kw):
+            pass
+
+    queue: asyncio.Queue = asyncio.Queue()
+    strat = asyncio.create_task(strategy_loop(
+        queue,
+        ArbDetector(desired_net_margin=0.005, default_fee_rate=0.0),
+        DutchBookPricer(desired_net_margin=0.005),
+        NegRiskArbDetector(desired_net_margin=0.005),
+        rebate_engine, fee_engine, breaker,
+        _NoTradeClient(), notifier, _NoopSigLogger(),
+    ))
+
+    await queue.put({
+        "type":              "neg_risk_tick",
+        "condition_id":      NR_CID,
+        "outcome_token_ids": [NR_TOKEN_A, NR_TOKEN_B, NR_TOKEN_C],
+        "no_asks":           NR_NO_ASKS,
+        "ts":                asyncio.get_event_loop().time(),
+    })
+    await asyncio.sleep(0.3)
+
+    strat.cancel()
+    await asyncio.gather(strat, return_exceptions=True)
+
+    detections = getattr(notifier, "arb_detections", [])
+    assert detections, "NegRisk signal was not alerted in off mode"
+    assert detections[0]["condition_id"] == NR_CID
+    assert "negrisk" in detections[0].get("category", "")
+    status = breaker.status_dict()
+    assert status["orders_passed"] == 0, "no order may pass the breaker in off mode"
+    assert status["open_positions"] == 0
+    assert status["session_pnl"] == 0.0
