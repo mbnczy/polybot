@@ -85,7 +85,15 @@ from eth_account import Account
 from web3 import Web3
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, LimitOrderArgs, MarketOrderArgs, OrderType
+from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, OrderType
+
+# py-clob-client ≥ 0.19 renamed LimitOrderArgs → OrderArgs and
+# create_limit_order() → create_order().  Support both so the bot runs against
+# whichever SDK generation is installed (see PolyClient._create_limit).
+try:
+    from py_clob_client.clob_types import OrderArgs as LimitOrderArgs
+except ImportError:  # pragma: no cover — legacy SDK
+    from py_clob_client.clob_types import LimitOrderArgs
 
 from telemetry.metrics import MATCH_ORDERS_TOTAL, SIGN_SECONDS, SUBMIT_SECONDS
 from strategy.arbitrage import TICK_SIZE   # single source of truth for tick size
@@ -320,6 +328,34 @@ def _extract_http_status(exc: Exception) -> int:
     return int(match.group(1)) if match else 0
 
 
+def _normalise_book(book: Any) -> dict:
+    """
+    Normalise an orderbook response to {"bids": [...], "asks": [...]} with
+    float-typed levels.  Accepts a legacy dict or a modern OrderBookSummary
+    dataclass whose levels are OrderSummary(price=str, size=str) objects.
+    """
+    def _levels(raw: Any) -> list[dict]:
+        out: list[dict] = []
+        for lvl in raw or []:
+            if isinstance(lvl, dict):
+                price, size = lvl.get("price"), lvl.get("size")
+            else:
+                price = getattr(lvl, "price", None)
+                size  = getattr(lvl, "size",  None)
+            try:
+                out.append({"price": float(price), "size": float(size)})
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    if isinstance(book, dict):
+        bids, asks = book.get("bids"), book.get("asks")
+    else:
+        bids = getattr(book, "bids", None)
+        asks = getattr(book, "asks", None)
+    return {"bids": _levels(bids), "asks": _levels(asks)}
+
+
 def _backoff_secs(attempt: int) -> float:
     """Exponential backoff with ±JITTER_FACTOR random jitter."""
     raw = min(_BASE_BACKOFF * (2.0 ** attempt), _MAX_BACKOFF)
@@ -454,6 +490,19 @@ class PolyClient:
             f = partial(fn, *args, **kwargs)
         return await loop.run_in_executor(_executor, f)
 
+    def _create_limit(self, args: "LimitOrderArgs") -> Any:
+        """
+        Sign a limit order with whichever SDK generation is installed.
+
+        Resolves the method on self._client at call time (not at dispatch
+        time), so it also survives a mid-session credential re-derivation
+        that swaps the underlying ClobClient instance.
+        """
+        fn = getattr(self._client, "create_order", None)
+        if fn is None:  # pragma: no cover — legacy SDK
+            fn = self._client.create_limit_order
+        return fn(args)
+
     async def _rederive_creds(self) -> None:
         """Re-derive L2 credentials in response to a 401.  Thread-safe."""
         logger.warning("CLOB 401 — re-deriving L2 API credentials")
@@ -578,8 +627,16 @@ class PolyClient:
         return await self._run_with_retry(self._client.get_market, condition_id)
 
     async def get_orderbook(self, token_id: str) -> dict:
-        """Return the current L2 orderbook for a token."""
-        return await self._run_with_retry(self._client.get_order_book, token_id)
+        """
+        Return the current L2 orderbook for a token as a plain dict:
+            {"bids": [{"price": float, "size": float}, …], "asks": […]}
+
+        Modern py-clob-client returns an OrderBookSummary dataclass (with
+        str-typed price levels); older SDKs returned a dict.  Normalise both
+        so callers (post_maker_order, MakerPairGuard) can rely on dict access.
+        """
+        book = await self._run_with_retry(self._client.get_order_book, token_id)
+        return _normalise_book(book)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public async API — order management
@@ -755,9 +812,7 @@ class PolyClient:
             size=size,
             side=side.upper(),
         )
-        signed = await self._run_with_retry(
-            self._client.create_limit_order, limit_args
-        )
+        signed = await self._run_with_retry(self._create_limit, limit_args)
         response = await self._run_with_retry(
             self._client.post_order, signed, OrderType.GTC
         )
@@ -938,8 +993,8 @@ class PolyClient:
 
         # Concurrent ECDSA signing — eliminates the ~1 s temporal drag
         yes_signed, no_signed = await asyncio.gather(
-            self._run_with_retry(self._client.create_limit_order, yes_args),
-            self._run_with_retry(self._client.create_limit_order, no_args),
+            self._run_with_retry(self._create_limit, yes_args),
+            self._run_with_retry(self._create_limit, no_args),
         )
 
         # Concurrent GTC submission
@@ -1152,7 +1207,7 @@ class PolyClient:
             for leg in legs
         ]
         signed_orders: list[Any] = list(await asyncio.gather(*[
-            self._run_with_retry(self._client.create_limit_order, args)
+            self._run_with_retry(self._create_limit, args)
             for args in limit_args_list
         ]))
 
