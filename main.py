@@ -93,6 +93,7 @@ from core.clob_client import PolyClient, classify_fills            # noqa: E402
 from core.scanner import FeedRegistry, MarketScanner               # noqa: E402
 from execution.auto_redeem import AutoRedeemer                     # noqa: E402
 from execution.inventory_manager import InventoryManager           # noqa: E402
+from execution.pair_guard import MakerPairGuard                    # noqa: E402
 from risk.circuit_breaker import (                                 # noqa: E402
     ArbOrderIntent,
     CircuitBreaker,
@@ -200,6 +201,7 @@ async def strategy_loop(
     notifier:       TelegramNotifier,
     sig_logger:     SignalLogger,
     inventory:      "InventoryManager | None" = None,
+    pair_guard:     "MakerPairGuard | None" = None,
 ) -> None:
     """
     Consumes arb_tick / neg_risk_tick snapshots from ALL active market feeds.
@@ -279,6 +281,19 @@ async def strategy_loop(
                     if inventory is not None:
                         inventory.register_paired_fill(arb_signal)
 
+                elif arb_signal.is_maker_signal and pair_guard is not None:
+                    # Maker path, not both-filled at ack: the GTC orders are
+                    # (or may be) resting on the book.  Hand the pair to the
+                    # MakerPairGuard, which keeps the breaker reservation and
+                    # guarantees one-leg exposure is hedged or unwound within
+                    # HEDGE_TIMEOUT_S — the strategy loop must NOT release or
+                    # unwind here, or a later lone fill would go unnoticed.
+                    pair_guard.watch_pair(arb_signal, n_shares, yes_resp, no_resp)
+                    logger.info(
+                        "Maker orders resting for %s (%s) — PairGuard watching.",
+                        condition_id[:16], fill_state,
+                    )
+
                 elif fill_state in ("yes_only", "no_only"):
                     breaker.release_open()
                     ARB_HALF_FILLS.inc()
@@ -303,11 +318,11 @@ async def strategy_loop(
                             f"({fill_state}) — MANUAL INTERVENTION REQUIRED"
                         )
 
-                else:  # "none"
+                else:  # "none" (taker/FOK path: both legs killed, no position)
                     breaker.release_open()
                     logger.info(
-                        "No immediate fill for %s — maker orders may be resting; "
-                        "P&L deferred to fill confirmation.", condition_id[:16],
+                        "No fill for %s — FOK legs killed; no exposure.",
+                        condition_id[:16],
                     )
 
             except CircuitBreakerTripped:
@@ -749,6 +764,11 @@ async def main() -> None:
     #    velocity). P&L is booked at fill time; this only recycles capital.
     inventory = InventoryManager(client, breaker, notifier)
 
+    # ── maker pair guard: one-leg protection for resting GTC maker pairs.
+    #    If the market moves and only one leg fills, the guard cancels the
+    #    stale order and hedges/unwinds the naked leg within HEDGE_TIMEOUT_S.
+    pair_guard = MakerPairGuard(client, breaker, notifier, inventory=inventory)
+
     await notifier.notify(
         f"Polymarket ARB Bot v7 online\n"
         f"balance={STARTING_BALANCE} USDC | margin={_desired_margin:.3f} "
@@ -798,11 +818,13 @@ async def main() -> None:
                 market_queue, detector, dutch_pricer, neg_risk_det, rebate_engine,
                 fee_engine, breaker, client, notifier, sig_logger,
                 inventory=inventory,
+                pair_guard=pair_guard,
             ),
             name="strategy",
         ),
         asyncio.create_task(auto_redeem_loop(redeemer),                        name="auto_redeem"),
         asyncio.create_task(inventory.run(),                                   name="inventory"),
+        asyncio.create_task(pair_guard.run(),                                  name="pair_guard"),
         asyncio.create_task(heartbeat_loop(breaker, notifier, feed_registry),  name="heartbeat"),
         asyncio.create_task(telegram_loop(notifier),                           name="telegram"),
         asyncio.create_task(sig_logger.run(),                                  name="sig_logger"),

@@ -904,8 +904,10 @@ class PolyClient:
         that prices are valid post-only bids in [0.01, 0.99].
 
         Unlike execute_arb_pair (FOK), these orders REST on the book as makers.
-        The InventoryManager monitors fill status and hedges any naked leg that
-        remains unfilled for > HEDGE_TIMEOUT_S seconds.
+        The caller MUST register the pair with MakerPairGuard
+        (execution/pair_guard.py) unless both legs confirmed filled at ack —
+        the guard cancels stale orders and hedges/unwinds any naked leg that
+        remains one-sided for > HEDGE_TIMEOUT_S seconds.
 
         Returns (yes_resp, no_resp) — exchange dicts with order_id and status.
         Orders may be PENDING (not yet filled) when returned.

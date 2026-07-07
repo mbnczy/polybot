@@ -8,9 +8,11 @@ executes arb bundles as a single atomic on-chain transaction.  The exchange
 either fully settles every leg or reverts — partial fills are impossible by
 construction.
 
-Because partial fills cannot occur, the Emergency Hedge path (T+5 s timer,
-taker cross, leg dump) has been removed entirely.  The InventoryManager now
-focuses exclusively on:
+Because matchOrders bundles cannot partially fill, this class carries no
+hedge logic.  NOTE: the binary GTC maker path (execute_arb_maker_pair) is NOT
+atomic — its one-leg / partial-fill risk is handled by MakerPairGuard
+(execution/pair_guard.py), not here.  The InventoryManager focuses
+exclusively on:
 
 1. On-Chain Settlement  (mergePositions, triggered on paired fill detection)
    After matchOrders is confirmed, our wallet holds a full YES+NO complementary
