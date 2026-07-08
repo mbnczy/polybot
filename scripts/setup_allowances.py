@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 
 from dotenv import load_dotenv
@@ -148,8 +149,11 @@ def main() -> int:
     usdc_nat = w3.eth.contract(address=USDC_NATIVE, abi=ERC20_ABI)
     ctf      = w3.eth.contract(address=CTF,         abi=ERC1155_ABI)
 
+    # Keyed provider URLs (Alchemy/QuickNode/…) embed the API key in the path —
+    # mask everything after the host so the key never lands in logs/history.
+    rpc_masked = re.sub(r"(https?://[^/]+/).+", r"\1…(masked)", rpc)
     print(f"Wallet   : {wallet}")
-    print(f"RPC      : {rpc}\n")
+    print(f"RPC      : {rpc_masked}\n")
 
     # ── Balances ──────────────────────────────────────────────────────────────
     pol   = w3.eth.get_balance(wallet) / 1e18
