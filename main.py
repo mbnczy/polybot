@@ -59,6 +59,8 @@ Environment variables
   SCAN_INTERVAL           seconds between Gamma API market scans (default 300)
   NEGRISK_EXEC_MODE       "off" (detect+alert only, default) | "onchain"
                           (matchOrders — registered operator wallets only)
+  TELEGRAM_HEARTBEAT_S    seconds between Telegram health pings
+                          (default 3600 = hourly; 0 = disabled)
 
   Optional single-market seed (backward-compatible):
   YES_TOKEN_ID, NO_TOKEN_ID, CONDITION_ID
@@ -150,6 +152,9 @@ _cfg = BotConfig.from_env()
 
 STARTING_BALANCE:    float = _cfg.starting_balance
 HEARTBEAT_INTERVAL:  float = 60.0
+# Telegram health-ping cadence (seconds); 0 disables the Telegram heartbeat
+# entirely.  Metrics/journal heartbeats stay on the 60-s cadence regardless.
+_telegram_heartbeat_s: float = max(0.0, float(os.environ.get("TELEGRAM_HEARTBEAT_S", 3600.0)))
 QUEUE_MAXSIZE:       int   = 2048
 # Phase 2: max concurrent in-flight executions dispatched off the consumer so a
 # slow order RTT never stalls evaluation of other markets' ticks (validated).
@@ -638,14 +643,31 @@ async def heartbeat_loop(
     notifier:      TelegramNotifier,
     feed_registry: FeedRegistry,
 ) -> None:
-    """Send a periodic system health update to Telegram and refresh metrics."""
-    logger.info("heartbeat_loop started")
+    """
+    Refresh metrics every HEARTBEAT_INTERVAL (60 s) and send a Telegram health
+    ping every TELEGRAM_HEARTBEAT_S seconds (default 3600 = hourly; 0 = never).
+
+    The 60-s inner cadence must stay — it drives the Prometheus gauges and the
+    journal heartbeat line — so only the Telegram send is throttled.
+    """
+    logger.info(
+        "heartbeat_loop started | telegram_heartbeat=%s",
+        f"{_telegram_heartbeat_s:.0f}s" if _telegram_heartbeat_s > 0 else "off",
+    )
+    last_tg_ping = time.monotonic()   # startup notify already announced us
     try:
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
             status = breaker.status_dict()
             logger.info("Heartbeat | %s", status)
-            await notifier.heartbeat(status)
+
+            now = time.monotonic()
+            if (
+                _telegram_heartbeat_s > 0
+                and now - last_tg_ping >= _telegram_heartbeat_s
+            ):
+                last_tg_ping = now
+                await notifier.heartbeat(status)
 
             # ── Metrics: refresh balance + market count (60-s cadence) ────
             USDC_BALANCE.set(
