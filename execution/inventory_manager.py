@@ -56,6 +56,7 @@ from typing import TYPE_CHECKING
 from eth_account import Account
 from web3 import Web3
 from web3.exceptions import ContractLogicError
+from web3.middleware import ExtraDataToPOAMiddleware
 
 from risk.circuit_breaker import (
     CircuitBreaker,
@@ -239,6 +240,9 @@ class InventoryManager:
         # ── Web3 / CTF setup ─────────────────────────────────────────────────
         rpc_url       = os.environ.get("POLYGON_RPC_URL", "")
         self._w3      = Web3(Web3.HTTPProvider(rpc_url))
+        # Polygon is POA-style: without this middleware every get_block()
+        # (EIP-1559 gas estimation) raises ExtraDataLengthError.
+        self._w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         self._ctf     = self._w3.eth.contract(address=_CTF_ADDRESS, abi=_CTF_ABI)
         self._negrisk = self._w3.eth.contract(
             address=_NEGRISK_ADAPTER_ADDRESS, abi=_NEGRISK_ABI
@@ -665,7 +669,9 @@ class InventoryManager:
         Raises on revert or timeout.
         """
         base_fee     = self._w3.eth.get_block("pending")["baseFeePerGas"]
-        priority_tip = Web3.to_wei(2, "gwei")    # standard Polygon tip
+        # Polygon enforces a 25 gwei minimum priority fee — anything lower is
+        # rejected by the mempool ("gas tip cap below minimum").
+        priority_tip = Web3.to_wei(30, "gwei")
         max_fee      = base_fee * 2 + priority_tip
 
         tx = fn_call.build_transaction({

@@ -87,11 +87,19 @@ class FakeEth:
         return {"status": 1, "transactionHash": _tx_hash}
 
 
+class _FakeMiddlewareOnion:
+    """Accepts the POA middleware injection (real Web3: middleware_onion.inject)."""
+
+    def inject(self, *_args: Any, **_kwargs: Any) -> None:
+        pass
+
+
 class FakeWeb3:
     """Mimics `web3.Web3` enough for AutoRedeemer / InventoryManager init+execute."""
 
     def __init__(self, _provider: Any = None) -> None:
         self.eth = FakeEth()
+        self.middleware_onion = _FakeMiddlewareOnion()
 
     @staticmethod
     def HTTPProvider(_url: str) -> object:

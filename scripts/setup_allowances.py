@@ -44,6 +44,7 @@ import sys
 from dotenv import load_dotenv
 from eth_account import Account
 from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 
 # ── Polygon mainnet contract addresses ────────────────────────────────────────
 USDC_E           = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
@@ -90,7 +91,9 @@ ERC1155_ABI = [
 
 def _send(w3: Web3, pk: str, wallet: str, fn_call) -> str:
     base_fee = w3.eth.get_block("pending")["baseFeePerGas"]
-    tip      = Web3.to_wei(2, "gwei")
+    # Polygon enforces a 25 gwei minimum priority fee; 30 gwei clears it
+    # with margin (~0.002 POL per approval at 65k gas).
+    tip      = Web3.to_wei(30, "gwei")
     tx = fn_call.build_transaction({
         "from":                 wallet,
         "nonce":                w3.eth.get_transaction_count(wallet, "pending"),
@@ -120,6 +123,9 @@ def main() -> int:
     load_dotenv()
     rpc = os.environ.get("POLYGON_RPC_URL", "https://polygon-rpc.com")
     w3  = Web3(Web3.HTTPProvider(rpc))
+    # Polygon is POA-style: block headers carry >32-byte extraData, which
+    # web3.py rejects unless this middleware strips it.
+    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     if not w3.is_connected():
         print(f"ERROR: cannot reach Polygon RPC at {rpc}")
         return 1
