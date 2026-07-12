@@ -30,6 +30,9 @@ os.environ.setdefault("DESIRED_NET_MARGIN", "0.005")
 os.environ.setdefault("DEFAULT_TAKER_FEE",  "0.02")
 os.environ.setdefault("MAX_FEEDS",          "10")
 os.environ.setdefault("MAX_POSITIONS",      "5")
+# Pin the pair cap so the suite is hermetic — main.py's load_dotenv() would
+# otherwise leak the operator's live .env value into the tests.
+os.environ.setdefault("MAX_ARB_PAIR_USDC",  "50.0")
 os.environ.setdefault("METRICS_PORT",       "0")
 os.environ.setdefault("LOG_LEVEL",          "WARNING")
 # Keep the NegRisk execution path exercised by the integration suite (paper

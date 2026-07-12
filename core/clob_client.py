@@ -169,7 +169,8 @@ _JITTER_FACTOR:  float = 0.10    # ±10 % random jitter on each wait
 _RETRYABLE:      frozenset[int] = frozenset({409, 429, 529})
 
 # ── Bundle position cap ────────────────────────────────────────────────────────
-_MAX_BUNDLE_USDC: float = 50.0   # hard ceiling per NegRisk maker bundle
+# Same env-driven per-trade ceiling as binary pairs (MAX_ARB_PAIR_USDC).
+from risk.circuit_breaker import MAX_ARB_PAIR_USDC as _MAX_BUNDLE_USDC  # noqa: E402
 
 # ── CTF Exchange V2 (Polymarket on-chain order matching — Polygon mainnet) ─────
 # matchOrders: atomically mints YES+NO shares and settles both legs in one tx.

@@ -58,7 +58,27 @@ logger = logging.getLogger(__name__)
 
 # ── Hard limits ────────────────────────────────────────────────────────────────
 DAILY_LOSS_LIMIT:   float = -250.0  # USDC; triggers CircuitBreakerTripped
-MAX_ARB_PAIR_USDC:  float =   50.0  # USDC; hard ceiling on combined YES+NO cost
+
+
+def _pair_cap_from_env() -> float:
+    """
+    MAX_ARB_PAIR_USDC — hard ceiling on the combined YES+NO cost of one arb
+    pair.  Env-configurable (same variable the monitor scripts read); fails
+    fast at import on a non-positive or non-numeric value.
+    """
+    raw = os.environ.get("MAX_ARB_PAIR_USDC", "").strip()
+    if not raw:
+        return 50.0
+    try:
+        cap = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"MAX_ARB_PAIR_USDC={raw!r} is not a valid float") from exc
+    if cap <= 0.0:
+        raise ValueError(f"MAX_ARB_PAIR_USDC must be > 0; got {cap}")
+    return cap
+
+
+MAX_ARB_PAIR_USDC:  float = _pair_cap_from_env()
 
 # Path to persisted daily state — resolves to <project_root>/daily_state.json
 _DAILY_STATE_PATH: str = os.path.normpath(
