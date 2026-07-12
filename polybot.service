@@ -1,0 +1,41 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# polybot.service — Polymarket arb bot (main.py)
+#
+# Install:
+#   sudo cp /home/ubuntu/polybot/polybot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now polybot
+#
+# Logs:
+#   journalctl -u polybot -f
+#
+# Paper/live toggle lives in /home/ubuntu/polybot/.env (PAPER_TRADE_MODE);
+# restart the service after changing it:  sudo systemctl restart polybot
+# ══════════════════════════════════════════════════════════════════════════════
+
+[Unit]
+Description=Polymarket arb bot (polybot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/polybot
+EnvironmentFile=/home/ubuntu/polybot/.env
+ExecStart=/home/ubuntu/polybot/.venv/bin/python -u main.py
+
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=120s
+StartLimitBurst=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polybot
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
