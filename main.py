@@ -238,6 +238,23 @@ async def strategy_loop(
     inflight: set[asyncio.Task] = set()
     exec_sem = asyncio.Semaphore(_EXEC_CONCURRENCY)
 
+    # Per-market re-entry guard: a market is "busy" from dispatch until its
+    # execution task finishes; afterwards the PairGuard (resting maker pair)
+    # and the InventoryManager (unsettled merge) keep it busy via is_watching /
+    # is_tracking.  Without this, every tick during an in-flight execution
+    # opened ANOTHER position on the same market and the newer pair silently
+    # displaced the older one in per-condition registries.
+    busy_conditions: set[str] = set()
+
+    def _condition_busy(cid: str) -> bool:
+        if cid in busy_conditions:
+            return True
+        if pair_guard is not None and pair_guard.is_watching(cid):
+            return True
+        if inventory is not None and inventory.is_tracking(cid):
+            return True
+        return False
+
     # Arb-duration tracking — how long each market stays in an arb window.
     duration_tracker = ArbDurationTracker(min_duration_s=_arb_duration_min_s)
 
@@ -343,9 +360,19 @@ async def strategy_loop(
                 await notifier.notify(f"ARB EXECUTION ERROR: {exc}")
 
     def _dispatch_exec(*args) -> None:
+        cid: str = args[5]   # condition_id (see _execute_and_settle signature)
+        busy_conditions.add(cid)
         t = asyncio.create_task(_execute_and_settle(*args))
         inflight.add(t)
-        t.add_done_callback(_on_exec_done)
+
+        def _done(task: asyncio.Task, _cid: str = cid) -> None:
+            # By now any resting pair is already registered with the PairGuard
+            # (watch_pair runs inside the task), so releasing the dispatch
+            # marker cannot open a duplicate-entry window.
+            busy_conditions.discard(_cid)
+            _on_exec_done(task)
+
+        t.add_done_callback(_done)
 
     try:
         while True:
@@ -573,6 +600,17 @@ async def strategy_loop(
                 yes_price=yes_ask,
                 no_price=no_ask,
             )
+
+            # ── 3c. Per-market re-entry guard ─────────────────────────────────
+            # One live position per market: skip while an execution is in
+            # flight, a maker pair rests under PairGuard watch, or a filled
+            # pair is still being merged back to USDC.
+            if _condition_busy(condition_id):
+                logger.debug(
+                    "Signal on busy market %s — skipping (in-flight/resting/settling)",
+                    condition_id[:16],
+                )
+                continue
 
             # ── 4. Size the position ──────────────────────────────────────────
             if arb_signal.is_maker_signal:
@@ -916,6 +954,13 @@ async def main() -> None:
     except asyncio.CancelledError:
         pass
     finally:
+        # Shutdown hygiene: never leave resting orders on the book while the
+        # bot is down (SIGTERM/systemctl restart does not go through the
+        # /halt or breaker-trip paths, which have their own cancel_all).
+        try:
+            await client.cancel_all_orders()
+        except Exception as cancel_exc:  # noqa: BLE001
+            logger.error("cancel_all_orders failed during shutdown: %s", cancel_exc)
         await feed_registry.stop_all()
         logger.info("Flushing signal logger …")
         await sig_logger.close()

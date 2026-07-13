@@ -62,6 +62,7 @@ from typing import TYPE_CHECKING
 import aiohttp
 from web3 import Web3
 from web3.exceptions import ContractLogicError
+from web3.middleware import ExtraDataToPOAMiddleware
 from eth_account import Account
 
 if TYPE_CHECKING:
@@ -193,6 +194,9 @@ class AutoRedeemer:
         # Web3 setup — blocking but done at init time before the event loop
         rpc_url           = os.environ.get("POLYGON_RPC_URL", "")
         self._w3          = Web3(Web3.HTTPProvider(rpc_url))
+        # Polygon is POA-style: without this middleware every get_block()
+        # (EIP-1559 gas estimation) raises ExtraDataLengthError.
+        self._w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         self._ctf         = self._w3.eth.contract(address=CTF_ADDRESS, abi=_CTF_ABI)
 
         # EOA key & wallet (web3-core-operations EOA protocol)
@@ -458,9 +462,10 @@ class AutoRedeemer:
         Runs in a thread-pool executor; must not call async functions.
         Returns the transaction hash bytes on success.
         """
-        # EIP-1559 base fee + 2 gwei priority tip (Polygon is cheap)
         base_fee     = self._w3.eth.get_block("pending")["baseFeePerGas"]
-        priority_tip = Web3.to_wei(2, "gwei")
+        # Polygon enforces a 25 gwei minimum priority fee — anything lower is
+        # rejected by the mempool ("gas tip cap below minimum").
+        priority_tip = Web3.to_wei(30, "gwei")
         max_fee      = base_fee * 2 + priority_tip
 
         tx = self._ctf.functions.redeemPositions(

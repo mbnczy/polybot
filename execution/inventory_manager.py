@@ -312,6 +312,14 @@ class InventoryManager:
             logger.info("InventoryManager stopped")
             raise
 
+    def is_tracking(self, condition_id: str) -> bool:
+        """True while a position on this market is pending/paired/settling.
+
+        The strategy loop uses this to refuse a new entry on a market whose
+        previous fill has not been merged back to USDC yet."""
+        pos = self._positions.get(condition_id)
+        return pos is not None and pos.status not in ("SETTLED",)
+
     def register_matched_pair(
         self,
         signal:     "ArbSignal",

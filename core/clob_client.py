@@ -495,6 +495,37 @@ class PolyClient:
             f = partial(fn, *args, **kwargs)
         return await loop.run_in_executor(_executor, f)
 
+    async def _submit_pair(self, yes_coro, no_coro) -> tuple[dict, dict]:
+        """
+        Submit both legs concurrently WITHOUT losing the surviving leg when
+        one submission raises.
+
+        A plain asyncio.gather() propagates the first exception and discards
+        the sibling result — if the sibling order was accepted, it would live
+        on the book with nobody tracking it (orphaned order / naked exposure).
+        Instead, a failed leg is normalised to {"status": "error"} so
+        classify_fills() treats it as unfilled and the caller's half-fill /
+        PairGuard handling resolves the surviving leg.
+
+        Raises only when BOTH legs failed (nothing usable to track).
+        """
+        yes_resp, no_resp = await asyncio.gather(
+            yes_coro, no_coro, return_exceptions=True
+        )
+        if isinstance(yes_resp, BaseException) and isinstance(no_resp, BaseException):
+            raise yes_resp
+
+        def _norm(resp: Any, label: str) -> dict:
+            if isinstance(resp, BaseException):
+                logger.error(
+                    "%s leg submission FAILED (sibling leg survives — "
+                    "half-fill handling takes over): %s", label, resp,
+                )
+                return {"status": "error", "error": str(resp)}
+            return resp
+
+        return _norm(yes_resp, "YES"), _norm(no_resp, "NO")
+
     def _create_limit(self, args: "LimitOrderArgs") -> Any:
         """
         Sign a limit order with whichever SDK generation is installed.
@@ -894,9 +925,10 @@ class PolyClient:
         )
         SIGN_SECONDS.observe(time.monotonic() - _sign_t0)
 
-        # Step 2 — submit both FOK orders simultaneously
+        # Step 2 — submit both FOK orders simultaneously.  _submit_pair keeps
+        # the surviving leg when one submission errors (orphan prevention).
         _submit_t0 = time.monotonic()
-        yes_resp, no_resp = await asyncio.gather(
+        yes_resp, no_resp = await self._submit_pair(
             self._run_with_retry(self._client.post_order, yes_signed, OrderType.FOK),
             self._run_with_retry(self._client.post_order, no_signed,  OrderType.FOK),
         )
@@ -1002,8 +1034,9 @@ class PolyClient:
             self._run_with_retry(self._create_limit, no_args),
         )
 
-        # Concurrent GTC submission
-        yes_resp, no_resp = await asyncio.gather(
+        # Concurrent GTC submission.  _submit_pair keeps the surviving leg
+        # when one submission errors — the PairGuard then owns its lifecycle.
+        yes_resp, no_resp = await self._submit_pair(
             self._run_with_retry(self._client.post_order, yes_signed, OrderType.GTC),
             self._run_with_retry(self._client.post_order, no_signed,  OrderType.GTC),
         )

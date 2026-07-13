@@ -284,3 +284,56 @@ async def test_partial_pair_merges_paired_portion_only():
     assert breaker.fills[0] == pytest.approx(0.088, abs=1e-6)
     assert inventory.paired == []                    # not a full pair
     assert inventory.merged == [("0xcond", 4.0)]     # merge only what's paired
+
+
+@pytest.mark.asyncio
+async def test_double_watch_same_condition_does_not_orphan_first_pair():
+    """
+    Two watches on the SAME market must coexist — keying by condition_id
+    alone silently overwrote (orphaned) the first pair's resting orders.
+    """
+    client = FakeGuardClient()
+    client.orders["oy"]  = {"status": "live", "size_matched": 0.0}
+    client.orders["on"]  = {"status": "live", "size_matched": 0.0}
+    client.orders["oy2"] = {"status": "live", "size_matched": 0.0}
+    client.orders["on2"] = {"status": "live", "size_matched": 0.0}
+    guard, breaker, _ = _build_guard(client)
+
+    sig = _maker_signal(10.0)
+    guard.watch_pair(sig, 10.0, _resting_resp("oy"),  _resting_resp("on"))
+    guard.watch_pair(sig, 10.0, _resting_resp("oy2"), _resting_resp("on2"))
+
+    assert guard.watched_count == 2          # nothing displaced
+    assert guard.is_watching(sig.condition_id)
+
+    # Resolve both pairs fully → both must book, not just the survivor.
+    for oid in ("oy", "on", "oy2", "on2"):
+        client.orders[oid] = {"status": "matched", "size_matched": 10.0}
+    await guard.poll_once()
+
+    assert guard.watched_count == 0
+    assert not guard.is_watching(sig.condition_id)
+    assert len(breaker.fills) == 2           # each pair booked exactly once
+
+
+@pytest.mark.asyncio
+async def test_error_leg_from_submit_pair_resolves_via_ttl_cancel():
+    """
+    A leg normalised to {"status": "error"} (failed submission, no order id)
+    must not wedge the pair: the surviving resting leg is cancelled at TTL
+    and the reservation is released.
+    """
+    client = FakeGuardClient()
+    client.orders["on"] = {"status": "live", "size_matched": 0.0}
+    guard, breaker, _ = _build_guard(client, order_ttl_s=0.0)
+
+    guard.watch_pair(_maker_signal(10.0), 10.0,
+                     {"status": "error", "error": "boom"},   # YES failed
+                     _resting_resp("on"))
+
+    await guard.poll_once()
+
+    assert "on" in client.cancelled
+    assert breaker.fills == []
+    assert breaker.releases == 1
+    assert guard.watched_count == 0

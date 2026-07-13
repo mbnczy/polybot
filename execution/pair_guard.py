@@ -103,6 +103,8 @@ class _Leg:
 
 @dataclass
 class _WatchedPair:
+    pair_id:         str                   # unique key — one condition may be
+                                           # watched more than once over time
     condition_id:    str
     signal:          "ArbSignal"
     yes:             _Leg
@@ -181,14 +183,18 @@ class MakerPairGuard:
                                   n_shares, yes_resp)
         no  = self._leg_from_resp("NO",  signal.no_token_id,  signal.no_bid,
                                   n_shares, no_resp)
+        # Unique key: NEVER key by condition_id alone — a second watch on the
+        # same market would silently overwrite (and orphan) the first pair.
+        pair_id = f"{signal.condition_id[:16]}-{time.monotonic_ns()}"
         pair = _WatchedPair(
+            pair_id=pair_id,
             condition_id=signal.condition_id,
             signal=signal,
             yes=yes,
             no=no,
             created_at=time.monotonic(),
         )
-        self._pairs[signal.condition_id] = pair
+        self._pairs[pair_id] = pair
         logger.info(
             "PairGuard watching | condition=%s shares=%.2f "
             "yes[%s open=%s matched=%.2f] no[%s open=%s matched=%.2f]",
@@ -213,6 +219,14 @@ class MakerPairGuard:
     @property
     def watched_count(self) -> int:
         return len(self._pairs)
+
+    def is_watching(self, condition_id: str) -> bool:
+        """True while any pair on this market is still being resolved.
+
+        The strategy loop uses this to refuse a new entry on a market whose
+        previous maker pair is unresolved (prevents pyramiding exposure and
+        double-booking against the same complementary set)."""
+        return any(p.condition_id == condition_id for p in self._pairs.values())
 
     # ──────────────────────────────────────────────────────────────────────────
     # Main loop
@@ -382,7 +396,7 @@ class MakerPairGuard:
         circuit-breaker reservation taken by the strategy loop is balanced.
         """
         pair.finalizing = True
-        self._pairs.pop(pair.condition_id, None)
+        self._pairs.pop(pair.pair_id, None)
 
         yes, no = pair.yes, pair.no
         # Make sure nothing is left resting on the book.
@@ -510,10 +524,23 @@ class MakerPairGuard:
         if paired >= pair.signal.yes_size - _SHARE_EPS:
             self._inventory.register_paired_fill(pair.signal)
         else:
-            # Partial pair — merge exactly the paired share count.
-            asyncio.ensure_future(
-                self._inventory.merge_complementary_set(pair.condition_id, paired)
-            )
+            # Partial pair — merge exactly the paired share count.  Run in a
+            # wrapper so a merge failure is loudly reported instead of dying
+            # as an unretrieved task exception.
+            async def _merge_partial(cid: str = pair.condition_id,
+                                     shares: float = paired) -> None:
+                try:
+                    await self._inventory.merge_complementary_set(cid, shares)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "PairGuard | partial merge FAILED condition=%s "
+                        "shares=%.2f: %s", cid[:16], shares, exc,
+                    )
+                    await self._notifier.send_critical_error(
+                        f"PARTIAL MERGE FAILED {cid[:16]} — {shares:.2f} shares "
+                        f"stuck as CTF tokens (redeemable at resolution): {exc}"
+                    )
+            asyncio.ensure_future(_merge_partial())
 
     async def _cancel_all_resting(self) -> None:
         """Shutdown hygiene: never leave watched GTC orders on the book."""
