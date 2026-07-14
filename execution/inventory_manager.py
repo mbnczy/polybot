@@ -494,27 +494,21 @@ class InventoryManager:
             self._on_settled(pos)
             return
 
-        settle_fn = (
-            self._negrisk_merge_sync if pos.is_negrisk
-            else self._merge_positions_sync
-        )
-        contract_label = "NegRiskAdapter" if pos.is_negrisk else "CTF"
-
         try:
-            tx_hash = await asyncio.get_running_loop().run_in_executor(
-                None,
-                settle_fn,
-                pos.condition_id,
-                pos.n_shares,
+            # Post-migration: settlement is routed through the V2 SDK, which
+            # targets the correct contracts (pUSD collateral) for both binary
+            # and NegRisk markets.
+            tx_hash = await self._client.merge_positions(
+                pos.condition_id, int(pos.n_shares * _CTF_UNIT)
             )
             pos.status = "SETTLED"
             self._on_settled(pos)
 
             msg = (
-                f"💰 SETTLED — {contract_label}.mergePositions confirmed\n"
+                f"💰 SETTLED — mergePositions confirmed\n"
                 f"condition={pos.condition_id[:20]}\n"
-                f"shares={pos.n_shares:.2f}  USDC_received≈{pos.n_shares:.4f}\n"
-                f"tx={tx_hash.hex()}"
+                f"shares={pos.n_shares:.2f}  pUSD_received≈{pos.n_shares:.4f}\n"
+                f"tx={tx_hash}"
             )
             logger.info(msg)
             await self._notifier.notify(msg)
@@ -581,21 +575,18 @@ class InventoryManager:
         Returns the transaction hash bytes on success, or None in paper mode.
         Raises on failure so the caller can decide how to handle it.
         """
-        contract_label = "NegRiskAdapter" if is_negrisk else "CTF"
         if _PAPER_TRADE:
             logger.info(
-                "PAPER %s.mergePositions | condition=%s shares=%.2f",
-                contract_label, condition_id[:16], n_shares,
+                "PAPER mergePositions | condition=%s shares=%.2f",
+                condition_id[:16], n_shares,
             )
             return None
 
-        sync_fn = self._negrisk_merge_sync if is_negrisk else self._merge_positions_sync
-        return await asyncio.get_running_loop().run_in_executor(
-            None,
-            sync_fn,
-            condition_id,
-            n_shares,
+        # V2 SDK handles contract routing (binary vs NegRisk) internally.
+        tx = await self._client.merge_positions(
+            condition_id, int(n_shares * _CTF_UNIT)
         )
+        return tx.encode() if isinstance(tx, str) else tx
 
     def _merge_positions_sync(
         self,

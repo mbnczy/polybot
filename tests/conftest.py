@@ -39,14 +39,6 @@ os.environ.setdefault("LOG_LEVEL",          "WARNING")
 # mode — no real matchOrders tx).  Live default is "off"; see config.py.
 os.environ.setdefault("NEGRISK_EXEC_MODE",  "onchain")
 
-# ── 2. Shim missing SDK names ────────────────────────────────────────────────
-try:
-    from py_clob_client import clob_types as _ct
-    if not hasattr(_ct, "LimitOrderArgs"):
-        _ct.LimitOrderArgs = _ct.OrderArgs                   # type: ignore[attr-defined]
-except Exception:                                            # pragma: no cover
-    pass
-
 # ── 3. Make repo root importable ─────────────────────────────────────────────
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -112,12 +104,13 @@ def arb_tick_queue() -> asyncio.Queue:
 
 @pytest.fixture
 def patched_clob(monkeypatch, fake_clob):
-    """Patch the ClobClient import site so PolyClient never hits the network."""
-    monkeypatch.setattr(
-        "core.clob_client.ClobClient",
-        lambda *a, **kw: fake_clob,
-        raising=True,
-    )
+    """Patch the SecureClient import site so PolyClient never hits the network."""
+    class _Factory:
+        @staticmethod
+        def create(**_kw):
+            return fake_clob
+
+    monkeypatch.setattr("core.clob_client.SecureClient", _Factory, raising=True)
     return fake_clob
 
 

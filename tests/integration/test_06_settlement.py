@@ -46,26 +46,28 @@ async def test_register_matched_pair_settles_in_paper_mode(
 
 
 @pytest.mark.asyncio
-async def test_merge_complementary_set_live_calls_web3(
+async def test_merge_complementary_set_live_routes_through_sdk(
     monkeypatch, patched_web3, patched_clob, fake_telegram, fake_w3, tmp_path,
 ):
-    """When paper mode is disabled the merge issues a real Web3 transaction."""
+    """When paper mode is disabled the merge is routed through the V2 SDK
+    (post-pUSD-migration contracts), not the legacy raw CTF call."""
     monkeypatch.setattr(
         "risk.circuit_breaker._DAILY_STATE_PATH",
         str(tmp_path / "daily.json"),
     )
     monkeypatch.setattr("execution.inventory_manager._PAPER_TRADE", False)
+    monkeypatch.setattr("core.clob_client._PAPER_TRADE", False)
 
     from core.clob_client          import PolyClient
     from execution.inventory_manager import InventoryManager
 
     invmgr = InventoryManager(PolyClient(), CircuitBreaker(starting_balance=500.0), fake_telegram)
-    tx = await invmgr.merge_complementary_set("0x" + "ab" * 32, n_shares=5.0)
+    cid = "0x" + "ab" * 32
+    tx = await invmgr.merge_complementary_set(cid, n_shares=5.0)
 
-    assert tx is not None and len(tx) == 32
-    assert any(name == "mergePositions" for name, _args in fake_w3.eth._contracts[
-        next(iter(fake_w3.eth._contracts))
-    ].functions.calls)
+    assert tx is not None
+    # 5.0 shares × 1e6 base units, routed to SecureClient.merge_positions
+    assert patched_clob.merges == [(cid, 5_000_000)]
 
 
 @pytest.mark.asyncio

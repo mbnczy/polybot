@@ -1,33 +1,25 @@
 """
 scripts/setup_allowances.py
 ───────────────────────────
-One-time wallet preparation for LIVE trading with a direct EOA.
+One-time wallet preparation for LIVE trading — V2 (post-pUSD-migration).
 
-Polymarket CLOB orders settle on-chain, so the bot wallet must pre-approve
-the exchange contracts.  Without these approvals every fill (BUY), every
-PairGuard unwind (SELL), and every mergePositions call reverts.
+Polymarket's April 2026 exchange upgrade replaced USDC.e collateral with
+pUSD (1:1 USDC-backed wrapper) and deployed new exchange contracts.  A
+trade-ready EOA wallet therefore needs:
 
-What it grants (the canonical Polymarket EOA set)
-─────────────────────────────────────────────────
-  USDC.e  approve(∞)            → CTF (splits/merges)
-  USDC.e  approve(∞)            → CTF Exchange          (binary BUY fills)
-  USDC.e  approve(∞)            → NegRisk CTF Exchange  (negrisk-market fills)
-  USDC.e  approve(∞)            → NegRisk Adapter
-  CTF     setApprovalForAll     → CTF Exchange          (SELL / unwind)
-  CTF     setApprovalForAll     → NegRisk CTF Exchange
-  CTF     setApprovalForAll     → NegRisk Adapter
-
-Note: binary markets that belong to a NegRisk event settle on the NegRisk
-CTF Exchange even in "NEGRISK_EXEC_MODE=off" (py-clob-client picks the
-exchange per market), so the NegRisk approvals are NOT optional.
+  1. POL for gas.
+  2. pUSD balance — wrapped from USDC.e via the CollateralOnramp:
+         USDC.e.approve(ONRAMP) ; ONRAMP.wrap(USDC.e, wallet, amount)
+  3. The V2 approval set — granted by the official SDK's
+     `SecureClient.setup_trading_approvals()` (pUSD → exchanges/adapters/
+     router, CTF ERC-1155 operators; already-approved entries are skipped).
 
 Usage
 ─────
-  # 1. Fill POLY_PRIVATE_KEY / POLY_FUNDER_ADDRESS / POLYGON_RPC_URL in .env
-  # 2. Dry-run: report balances + current allowances, send nothing:
+  # Dry-run: report balances + what would be done, send nothing:
   .venv/bin/python scripts/setup_allowances.py
 
-  # 3. Send the missing approval transactions (needs POL for gas):
+  # Wrap all USDC.e into pUSD and grant the V2 approvals:
   .venv/bin/python scripts/setup_allowances.py --apply
 
   # Read-only inspection of an arbitrary address (no key needed):
@@ -47,25 +39,14 @@ from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 
 # ── Polygon mainnet contract addresses ────────────────────────────────────────
-USDC_E           = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
-USDC_NATIVE      = Web3.to_checksum_address("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359")
-CTF              = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
-CTF_EXCHANGE     = Web3.to_checksum_address("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982e")
-NEGRISK_EXCHANGE = Web3.to_checksum_address("0xC5d563A36AE78145C45a50134d48A1215220f80a")
-NEGRISK_ADAPTER  = Web3.to_checksum_address("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")
+USDC_E      = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+USDC_NATIVE = Web3.to_checksum_address("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359")
+PUSD        = Web3.to_checksum_address("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")
+# CollateralOnramp — wraps USDC.e 1:1 into pUSD (docs.polymarket.com/concepts/pusd)
+ONRAMP      = Web3.to_checksum_address("0x93070a847efEf7F70739046A929D47a521F5B8ee")
 
-SPENDERS = [
-    ("CTF (ConditionalTokens)", CTF),
-    ("CTF Exchange",            CTF_EXCHANGE),
-    ("NegRisk CTF Exchange",    NEGRISK_EXCHANGE),
-    ("NegRisk Adapter",         NEGRISK_ADAPTER),
-]
-# ERC-1155 operators: CTF itself never needs to operate our CTF balance.
-OPERATORS = SPENDERS[1:]
-
-MAX_UINT = 2 ** 256 - 1
-# "Effectively unlimited" threshold — half of max still counts as approved.
-APPROVED_FLOOR = 2 ** 255
+MAX_UINT       = 2 ** 256 - 1
+APPROVED_FLOOR = 2 ** 255   # "effectively unlimited"
 
 ERC20_ABI = [
     {"name": "balanceOf", "type": "function", "stateMutability": "view",
@@ -79,25 +60,23 @@ ERC20_ABI = [
      "outputs": [{"name": "", "type": "bool"}]},
 ]
 
-ERC1155_ABI = [
-    {"name": "isApprovedForAll", "type": "function", "stateMutability": "view",
-     "inputs": [{"name": "a", "type": "address"}, {"name": "o", "type": "address"}],
-     "outputs": [{"name": "", "type": "bool"}]},
-    {"name": "setApprovalForAll", "type": "function", "stateMutability": "nonpayable",
-     "inputs": [{"name": "o", "type": "address"}, {"name": "b", "type": "bool"}],
+ONRAMP_ABI = [
+    {"name": "wrap", "type": "function", "stateMutability": "nonpayable",
+     "inputs": [{"name": "_asset", "type": "address"},
+                {"name": "_to", "type": "address"},
+                {"name": "_amount", "type": "uint256"}],
      "outputs": []},
 ]
 
 
-def _send(w3: Web3, pk: str, wallet: str, fn_call) -> str:
+def _send(w3: Web3, pk: str, wallet: str, fn_call, gas: int = 200_000) -> str:
     base_fee = w3.eth.get_block("pending")["baseFeePerGas"]
-    # Polygon enforces a 25 gwei minimum priority fee; 30 gwei clears it
-    # with margin (~0.002 POL per approval at 65k gas).
-    tip      = Web3.to_wei(30, "gwei")
+    # Polygon enforces a 25 gwei minimum priority fee; 30 gwei clears it.
+    tip = Web3.to_wei(30, "gwei")
     tx = fn_call.build_transaction({
         "from":                 wallet,
         "nonce":                w3.eth.get_transaction_count(wallet, "pending"),
-        "gas":                  120_000,
+        "gas":                  gas,
         "maxFeePerGas":         base_fee * 2 + tip,
         "maxPriorityFeePerGas": tip,
         "chainId":              137,
@@ -112,22 +91,22 @@ def _send(w3: Web3, pk: str, wallet: str, fn_call) -> str:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[3])
+    ap = argparse.ArgumentParser(
+        description="V2 wallet prep: wrap USDC.e→pUSD + grant trading approvals"
+    )
     ap.add_argument("--apply", action="store_true",
-                    help="send the missing approval transactions "
+                    help="send the wrap + approval transactions "
                          "(default: report only)")
     ap.add_argument("--address", default=None,
                     help="inspect this address read-only (ignores .env key)")
     args = ap.parse_args()
 
     load_dotenv()
-    rpc = os.environ.get("POLYGON_RPC_URL", "https://polygon-rpc.com")
+    rpc = os.environ.get("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
     w3  = Web3(Web3.HTTPProvider(rpc))
-    # Polygon is POA-style: block headers carry >32-byte extraData, which
-    # web3.py rejects unless this middleware strips it.
     w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     if not w3.is_connected():
-        print(f"ERROR: cannot reach Polygon RPC at {rpc}")
+        print("ERROR: cannot reach the Polygon RPC")
         return 1
 
     pk = ""
@@ -153,60 +132,70 @@ def main() -> int:
 
     usdc_e   = w3.eth.contract(address=USDC_E,      abi=ERC20_ABI)
     usdc_nat = w3.eth.contract(address=USDC_NATIVE, abi=ERC20_ABI)
-    ctf      = w3.eth.contract(address=CTF,         abi=ERC1155_ABI)
+    pusd     = w3.eth.contract(address=PUSD,        abi=ERC20_ABI)
+    onramp   = w3.eth.contract(address=ONRAMP,      abi=ONRAMP_ABI)
 
-    # Keyed provider URLs (Alchemy/QuickNode/…) embed the API key in the path —
-    # mask everything after the host so the key never lands in logs/history.
     rpc_masked = re.sub(r"(https?://[^/]+/).+", r"\1…(masked)", rpc)
     print(f"Wallet   : {wallet}")
     print(f"RPC      : {rpc_masked}\n")
 
     # ── Balances ──────────────────────────────────────────────────────────────
-    pol   = w3.eth.get_balance(wallet) / 1e18
-    e_bal = usdc_e.functions.balanceOf(wallet).call() / 1e6
-    n_bal = usdc_nat.functions.balanceOf(wallet).call() / 1e6
+    pol    = w3.eth.get_balance(wallet) / 1e18
+    e_bal  = usdc_e.functions.balanceOf(wallet).call()
+    n_bal  = usdc_nat.functions.balanceOf(wallet).call() / 1e6
+    p_bal  = pusd.functions.balanceOf(wallet).call() / 1e6
     print(f"POL (gas)      : {pol:.4f}   {'OK' if pol >= 1 else '⚠ top up ~5 POL'}")
-    print(f"USDC.e         : {e_bal:.2f}   {'OK' if e_bal > 0 else '⚠ the bot trades USDC.e'}")
+    print(f"pUSD           : {p_bal:.2f}   "
+          + ("OK — this is what the bot trades with" if p_bal > 0
+             else "⚠ the V2 exchange collateral — wrap USDC.e below"))
+    print(f"USDC.e         : {e_bal / 1e6:.2f}"
+          + ("   → will be wrapped to pUSD" if e_bal > 0 else ""))
     print(f"USDC (native)  : {n_bal:.2f}"
-          + ("   ⚠ native USDC is NOT used by the bot — swap it to USDC.e"
-             if n_bal > 0 and e_bal == 0 else ""))
+          + ("   ⚠ not usable — swap to USDC.e first (Uniswap)"
+             if n_bal > 0 else ""))
     print()
 
-    # ── Allowances ────────────────────────────────────────────────────────────
-    todo: list[tuple[str, object]] = []
-
-    for label, spender in SPENDERS:
-        cur = usdc_e.functions.allowance(wallet, spender).call()
-        ok  = cur >= APPROVED_FLOOR
-        print(f"USDC.e allowance → {label:24s} "
-              f"{'✅ unlimited' if ok else ('⚠ ' + str(cur / 1e6) + ' — missing')}")
-        if not ok:
-            todo.append((f"USDC.e approve → {label}",
-                         usdc_e.functions.approve(spender, MAX_UINT)))
-
-    for label, operator in OPERATORS:
-        ok = ctf.functions.isApprovedForAll(wallet, operator).call()
-        print(f"CTF  operator    → {label:24s} {'✅ approved' if ok else '⚠ missing'}")
-        if not ok:
-            todo.append((f"CTF setApprovalForAll → {label}",
-                         ctf.functions.setApprovalForAll(operator, True)))
-
-    print()
-    if not todo:
-        print("All approvals in place — the wallet is trade-ready. ✅")
+    if args.address:
+        print("(read-only mode — approval state requires the SDK client; done)")
         return 0
 
+    # ── Plan ──────────────────────────────────────────────────────────────────
+    todo: list[str] = []
+    onramp_allowance = usdc_e.functions.allowance(wallet, ONRAMP).call()
+    if e_bal > 0:
+        if onramp_allowance < e_bal:
+            todo.append(f"USDC.e approve → CollateralOnramp ({ONRAMP[:10]}…)")
+        todo.append(f"Onramp.wrap: {e_bal / 1e6:.2f} USDC.e → pUSD")
+    todo.append("SDK setup_trading_approvals (skips already-approved entries)")
+
+    print("Plan:")
+    for step in todo:
+        print(f"  • {step}")
     if not args.apply:
-        print(f"{len(todo)} approval(s) missing.  Re-run with --apply to send them "
-              f"(needs a little POL for gas).")
+        print("\nDry-run only.  Re-run with --apply to execute.")
         return 2
 
-    for label, fn_call in todo:
-        print(f"Sending: {label} …", flush=True)
-        tx = _send(w3, pk, wallet, fn_call)
+    # ── Execute: wrap USDC.e → pUSD ───────────────────────────────────────────
+    if e_bal > 0:
+        if onramp_allowance < e_bal:
+            print("Sending: USDC.e approve → CollateralOnramp …", flush=True)
+            tx = _send(w3, pk, wallet, usdc_e.functions.approve(ONRAMP, MAX_UINT),
+                       gas=120_000)
+            print(f"  confirmed  tx={tx}")
+        print(f"Sending: Onramp.wrap {e_bal / 1e6:.2f} USDC.e → pUSD …", flush=True)
+        tx = _send(w3, pk, wallet, onramp.functions.wrap(USDC_E, wallet, e_bal))
         print(f"  confirmed  tx={tx}")
+        print(f"  pUSD balance now: "
+              f"{pusd.functions.balanceOf(wallet).call() / 1e6:.2f}")
 
-    print("\nDone — all approvals granted. ✅")
+    # ── Execute: V2 trading approvals via the official SDK ───────────────────
+    print("Running SDK setup_trading_approvals …", flush=True)
+    from polymarket import SecureClient
+    with SecureClient.create(private_key=pk, wallet=wallet) as client:
+        client.setup_trading_approvals().wait()
+    print("  approvals in place.")
+
+    print("\nDone — the wallet is V2 trade-ready. ✅")
     return 0
 
 

@@ -187,9 +187,13 @@ class AutoRedeemer:
         self,
         feed_registry: "FeedRegistry",
         notifier:      "TelegramNotifier",
+        clob_client:   "object | None" = None,
     ) -> None:
         self._registry  = feed_registry
         self._notifier  = notifier
+        # V2 SDK route (PolyClient.redeem_positions) — post-pUSD-migration the
+        # raw CTF redeemPositions path below is a legacy fallback only.
+        self._client    = clob_client
 
         # Web3 setup — blocking but done at init time before the event loop
         rpc_url           = os.environ.get("POLYGON_RPC_URL", "")
@@ -423,12 +427,17 @@ class AutoRedeemer:
             return
 
         try:
-            tx_hash = await asyncio.get_running_loop().run_in_executor(
-                None,
-                self._build_sign_send,
-                cid_bytes,
-                index_sets,
-            )
+            if self._client is not None:
+                # Preferred: V2 SDK routing (correct post-migration contracts).
+                tx_str  = await self._client.redeem_positions(condition_id)
+                tx_hash = tx_str.encode() if isinstance(tx_str, str) else tx_str
+            else:
+                tx_hash = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    self._build_sign_send,
+                    cid_bytes,
+                    index_sets,
+                )
         except ContractLogicError as exc:
             logger.error(
                 "AutoRedeemer | redeemPositions reverted for %s: %s",

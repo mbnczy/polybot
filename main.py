@@ -855,6 +855,7 @@ async def main() -> None:
     redeemer = AutoRedeemer(
         feed_registry=feed_registry,
         notifier=notifier,
+        clob_client=client,   # V2 SDK redemption routing (post-pUSD migration)
     )
 
     # ── inventory manager: recycles paired-fill collateral via mergePositions

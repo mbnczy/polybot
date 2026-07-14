@@ -85,16 +85,10 @@ from eth_account import Account
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, OrderType
-
-# py-clob-client ≥ 0.19 renamed LimitOrderArgs → OrderArgs and
-# create_limit_order() → create_order().  Support both so the bot runs against
-# whichever SDK generation is installed (see PolyClient._create_limit).
-try:
-    from py_clob_client.clob_types import OrderArgs as LimitOrderArgs
-except ImportError:  # pragma: no cover — legacy SDK
-    from py_clob_client.clob_types import LimitOrderArgs
+# Polymarket unified V2 SDK (the archived py-clob-client signs pre-migration
+# orders that the CLOB now rejects with "invalid order version").
+from polymarket import SecureClient
+from polymarket.errors import RateLimitError
 
 from telemetry.metrics import MATCH_ORDERS_TOTAL, SIGN_SECONDS, SUBMIT_SECONDS
 from strategy.arbitrage import TICK_SIZE   # single source of truth for tick size
@@ -312,6 +306,14 @@ class BundleLeg:
 # Internal helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _classify_sdk_error(exc: Exception) -> int | None:
+    """Map V2 SDK exception classes to synthetic HTTP statuses for the retry
+    policy (RateLimitError → 429).  Returns None when unrecognised."""
+    if isinstance(exc, RateLimitError):
+        return 429
+    return None
+
+
 def _extract_http_status(exc: Exception) -> int:
     """
     Best-effort extraction of an HTTP status code from an exception.
@@ -328,6 +330,49 @@ def _extract_http_status(exc: Exception) -> int:
             return sc
     match = _STATUS_RE.search(str(exc))
     return int(match.group(1)) if match else 0
+
+
+def _field(obj: Any, name: str, default: Any = None) -> Any:
+    """Read a field from an SDK model object OR a plain dict (test fakes)."""
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _order_resp_to_dict(resp: Any) -> dict:
+    """
+    Normalise a post_order result (AcceptedOrder | RejectedOrder | dict) to
+    the plain dict shape the strategy layer / classify_fills consumes.
+    """
+    if isinstance(resp, dict):
+        return resp
+    if _field(resp, "ok", True) is False:      # RejectedOrder
+        return {
+            "status": "error",
+            "error":  str(_field(resp, "message", "rejected")),
+            "code":   str(_field(resp, "code", "")),
+        }
+    return {
+        "status":        str(_field(resp, "status", "") or ""),
+        "order_id":      str(_field(resp, "order_id", "") or ""),
+        "making_amount": _field(resp, "making_amount"),
+        "taking_amount": _field(resp, "taking_amount"),
+    }
+
+
+def _open_order_to_dict(order: Any) -> dict:
+    """Normalise an OpenOrder model to the dict shape PairGuard polls."""
+    if isinstance(order, dict):
+        return order
+    return {
+        "id":            str(_field(order, "id", "") or ""),
+        "status":        str(_field(order, "status", "") or ""),
+        "size_matched":  float(_field(order, "size_matched", 0.0) or 0.0),
+        "original_size": float(_field(order, "original_size", 0.0) or 0.0),
+        "price":         float(_field(order, "price", 0.0) or 0.0),
+        "side":          str(_field(order, "side", "") or ""),
+        "token_id":      str(_field(order, "token_id", "") or ""),
+    }
 
 
 def _normalise_book(book: Any) -> dict:
@@ -413,37 +458,31 @@ class PolyClient:
                 "(per-call context; WebSocket is unproxied)"
             )
 
-        self._client = self._build_l2_client(pk, funder)
+        self._client = self._build_client(self._pk, funder)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Client factory (also used for credential re-derivation on 401)
     # ──────────────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _build_l2_client(pk: str, funder: str) -> ClobClient:
-        """Derive L2 API credentials and return an authenticated ClobClient."""
-        l1: ClobClient = ClobClient(
-            host=_CLOB_HOST,
-            chain_id=_CHAIN_ID,
-            key=pk,
-            funder=funder,
-            signature_type=0,
-        )
-        try:
-            creds: ApiCreds = l1.create_or_derive_api_creds()
-            logger.info("CLOB L2 creds derived for funder %s", funder[:10])
-        except Exception as exc:
-            logger.error("Failed to derive API creds: %s", exc)
-            raise
+    def _build_client(pk: str, funder: str) -> "SecureClient":
+        """
+        Build an authenticated V2 SecureClient acting directly for the EOA.
 
-        return ClobClient(
-            host=_CLOB_HOST,
-            chain_id=_CHAIN_ID,
-            key=pk,
-            funder=funder,
-            creds=creds,
-            signature_type=0,
-        )
+        Passing `wallet=<EOA address>` selects the direct-EOA trading flow
+        (the SDK's default, wallet=None, would derive a Deposit Wallet).
+        API credentials are derived/managed by the SDK internally.
+        """
+        try:
+            client = SecureClient.create(private_key=pk, wallet=funder)
+            logger.info(
+                "Polymarket SecureClient ready | wallet=%s type=%s",
+                funder[:10], getattr(client, "wallet_type", "?"),
+            )
+            return client
+        except Exception as exc:
+            logger.error("Failed to build SecureClient: %s", exc)
+            raise
 
     # ──────────────────────────────────────────────────────────────────────────
     # Internal dispatch helpers
@@ -526,23 +565,38 @@ class PolyClient:
 
         return _norm(yes_resp, "YES"), _norm(no_resp, "NO")
 
-    def _create_limit(self, args: "LimitOrderArgs") -> Any:
-        """
-        Sign a limit order with whichever SDK generation is installed.
+    def _create_limit(self, *, token_id: str, price: float, size: float,
+                      side: str) -> Any:
+        """Sign a GTC limit order (resolved on the live client at call time)."""
+        return self._client.create_limit_order(
+            token_id=token_id, price=price, size=size, side=side.upper(),
+        )
 
-        Resolves the method on self._client at call time (not at dispatch
-        time), so it also survives a mid-session credential re-derivation
-        that swaps the underlying ClobClient instance.
+    def _create_market(self, *, token_id: str, side: str, shares: float,
+                       price: float | None) -> Any:
         """
-        fn = getattr(self._client, "create_order", None)
-        if fn is None:  # pragma: no cover — legacy SDK
-            fn = self._client.create_limit_order
-        return fn(args)
+        Sign an FOK market order for `shares`.
+
+        `price` acts as the marketable limit: max price for BUY, min price
+        for SELL.  None → let the SDK derive it from the live book.
+        """
+        side = side.upper()
+        kwargs: dict[str, Any] = {
+            "token_id": token_id, "side": side,
+            "shares": shares, "order_type": "FOK",
+        }
+        if price is not None and price > 0:
+            kwargs["max_price" if side == "BUY" else "min_price"] = price
+        return self._client.create_market_order(**kwargs)
+
+    def _post(self, signed_order: Any) -> dict:
+        """Submit a signed order and normalise the response to a dict."""
+        return _order_resp_to_dict(self._client.post_order(signed_order))
 
     async def _rederive_creds(self) -> None:
-        """Re-derive L2 credentials in response to a 401.  Thread-safe."""
-        logger.warning("CLOB 401 — re-deriving L2 API credentials")
-        new_client = await self._run(self._build_l2_client, self._pk, self._funder)
+        """Rebuild the SecureClient in response to a 401.  Thread-safe."""
+        logger.warning("CLOB 401 — rebuilding SecureClient / credentials")
+        new_client = await self._run(self._build_client, self._pk, self._funder)
         self._client = new_client
         logger.info("CLOB credentials refreshed successfully")
 
@@ -567,7 +621,7 @@ class PolyClient:
                 raise   # already classified; propagate immediately
 
             except Exception as exc:
-                status = _extract_http_status(exc)
+                status = _classify_sdk_error(exc) or _extract_http_status(exc)
 
                 # ── 400: Bad Request — never retryable ───────────────────────
                 if status == 400:
@@ -654,14 +708,6 @@ class PolyClient:
     # Public async API — market data
     # ──────────────────────────────────────────────────────────────────────────
 
-    async def get_markets(self, next_cursor: str = "") -> dict:
-        """Return a page of active markets."""
-        return await self._run_with_retry(self._client.get_markets, next_cursor)
-
-    async def get_market(self, condition_id: str) -> dict:
-        """Return full market detail for a single condition ID."""
-        return await self._run_with_retry(self._client.get_market, condition_id)
-
     async def get_orderbook(self, token_id: str) -> dict:
         """
         Return the current L2 orderbook for a token as a plain dict:
@@ -671,7 +717,9 @@ class PolyClient:
         str-typed price levels); older SDKs returned a dict.  Normalise both
         so callers (post_maker_order, MakerPairGuard) can rely on dict access.
         """
-        book = await self._run_with_retry(self._client.get_order_book, token_id)
+        book = await self._run_with_retry(
+            lambda: self._client.get_order_book(token_id=token_id)
+        )
         return _normalise_book(book)
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -680,26 +728,39 @@ class PolyClient:
 
     async def cancel_order(self, order_id: str) -> dict:
         """Cancel an open order by ID."""
-        return await self._run_with_retry(self._client.cancel, order_id)
+        resp = await self._run_with_retry(
+            lambda: self._client.cancel_order(order_id=order_id)
+        )
+        return {
+            "canceled":     list(_field(resp, "canceled", []) or []),
+            "not_canceled": _field(resp, "not_canceled", {}) or {},
+        }
 
     async def get_open_orders(self) -> list[dict]:
         """Return all open orders for the authenticated account."""
-        return await self._run_with_retry(self._client.get_orders)
+        orders = await self._run_with_retry(
+            lambda: list(self._client.list_open_orders())
+        )
+        return [_open_order_to_dict(o) for o in orders]
 
     async def get_order_status(self, order_id: str) -> dict | None:
         """
         Fetch the current status of a single order.
 
         Returns the order dict if found, or None if the order is no longer
-        tracked (fully filled or cancelled).  Uses the REST `/order/{id}`
-        endpoint.
+        tracked (fully filled or cancelled / unknown to the CLOB).
         """
         try:
-            return await self._run_with_retry(self._client.get_order, order_id)
+            order = await self._run_with_retry(
+                lambda: self._client.get_order(order_id=order_id)
+            )
         except ClobApiError as exc:
             if exc.status_code == 404:
                 return None   # order fully consumed or never existed
             raise
+        if order is None:
+            return None
+        return _open_order_to_dict(order)
 
     async def cancel_all_orders(self) -> dict:
         """Cancel all open orders for the authenticated account."""
@@ -709,7 +770,10 @@ class PolyClient:
 
         result = await self._run_with_retry(self._client.cancel_all)
         logger.info("cancel_all_orders result: %s", result)
-        return result
+        return {
+            "canceled":     list(_field(result, "canceled", []) or []),
+            "not_canceled": _field(result, "not_canceled", {}) or {},
+        }
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public async API — single-leg taker order (FOK)
@@ -721,7 +785,7 @@ class PolyClient:
         side:        str,
         price:       float,
         size:        float,
-        _order_type: OrderType = OrderType.FOK,
+        _order_type: str = "FOK",   # retained for API compatibility; FOK only
     ) -> dict:
         """
         Build, sign, and submit a single-leg FOK market order.
@@ -744,18 +808,11 @@ class PolyClient:
                 "cost_usdc": cost_usdc,
             }
 
-        order_args = MarketOrderArgs(
-            token_id=token_id,
-            amount=size,
-            side=side,
-            price=price,
-        )
         signed_order = await self._run_with_retry(
-            self._client.create_market_order, order_args
+            self._create_market,
+            token_id=token_id, side=side, shares=size, price=price,
         )
-        response = await self._run_with_retry(
-            self._client.post_order, signed_order, OrderType.FOK
-        )
+        response = await self._run_with_retry(self._post, signed_order)
         logger.info(
             "Order submitted | side=%s token=%s price=%.4f size=%.2f → %s",
             side, token_id[:12], price, size, response,
@@ -842,16 +899,11 @@ class PolyClient:
             }
 
         # ── 2. Sign and submit as GTC limit ─────────────────────────────────
-        limit_args = LimitOrderArgs(
-            token_id=token_id,
-            price=safe_price,
-            size=size,
-            side=side.upper(),
+        signed = await self._run_with_retry(
+            self._create_limit,
+            token_id=token_id, price=safe_price, size=size, side=side,
         )
-        signed = await self._run_with_retry(self._create_limit, limit_args)
-        response = await self._run_with_retry(
-            self._client.post_order, signed, OrderType.GTC
-        )
+        response = await self._run_with_retry(self._post, signed)
         logger.info(
             "Maker order placed | side=%s token=%s desired=%.4f safe=%.4f "
             "size=%.2f → %s",
@@ -914,14 +966,17 @@ class PolyClient:
             return yes_resp, no_resp
 
         # ── Live path ─────────────────────────────────────────────────────────
-        yes_args = MarketOrderArgs(token_id=yes_token_id, amount=yes_size, side="BUY", price=yes_price)
-        no_args  = MarketOrderArgs(token_id=no_token_id,  amount=no_size,  side="BUY", price=no_price)
-
         # Step 1 — sign both concurrently (CPU-bound ECDSA in executor)
         _sign_t0 = time.monotonic()
         yes_signed, no_signed = await asyncio.gather(
-            self._run_with_retry(self._client.create_market_order, yes_args),
-            self._run_with_retry(self._client.create_market_order, no_args),
+            self._run_with_retry(
+                self._create_market,
+                token_id=yes_token_id, side="BUY", shares=yes_size, price=yes_price,
+            ),
+            self._run_with_retry(
+                self._create_market,
+                token_id=no_token_id, side="BUY", shares=no_size, price=no_price,
+            ),
         )
         SIGN_SECONDS.observe(time.monotonic() - _sign_t0)
 
@@ -929,8 +984,8 @@ class PolyClient:
         # the surviving leg when one submission errors (orphan prevention).
         _submit_t0 = time.monotonic()
         yes_resp, no_resp = await self._submit_pair(
-            self._run_with_retry(self._client.post_order, yes_signed, OrderType.FOK),
-            self._run_with_retry(self._client.post_order, no_signed,  OrderType.FOK),
+            self._run_with_retry(self._post, yes_signed),
+            self._run_with_retry(self._post, no_signed),
         )
         SUBMIT_SECONDS.observe(time.monotonic() - _submit_t0)
 
@@ -964,11 +1019,12 @@ class PolyClient:
                 "token_id": token_id, "side": "SELL", "size": size,
             }
 
-        sell_args = MarketOrderArgs(
-            token_id=token_id, amount=size, side="SELL", price=price,
+        signed = await self._run_with_retry(
+            self._create_market,
+            token_id=token_id, side="SELL", shares=size,
+            price=price if price > 0 else None,
         )
-        signed = await self._run_with_retry(self._client.create_market_order, sell_args)
-        resp   = await self._run_with_retry(self._client.post_order, signed, OrderType.FOK)
+        resp = await self._run_with_retry(self._post, signed)
         logger.warning("UNWIND submitted | SELL %s of %s | resp=%s", size, token_id[:16], resp)
         return resp
 
@@ -1021,24 +1077,23 @@ class PolyClient:
             }
             return yes_resp, no_resp
 
-        yes_args = LimitOrderArgs(
-            token_id=yes_token_id, price=yes_bid, size=yes_size, side="BUY"
-        )
-        no_args = LimitOrderArgs(
-            token_id=no_token_id, price=no_bid, size=no_size, side="BUY"
-        )
-
         # Concurrent ECDSA signing — eliminates the ~1 s temporal drag
         yes_signed, no_signed = await asyncio.gather(
-            self._run_with_retry(self._create_limit, yes_args),
-            self._run_with_retry(self._create_limit, no_args),
+            self._run_with_retry(
+                self._create_limit,
+                token_id=yes_token_id, price=yes_bid, size=yes_size, side="BUY",
+            ),
+            self._run_with_retry(
+                self._create_limit,
+                token_id=no_token_id, price=no_bid, size=no_size, side="BUY",
+            ),
         )
 
         # Concurrent GTC submission.  _submit_pair keeps the surviving leg
         # when one submission errors — the PairGuard then owns its lifecycle.
         yes_resp, no_resp = await self._submit_pair(
-            self._run_with_retry(self._client.post_order, yes_signed, OrderType.GTC),
-            self._run_with_retry(self._client.post_order, no_signed,  OrderType.GTC),
+            self._run_with_retry(self._post, yes_signed),
+            self._run_with_retry(self._post, no_signed),
         )
 
         logger.info(
@@ -1236,19 +1291,25 @@ class PolyClient:
             return responses
 
         # ── Live path: CTF Exchange V2 matchOrders ────────────────────────────
+        # OBSOLETE since the April 2026 protocol migration (pUSD / new exchange
+        # contracts): the V1-era matchOrders call would target a defunct
+        # exchange and requires operator registration regardless.  NegRisk
+        # execution is gated off by NEGRISK_EXEC_MODE=off; fail loudly if it
+        # is ever forced on.
+        raise ClobApiError(
+            0,
+            "execute_arb_maker_bundle live path is disabled: the pre-migration "
+            "matchOrders flow is obsolete post-pUSD-upgrade. Route NegRisk "
+            "bundles through CLOB limit orders instead.",
+        )
+
         # Step 1 — ECDSA-sign all N order structs concurrently
-        limit_args_list = [
-            LimitOrderArgs(
-                token_id=leg.token_id,
-                price=leg.bid,
-                size=leg.size,
-                side="BUY",
+        signed_orders: list[Any] = list(await asyncio.gather(*[
+            self._run_with_retry(
+                self._create_limit,
+                token_id=leg.token_id, price=leg.bid, size=leg.size, side="BUY",
             )
             for leg in legs
-        ]
-        signed_orders: list[Any] = list(await asyncio.gather(*[
-            self._run_with_retry(self._create_limit, args)
-            for args in limit_args_list
         ]))
 
         # Step 2 — Extract Order structs and raw ECDSA signatures
@@ -1303,6 +1364,70 @@ class PolyClient:
         return bundle_responses
 
     # ──────────────────────────────────────────────────────────────────────────
+    # Public async API — on-chain settlement via the V2 SDK
+    # ──────────────────────────────────────────────────────────────────────────
+
+    async def merge_positions(self, condition_id: str, amount_units: int) -> str:
+        """
+        Burn a complementary YES+NO set and receive collateral (pUSD) back.
+
+        Post-migration the SDK routes this through the correct contracts
+        (protocol V2 router / adapters) and, for EOA wallets, submits the
+        transaction directly.  Blocking `handle.wait()` runs in the executor.
+
+        `amount_units` is in base units (1e6 per share).  Returns a tx-hash
+        string when available ("" otherwise).
+        """
+        if _PAPER_TRADE:
+            logger.info(
+                "PAPER SDK merge | condition=%s amount=%d",
+                condition_id[:16], amount_units,
+            )
+            return "paper-merge"
+
+        def _merge() -> str:
+            handle = self._client.merge_positions(
+                condition_id=condition_id, amount=amount_units,
+            )
+            outcome = handle.wait()
+            tx = (
+                _field(outcome, "transaction_hash", None)
+                or _field(outcome, "tx_hash", None) or ""
+            )
+            logger.info(
+                "SDK merge confirmed | condition=%s amount=%d tx=%s",
+                condition_id[:16], amount_units, str(tx)[:20],
+            )
+            return str(tx)
+
+        return await self._run_with_retry(_merge)
+
+    async def redeem_positions(self, condition_id: str) -> str:
+        """
+        Redeem winnings on a resolved market via the V2 SDK.
+
+        Returns a tx-hash string when available ("" otherwise).
+        """
+        if _PAPER_TRADE:
+            logger.info("PAPER SDK redeem | condition=%s", condition_id[:16])
+            return "paper-redeem"
+
+        def _redeem() -> str:
+            handle = self._client.redeem_positions(condition_id=condition_id)
+            outcome = handle.wait()
+            tx = (
+                _field(outcome, "transaction_hash", None)
+                or _field(outcome, "tx_hash", None) or ""
+            )
+            logger.info(
+                "SDK redeem confirmed | condition=%s tx=%s",
+                condition_id[:16], str(tx)[:20],
+            )
+            return str(tx)
+
+        return await self._run_with_retry(_redeem)
+
+    # ──────────────────────────────────────────────────────────────────────────
     # Public async API — close a single leg (emergency taker exit)
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -1332,18 +1457,11 @@ class PolyClient:
                 "size":     size,
             }
 
-        order_args = MarketOrderArgs(
-            token_id=token_id,
-            amount=size,
-            side="SELL",
-            price=min_price,
-        )
         signed = await self._run_with_retry(
-            self._client.create_market_order, order_args
+            self._create_market,
+            token_id=token_id, side="SELL", shares=size, price=min_price,
         )
-        response = await self._run_with_retry(
-            self._client.post_order, signed, OrderType.FOK
-        )
+        response = await self._run_with_retry(self._post, signed)
         logger.info(
             "Emergency leg close | SELL %s size=%.2f → %s",
             token_id[:12], size, response,

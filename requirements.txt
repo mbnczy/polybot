@@ -2,8 +2,8 @@
 # Install inside a virtualenv:
 #   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-# Polymarket CLOB SDK (order signing, ECDSA, REST API)
-py-clob-client>=0.18.0
+# Polymarket unified V2 SDK (order signing, REST, settlement routing)
+polymarket-client>=0.1.0b19  # V2 unified SDK (pUSD-era order version)
 
 # Async HTTP client + WebSocket transport (ws_feed + telegram notifier)
 aiohttp>=3.9.0
