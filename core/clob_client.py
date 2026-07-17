@@ -87,7 +87,7 @@ from web3.middleware import ExtraDataToPOAMiddleware
 
 # Polymarket unified V2 SDK (the archived py-clob-client signs pre-migration
 # orders that the CLOB now rejects with "invalid order version").
-from polymarket import SecureClient
+from polymarket import BuilderApiKey, SecureClient
 from polymarket.errors import RateLimitError
 
 from telemetry.metrics import MATCH_ORDERS_TOTAL, SIGN_SECONDS, SUBMIT_SECONDS
@@ -467,22 +467,53 @@ class PolyClient:
     @staticmethod
     def _build_client(pk: str, funder: str) -> "SecureClient":
         """
-        Build an authenticated V2 SecureClient acting directly for the EOA.
+        Build an authenticated V2 SecureClient.
 
-        Passing `wallet=<EOA address>` selects the direct-EOA trading flow
-        (the SDK's default, wallet=None, would derive a Deposit Wallet).
-        API credentials are derived/managed by the SDK internally.
+        Preferred: the DEPOSIT WALLET flow (wallet=None + builder API key) —
+        the V2 exchange rejects direct-EOA makers with "maker address not
+        allowed, please use the deposit wallet flow".  The EOA remains the
+        signer; collateral and positions live in the derived Deposit Wallet,
+        and relayer transactions (approvals/merges) are gasless.
+
+        Falls back to the direct-EOA flow when no builder key is configured
+        (POLYMARKET_BUILDER_KEY/SECRET/PASSPHRASE) — orders will be rejected
+        by the exchange, so this is only useful for read paths.
         """
+        b_key  = os.environ.get("POLYMARKET_BUILDER_KEY", "").strip()
+        b_sec  = os.environ.get("POLYMARKET_BUILDER_SECRET", "").strip()
+        b_pass = os.environ.get("POLYMARKET_BUILDER_PASSPHRASE", "").strip()
         try:
-            client = SecureClient.create(private_key=pk, wallet=funder)
+            if b_key and b_sec and b_pass:
+                client = SecureClient.create(
+                    private_key=pk,
+                    api_key=BuilderApiKey(key=b_key, secret=b_sec,
+                                          passphrase=b_pass),
+                )
+            else:
+                logger.warning(
+                    "No POLYMARKET_BUILDER_KEY configured — falling back to "
+                    "direct-EOA flow; the V2 exchange will REJECT orders."
+                )
+                client = SecureClient.create(private_key=pk, wallet=funder)
             logger.info(
-                "Polymarket SecureClient ready | wallet=%s type=%s",
-                funder[:10], getattr(client, "wallet_type", "?"),
+                "Polymarket SecureClient ready | trading_wallet=%s type=%s signer=%s",
+                str(getattr(client, "wallet", "?"))[:12],
+                getattr(client, "wallet_type", "?"),
+                funder[:10],
             )
             return client
         except Exception as exc:
             logger.error("Failed to build SecureClient: %s", exc)
             raise
+
+    @property
+    def trading_wallet(self) -> str:
+        """
+        The address that holds collateral and positions on the V2 stack —
+        the Deposit Wallet in the preferred flow (NOT the signer EOA).
+        Balance-scanning components must target this address.
+        """
+        return str(getattr(self._client, "wallet", "") or self._funder)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Internal dispatch helpers

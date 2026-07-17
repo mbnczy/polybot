@@ -206,8 +206,11 @@ class AutoRedeemer:
         # EOA key & wallet (web3-core-operations EOA protocol)
         raw_pk            = os.environ.get("POLY_PRIVATE_KEY", "")
         self._private_key = raw_pk if raw_pk.startswith("0x") else "0x" + raw_pk
+        # Positions live in the V2 trading wallet (Deposit Wallet), not the
+        # signer EOA — scan balances there when the client exposes it.
+        _tw = str(getattr(clob_client, "trading_wallet", "") or "")
         self._wallet      = Web3.to_checksum_address(
-            os.environ.get("POLY_FUNDER_ADDRESS", "")
+            _tw or os.environ.get("POLY_FUNDER_ADDRESS", "")
         )
 
         # Per-market resolution cache: condition_id → (winner_index | None, cached_ts)
