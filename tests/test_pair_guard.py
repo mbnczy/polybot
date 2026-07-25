@@ -38,6 +38,8 @@ class FakeGuardClient:
         self.taker_buys: list[tuple[str, float, float]] = []
         self.best_asks: dict[str, float] = {}
         self.taker_fill_status: str = "matched"
+        # Price the naked leg sells at on unwind (proceeds = size × this).
+        self.unwind_sell_price: float = 0.40
 
     async def get_order_status(self, order_id: str):
         return self.orders.get(order_id)
@@ -66,7 +68,9 @@ class FakeGuardClient:
     async def unwind_leg(self, token_id: str, size: float,
                          price: float = 0.0) -> dict:
         self.unwound.append((token_id, size))
-        return {"status": "matched"}
+        proceeds = round(size * self.unwind_sell_price, 6)
+        return {"status": "matched", "making_amount": size,
+                "taking_amount": proceeds}
 
 
 class FakeBreaker:
@@ -218,10 +222,13 @@ async def test_one_leg_fill_unwinds_when_completion_unprofitable():
     assert "on" in client.cancelled
     assert client.taker_buys == []
     assert client.unwound == [("tok-yes", 10.0)]
-    assert breaker.fills == []
-    assert breaker.releases == 1          # reservation freed, nothing booked
+    # The unwind's REALISED loss must be booked (not silently dropped):
+    # proceeds 10×0.40 − cost 10×0.479 = 4.0 − 4.79 = −0.79
+    assert len(breaker.fills) == 1
+    assert breaker.fills[0] == pytest.approx(-0.79, abs=1e-6)
+    assert breaker.releases == 0          # on_fill released the reservation
     assert guard.watched_count == 0
-    assert any("dissolved" in m for m in notifier.messages)
+    assert any("unwound" in m for m in notifier.messages)
 
 
 @pytest.mark.asyncio
@@ -280,8 +287,9 @@ async def test_partial_pair_merges_paired_portion_only():
 
     assert client.unwound == [("tok-yes", 6.0)]
     assert len(breaker.fills) == 1
-    # pnl = 4 × (1 − 0.978) = 0.088
-    assert breaker.fills[0] == pytest.approx(0.088, abs=1e-6)
+    # paired pnl = 4 × (1 − 0.978) = 0.088; naked unwind realised =
+    # 6×0.40 − 6×0.479 = 2.4 − 2.874 = −0.474; total = −0.386
+    assert breaker.fills[0] == pytest.approx(-0.386, abs=1e-6)
     assert inventory.paired == []                    # not a full pair
     assert inventory.merged == [("0xcond", 4.0)]     # merge only what's paired
 
@@ -337,3 +345,57 @@ async def test_error_leg_from_submit_pair_resolves_via_ttl_cancel():
     assert breaker.fills == []
     assert breaker.releases == 1
     assert guard.watched_count == 0
+
+
+@pytest.mark.asyncio
+async def test_unwind_failure_marks_stuck_and_alerts():
+    """
+    A failed unwind (naked shares cannot be sold) must NOT book a phantom
+    P&L: it fires a critical alert and releases the reservation, leaving the
+    stuck shares for manual recovery.
+    """
+    class _FailUnwindClient(FakeGuardClient):
+        async def unwind_leg(self, token_id, size, price=0.0):
+            raise RuntimeError("not enough balance / allowance")
+
+    client = _FailUnwindClient()
+    client.orders["oy"] = {"status": "matched", "size_matched": 10.0}
+    client.orders["on"] = {"status": "live",    "size_matched": 0.0}
+    client.best_asks["tok-no"] = 0.60   # completion unprofitable → unwind path
+    guard, breaker, notifier = _build_guard(client, hedge_timeout_s=0.0)
+
+    guard.watch_pair(_maker_signal(10.0), 10.0,
+                     _resting_resp("oy"), _resting_resp("on"))
+
+    await guard.poll_once()
+    await guard.poll_once()
+
+    assert breaker.fills == []            # nothing realised on stuck shares
+    assert breaker.releases == 1          # slot freed
+    assert any("MANUAL INTERVENTION" in m for m in notifier.critical)
+    assert guard.watched_count == 0
+
+
+@pytest.mark.asyncio
+async def test_taker_completion_books_positive_pnl_and_merges():
+    """One-leg fill completed as taker: excess becomes a real pair, positive
+    P&L booked, full set merged."""
+    client = FakeGuardClient()
+    client.orders["oy"] = {"status": "matched", "size_matched": 10.0}
+    client.orders["on"] = {"status": "live",    "size_matched": 0.0}
+    client.best_asks["tok-no"] = 0.50   # 0.479 + 0.50×1.02 = 0.989 < 1 → complete
+    inventory = FakeInventory()
+    guard, breaker, _ = _build_guard(client, inventory, hedge_timeout_s=0.0)
+
+    guard.watch_pair(_maker_signal(10.0), 10.0,
+                     _resting_resp("oy"), _resting_resp("on"))
+
+    await guard.poll_once()
+    await guard.poll_once()
+
+    assert client.taker_buys == [("tok-no", 0.50, 10.0)]
+    assert client.unwound == []
+    assert len(breaker.fills) == 1
+    assert breaker.fills[0] == pytest.approx(0.11, abs=1e-6)   # 10×(1−0.989)
+    assert breaker.releases == 0
+    assert inventory.paired == ["0xcond"]   # completed excess → full pair merged

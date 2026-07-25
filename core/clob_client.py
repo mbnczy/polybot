@@ -624,6 +624,18 @@ class PolyClient:
         """Submit a signed order and normalise the response to a dict."""
         return _order_resp_to_dict(self._client.post_order(signed_order))
 
+    async def _post_once(self, signed_order: Any) -> dict:
+        """
+        Submit a signed order WITHOUT the retry wrapper.
+
+        Market (FOK) orders are not idempotent: a retry re-submits the same
+        signed order (same salt) and the exchange rejects it as "invalid.
+        Duplicated" — or, worse, a spurious retry after a silent success
+        double-executes.  Single-shot posting is the safe path for
+        market-order flows (unwind / emergency close / taker completion).
+        """
+        return await self._run(self._post, signed_order)
+
     async def _rederive_creds(self) -> None:
         """Rebuild the SecureClient in response to a 401.  Thread-safe."""
         logger.warning("CLOB 401 — rebuilding SecureClient / credentials")
@@ -843,7 +855,8 @@ class PolyClient:
             self._create_market,
             token_id=token_id, side=side, shares=size, price=price,
         )
-        response = await self._run_with_retry(self._post, signed_order)
+        # Single-shot: market FOK orders are not idempotent (retry → duplicate).
+        response = await self._post_once(signed_order)
         logger.info(
             "Order submitted | side=%s token=%s price=%.4f size=%.2f → %s",
             side, token_id[:12], price, size, response,
@@ -1050,13 +1063,20 @@ class PolyClient:
                 "token_id": token_id, "side": "SELL", "size": size,
             }
 
+        # Floor to 2 d.p. — never round UP, or the sell exceeds the on-chain
+        # balance ("not enough balance / allowance").
+        sell_size = math.floor(size * 100) / 100.0
+        if sell_size < 0.01:
+            logger.warning("UNWIND skipped | size %.4f below minimum", size)
+            return {"status": "error", "error": "size below minimum"}
         signed = await self._run_with_retry(
             self._create_market,
-            token_id=token_id, side="SELL", shares=size,
+            token_id=token_id, side="SELL", shares=sell_size,
             price=price if price > 0 else None,
         )
-        resp = await self._run_with_retry(self._post, signed)
-        logger.warning("UNWIND submitted | SELL %s of %s | resp=%s", size, token_id[:16], resp)
+        # Single-shot post: a retried market SELL duplicates or double-sells.
+        resp = await self._post_once(signed)
+        logger.warning("UNWIND submitted | SELL %s of %s | resp=%s", sell_size, token_id[:16], resp)
         return resp
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -1492,7 +1512,8 @@ class PolyClient:
             self._create_market,
             token_id=token_id, side="SELL", shares=size, price=min_price,
         )
-        response = await self._run_with_retry(self._post, signed)
+        # Single-shot: market FOK orders are not idempotent (retry → duplicate).
+        response = await self._post_once(signed)
         logger.info(
             "Emergency leg close | SELL %s size=%.2f → %s",
             token_id[:12], size, response,

@@ -57,7 +57,26 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # ── Hard limits ────────────────────────────────────────────────────────────────
-DAILY_LOSS_LIMIT:   float = -250.0  # USDC; triggers CircuitBreakerTripped
+def _daily_loss_limit_from_env() -> float:
+    """
+    DAILY_LOSS_LIMIT — hard daily realised-loss floor (negative USDC). Breaching
+    it raises CircuitBreakerTripped → cancel-all + halt. Env-configurable so it
+    can be scaled to the actual account size (a −250 default is meaningless on a
+    small account). Must be negative.
+    """
+    raw = os.environ.get("DAILY_LOSS_LIMIT", "").strip()
+    if not raw:
+        return -250.0
+    try:
+        lim = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"DAILY_LOSS_LIMIT={raw!r} is not a valid float") from exc
+    if lim >= 0.0:
+        raise ValueError(f"DAILY_LOSS_LIMIT must be negative; got {lim}")
+    return lim
+
+
+DAILY_LOSS_LIMIT:   float = _daily_loss_limit_from_env()  # USDC; triggers CircuitBreakerTripped
 
 
 def _pair_cap_from_env() -> float:

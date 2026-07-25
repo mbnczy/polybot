@@ -174,6 +174,9 @@ _arb_duration_min_s = _cfg.arb_duration_min_s
 # NegRisk execution mode — "off" (detect+alert only, default) or "onchain"
 # (matchOrders; requires the wallet to be a registered CTF Exchange operator).
 _negrisk_exec_mode = _cfg.negrisk_exec_mode
+# Maker (Dutch Book) arb path toggle. Default on. Set MAKER_ARB_ENABLED=false
+# to disable resting-bid maker orders (one-leg risk) and trade taker-only.
+_maker_arb_enabled = os.environ.get("MAKER_ARB_ENABLED", "true").strip().lower() != "false"
 
 # Optional single-market seed (backward-compatible with Phase ≤ 6 .env files)
 YES_TOKEN_ID: str = _cfg.yes_token_id
@@ -533,7 +536,11 @@ async def strategy_loop(
             )
 
             # ── 2b. Maker arb fallback (DutchBookPricer) ──────────────────────
-            if arb_signal is None:
+            # Gated by MAKER_ARB_ENABLED: the resting-bid maker path is subject
+            # to adverse one-leg fills (a bid fills only when price moves against
+            # us). Set MAKER_ARB_ENABLED=false to trade taker-only (no one-leg
+            # risk) at the cost of far fewer opportunities.
+            if arb_signal is None and _maker_arb_enabled:
                 rebate = rebate_engine.peek_maker_rebate(condition_id)
                 if rebate is None:
                     rebate = await rebate_engine.get_maker_rebate(condition_id)
@@ -779,6 +786,11 @@ async def main() -> None:
             "a REGISTERED CTF Exchange V2 operator; a normal user wallet will "
             "revert every NegRisk bundle."
         )
+    logger.info(
+        "Maker arb path: %s | extreme band [%.2f, %.2f] | min_real_edge=%.4f",
+        "ENABLED" if _maker_arb_enabled else "DISABLED (taker-only)",
+        _extreme_lo, _extreme_hi, _min_real_edge,
+    )
 
     # ── initialise components ─────────────────────────────────────────────
     client         = PolyClient()

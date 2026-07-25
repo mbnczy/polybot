@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -408,27 +409,40 @@ class MakerPairGuard:
         rich    = yes if yes.matched > no.matched else no
         deficit = no  if rich is yes else yes
         excess  = rich.matched - deficit.matched
+        # Guaranteed arb profit on the fully-paired shares (merge pays $1/pair).
         pnl     = paired * (1.0 - (yes.bid + no.bid))
 
         hedged_note = ""
+        realized_activity = paired > _SHARE_EPS
         if excess > _SHARE_EPS:
             ARB_HALF_FILLS.inc()
-            completed_pnl = await self._complete_or_unwind(pair, rich, deficit, excess)
-            if completed_pnl is not None:
-                pnl += completed_pnl
+            kind, leg_pnl = await self._complete_or_unwind(pair, rich, deficit, excess)
+            if kind == "completed":
+                # Bought the missing leg — the excess is now a real pair.
+                pnl += leg_pnl
                 paired += excess
+                realized_activity = True
                 hedged_note = f" ({excess:.2f} shares completed as taker)"
-            else:
-                hedged_note = f" ({excess:.2f} naked shares unwound)"
+            elif kind == "unwound":
+                # Sold the naked shares — leg_pnl is the REALISED result
+                # (usually a loss). This MUST be booked or the breaker is blind.
+                pnl += leg_pnl
+                realized_activity = True
+                hedged_note = f" ({excess:.2f} naked shares unwound, pnl={leg_pnl:+.4f})"
+            else:  # "failed" — naked shares stuck, nothing realised on them
+                hedged_note = f" ({excess:.2f} naked shares STUCK — manual)"
 
-        if paired > _SHARE_EPS:
-            # Books P&L and releases the position reservation.
+        if realized_activity:
+            # Book P&L (profit OR loss) and release the reservation. This is the
+            # single booking point; InventoryManager merges recycle-only.
             self._breaker.on_fill(pnl=round(pnl, 6))
+            emoji = "✅" if pnl >= 0 else "🔻"
             await self._notifier.notify(
-                f"✅ Maker pair settled on {pair.condition_id[:16]} — "
+                f"{emoji} Maker pair on {pair.condition_id[:16]} — "
                 f"{paired:.2f} paired shares, pnl={pnl:+.4f} USDC{hedged_note}"
             )
-            self._register_settlement(pair, paired)
+            if paired > _SHARE_EPS:
+                self._register_settlement(pair, paired)
         else:
             self._breaker.release_open()
             logger.info(
@@ -437,8 +451,7 @@ class MakerPairGuard:
             )
             if hedged_note:
                 await self._notifier.notify(
-                    f"⚠️ Maker pair on {pair.condition_id[:16]} dissolved — "
-                    f"no profit booked{hedged_note}"
+                    f"⚠️ Maker pair on {pair.condition_id[:16]} dissolved{hedged_note}"
                 )
 
     async def _complete_or_unwind(
@@ -447,7 +460,7 @@ class MakerPairGuard:
         rich:    _Leg,
         deficit: _Leg,
         excess:  float,
-    ) -> float | None:
+    ) -> tuple[str, float]:
         """
         Resolve `excess` naked shares held on the `rich` leg.
 
@@ -456,9 +469,16 @@ class MakerPairGuard:
         (locks a guaranteed non-negative payoff).  Fallback: market-sell the
         naked shares (`unwind_leg`) to flatten directional risk.
 
-        Returns the P&L of the completed pairs, or None when unwound instead.
+        Returns (kind, pnl):
+          ("completed", pnl)  — bought the missing leg; excess becomes a pair.
+          ("unwound",   pnl)  — sold the naked shares; pnl is the REALISED
+                                result (proceeds − cost basis), usually a loss.
+          ("failed",    0.0)  — could neither complete nor sell; shares stuck.
         """
-        excess = round(excess, 2)
+        # Floor — never try to trade more than we actually hold on-chain.
+        excess = math.floor(excess * 100) / 100.0
+        cost_basis = excess * rich.bid   # what we paid for the naked shares
+
         ask = await self._best_ask(deficit.token_id)
         if ask is not None:
             completion_cost = rich.bid + ask * (1.0 + self._fee_est)
@@ -478,7 +498,7 @@ class MakerPairGuard:
                             pair.condition_id[:16], excess, deficit.label,
                             ask, completion_cost,
                         )
-                        return round(excess * (1.0 - completion_cost), 6)
+                        return "completed", round(excess * (1.0 - completion_cost), 6)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "PairGuard | taker completion failed on %s: %s — unwinding",
@@ -487,11 +507,22 @@ class MakerPairGuard:
 
         # Completion not possible/profitable — flatten the naked shares.
         try:
-            await self._client.unwind_leg(rich.token_id, excess)
+            resp = await self._client.unwind_leg(rich.token_id, excess)
+            status = str(resp.get("status", "")).strip().lower()
+            if status not in _FILLED_STATUSES:
+                raise RuntimeError(f"unwind not filled: {resp}")
+            # Realised P&L = SELL proceeds − cost basis. taking_amount is the
+            # pUSD received; making_amount is the shares actually sold.
+            proceeds  = float(resp.get("taking_amount") or 0.0)
+            sold      = float(resp.get("making_amount") or excess)
+            realised  = round(proceeds - sold * rich.bid, 6)
             logger.warning(
-                "PairGuard | UNWOUND %.2f naked %s shares on %s",
-                excess, rich.label, pair.condition_id[:16],
+                "PairGuard | UNWOUND %.2f naked %s shares on %s — "
+                "proceeds=%.4f cost=%.4f realised=%+.4f",
+                sold, rich.label, pair.condition_id[:16],
+                proceeds, sold * rich.bid, realised,
             )
+            return "unwound", realised
         except Exception as exc:  # noqa: BLE001
             ARB_UNWIND_FAILURES.inc()
             logger.error(
@@ -499,9 +530,10 @@ class MakerPairGuard:
             )
             await self._notifier.send_critical_error(
                 f"PAIR GUARD UNWIND FAILED {pair.condition_id[:16]} — "
-                f"{excess:.2f} naked {rich.label} shares — MANUAL INTERVENTION REQUIRED"
+                f"{excess:.2f} naked {rich.label} shares (cost≈{cost_basis:.2f} "
+                f"pUSD) — MANUAL INTERVENTION REQUIRED"
             )
-        return None
+            return "failed", 0.0
 
     async def _best_ask(self, token_id: str) -> float | None:
         try:
