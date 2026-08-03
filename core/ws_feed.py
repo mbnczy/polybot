@@ -134,6 +134,14 @@ class MarketFeed:
             no_token_id:  None,
         }
 
+        # Per-leg tick size, learned from "book" snapshots (Polymarket includes
+        # tick_size in each book event). Threaded into the arb_tick so the maker
+        # pricer snaps bids to the market's grid (0.01 vs 0.001).
+        self._tick_size: dict[str, Optional[float]] = {
+            yes_token_id: None,
+            no_token_id:  None,
+        }
+
         # Dedup: the WS emits an event on every book/price_change even when the
         # best ask is unchanged.  Remember the last pushed pair so we never
         # enqueue an identical tick (saves downstream re-evaluation + alerts).
@@ -286,6 +294,15 @@ class MarketFeed:
         Full orderbook snapshot → take asks[0].price as the definitive best ask.
         Asks are sorted ascending (lowest first) per Polymarket CLOB convention.
         """
+        # Capture the market tick size from the snapshot (present on Polymarket
+        # book events) so the maker pricer can post on-grid bids.
+        _ts = event.get("tick_size", event.get("tickSize"))
+        if _ts is not None:
+            try:
+                self._tick_size[asset_id] = float(_ts)
+            except (TypeError, ValueError):
+                pass
+
         asks = event.get("asks", [])
         if not asks:
             return False
@@ -403,6 +420,11 @@ class MarketFeed:
 
         now = time.monotonic()
         self._last_tick_monotonic = now   # liveness marker for stale-feed pruning
+        # Coarser of the two legs' ticks — both bids must be valid, so use the
+        # larger increment (None if neither leg reported one yet → pricer default).
+        _yt = self._tick_size.get(self._yes_token_id)
+        _nt = self._tick_size.get(self._no_token_id)
+        _ticks = [t for t in (_yt, _nt) if t is not None]
         tick: dict = {
             "type":         "arb_tick",
             "condition_id": self._condition_id,
@@ -410,6 +432,7 @@ class MarketFeed:
             "no_token_id":  self._no_token_id,
             "yes_ask":      yes_ask,
             "no_ask":       no_ask,
+            "tick_size":    max(_ticks) if _ticks else None,
             "ts":           now,
         }
 

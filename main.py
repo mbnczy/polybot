@@ -552,6 +552,7 @@ async def strategy_loop(
                     no_ask=no_ask,
                     max_position_usdc=MAX_ARB_PAIR_USDC,
                     maker_rebate=rebate,
+                    tick_size=tick.get("tick_size"),
                 )
 
             # Record dequeue→decision latency (covers both taker + maker paths).

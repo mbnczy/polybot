@@ -146,7 +146,29 @@ MAX_TAKER_FEE:      float = 0.0400   # sanity clamp for implausibly high API val
 
 # ── Common constants ─────────────────────────────────────────────────────────
 DESIRED_NET_MARGIN: float = 0.0050   # 0.50 % minimum guaranteed profit per pair
-TICK_SIZE:          float = 0.001    # Polymarket minimum price increment (0.1 cent)
+TICK_SIZE:          float = 0.001    # legacy default price increment (0.1 cent)
+# Markets have per-market tick sizes (0.01 OR 0.001). Posting a bid that is not
+# on the market's tick grid is rejected: "price must conform to tick size 0.01
+# with at most 2 decimal places". When the market's tick is unknown we default
+# to the COARSER 0.01 grid, which is valid on every market (a 0.01-multiple also
+# conforms to a 0.001 grid) — never produces an invalid price.
+DEFAULT_TICK_SIZE:  float = 0.01
+
+
+def snap_post_only_bid(ask: float, tick: float | None) -> float:
+    """
+    One market-tick below `ask`, snapped to the market's tick grid.
+
+    tick 0.01 → 2-decimal price (e.g. ask 0.49 → bid 0.48)
+    tick 0.001 → 3-decimal price (e.g. ask 0.49 → bid 0.489)
+    Unknown tick → 0.01 grid (safe on every market).
+    Result is clamped to the valid [tick, 1 − tick] price range.
+    """
+    t = tick if (tick and tick > 0) else DEFAULT_TICK_SIZE
+    decimals = 2 if t >= 0.01 else 3
+    bid = round(ask - t, decimals)
+    lo, hi = t, round(1.0 - t, decimals)
+    return max(lo, min(bid, hi))
 
 # ── Signal-quality guards (efficiency-and-reliability) ───────────────────────
 # Near-resolved markets (one outcome ~certain) produce "signals" whose edge is
@@ -487,6 +509,7 @@ class DutchBookPricer:
         no_ask:            float,   # best ask from WS feed
         max_position_usdc: float = 50.0,
         maker_rebate:      float | None = None,
+        tick_size:         float | None = None,   # market tick (0.01 / 0.001)
     ) -> Optional[ArbSignal]:
         """
         Evaluate a Dutch Book opportunity using synthetic post-only maker bids.
@@ -537,8 +560,10 @@ class DutchBookPricer:
             return None
 
         # ── 2. Apply synthetic post-only clamp (stay below the ask) ──────────
-        yes_bid = round(max(0.01, yes_ask - TICK_SIZE), 3)
-        no_bid  = round(max(0.01, no_ask  - TICK_SIZE), 3)
+        # Snap to the MARKET's tick grid — a bid off-grid is rejected by the
+        # exchange ("price must conform to tick size …"). Unknown → 0.01 grid.
+        yes_bid = snap_post_only_bid(yes_ask, tick_size)
+        no_bid  = snap_post_only_bid(no_ask,  tick_size)
 
         # ── 3. Resolve maker rebate ───────────────────────────────────────────
         rebate = (
@@ -948,6 +973,7 @@ class NegRiskArbDetector:
         no_asks:            list[float],  # corresponding best NO asks from WS feed
         max_position_usdc:  float = 50.0,
         maker_rebate:       float | None = None,
+        tick_size:          float | None = None,
     ) -> Optional[NegRiskSignal]:
         """
         Evaluate whether buying NO on all N outcomes yields a NegRisk edge.
@@ -992,7 +1018,7 @@ class NegRiskArbDetector:
                 return None
 
         # ── 3. Synthetic post-only NO bids ────────────────────────────────────
-        no_bids = [round(max(0.01, ask - TICK_SIZE), 3) for ask in no_asks]
+        no_bids = [snap_post_only_bid(ask, tick_size) for ask in no_asks]
 
         # ── 4. Resolve maker rebate ───────────────────────────────────────────
         rebate = (
