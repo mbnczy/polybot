@@ -80,6 +80,9 @@ _GAMMA_URL   = "https://gamma-api.polymarket.com/markets"
 _PAGE_LIMIT  = 100
 # Polymarket uses "LTE=" as the terminal cursor value for paginated endpoints.
 _END_CURSOR  = "LTE="
+# Safety cap on offset pagination (the active universe is ~2k markets; this
+# bounds a runaway loop if the API ever stops returning short final pages).
+_MAX_SCAN_MARKETS: int = 8000
 
 # ── Scanner defaults ────────────────────────────────────────────────────────
 SCAN_INTERVAL: float = 300.0   # seconds between full market-list polls (5 min)
@@ -694,9 +697,19 @@ class MarketScanner:
         """
         Page through the Gamma API and collect all active, non-closed,
         non-archived binary markets (clobTokenIds has exactly 2 entries).
+
+        Gamma `/markets` returns a PLAIN LIST but is paginated by `offset` —
+        it is NOT a single complete response.  Earlier this method stopped
+        after the first page ("plain list is never paginated"), so the scanner
+        only ever saw the first ~100 markets (≈30 candidates after the volume
+        /liquidity floors) instead of the full liquid universe (~600). We now
+        page by offset until a short/empty page, an end-of-range 422, or the
+        _MAX_SCAN_MARKETS safety cap.  The legacy dict/next_cursor shape is
+        still handled for forward compatibility.
         """
         results: list[dict] = []
         cursor              = ""
+        offset              = 0
 
         async with aiohttp.ClientSession() as session:
             while True:
@@ -708,6 +721,8 @@ class MarketScanner:
                 }
                 if cursor:
                     params["next_cursor"] = cursor
+                else:
+                    params["offset"] = offset
 
                 data = None
                 for _attempt in range(3):
@@ -717,6 +732,9 @@ class MarketScanner:
                             params=params,
                             timeout=aiohttp.ClientTimeout(total=30),
                         ) as resp:
+                            # 422 past the last page = clean end of pagination.
+                            if resp.status == 422 and (offset > 0 or results):
+                                return results
                             resp.raise_for_status()
                             data = await resp.json(content_type=None)
                         break  # success
@@ -736,14 +754,23 @@ class MarketScanner:
                 if data is None:
                     return results
 
-                # The Gamma API may return a plain list or a paginated dict.
+                # Plain-list response → paginate by offset until a short page.
                 if isinstance(data, list):
                     for m in data:
                         if _is_binary(m):
                             results.append(m)
-                    break  # plain list is never paginated
+                    if len(data) < _PAGE_LIMIT:
+                        break                      # last (short) page
+                    offset += len(data)
+                    if offset >= _MAX_SCAN_MARKETS:
+                        logger.warning(
+                            "MarketScanner | hit _MAX_SCAN_MARKETS=%d scan cap",
+                            _MAX_SCAN_MARKETS,
+                        )
+                        break
+                    continue
 
-                # Paginated response: {"data": [...], "next_cursor": "…"}
+                # Paginated dict response: {"data": [...], "next_cursor": "…"}
                 for m in data.get("data", []):
                     if _is_binary(m):
                         results.append(m)
