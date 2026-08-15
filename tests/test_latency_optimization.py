@@ -149,7 +149,7 @@ async def test_ws_parse_metric_observes():
 
     before = REGISTRY.get_sample_value("polly_ws_parse_seconds_count") or 0.0
     feed = MarketFeed("Y", "N", "0xc", asyncio.Queue())
-    await feed._dispatch(
+    feed._dispatch(   # _dispatch is synchronous (queue push has no await)
         '{"event_type":"book","asset_id":"Y","asks":[{"price":"0.47","size":"10"}]}'
     )
     after = REGISTRY.get_sample_value("polly_ws_parse_seconds_count") or 0.0

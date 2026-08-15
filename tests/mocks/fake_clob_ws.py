@@ -20,9 +20,13 @@ class FakeWebSocket:
     def __init__(self, script: list[dict | list]) -> None:
         self._script  = list(script)
         self._sent: list[str] = []
+        self.closed = False
 
     async def send_str(self, payload: str) -> None:
         self._sent.append(payload)
+
+    async def close(self) -> None:
+        self.closed = True
 
     def __aiter__(self):
         return self

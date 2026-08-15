@@ -59,6 +59,7 @@ Paired tick pushed to queue
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -90,212 +91,61 @@ _MAX_BACKOFF     = 30.0   # seconds
 _STABLE_AFTER    = 10.0   # reset back-off after this many seconds connected
 
 
-class MarketFeed:
+class _MarketState:
     """
-    Async WebSocket feed tracking the best-ask for both legs of one market.
+    Per-market best-ask state and event handling for ONE binary market.
 
-    Usage::
-
-        queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=2048)
-        feed = MarketFeed(
-            yes_token_id="0xabc...",
-            no_token_id="0xdef...",
-            condition_id="0x123...",
-            queue=queue,
-        )
-        asyncio.create_task(feed.run())
+    Shared by MarketFeed (single-market connection) and MarketShard (many
+    markets on one multiplexed connection).  Encapsulates the book /
+    price_change parsing, tick-size capture, dedup and liveness tracking that
+    used to live directly on MarketFeed, so both feed types behave identically.
     """
 
-    def __init__(
-        self,
-        yes_token_id: str,
-        no_token_id: str,
-        condition_id: str,
-        queue: asyncio.Queue,
-        *,
-        ping_interval: float = 20.0,
-    ) -> None:
-        self._yes_token_id = yes_token_id
-        self._no_token_id  = no_token_id
-        self._condition_id = condition_id
-        self._token_ids    = [yes_token_id, no_token_id]
-        self._queue        = queue
-        self._ping_interval = ping_interval
-        self._running      = False
+    def __init__(self, condition_id: str, yes_token_id: str, no_token_id: str) -> None:
+        self.condition_id = condition_id
+        self.yes_token_id = yes_token_id
+        self.no_token_id  = no_token_id
+        self.token_ids    = [yes_token_id, no_token_id]
 
-        # Liveness tracking — used by FeedRegistry.prune_stale to drop feeds on
-        # dead/illiquid markets that never produce a two-sided quote.
-        self._created_monotonic   = time.monotonic()
-        self._last_tick_monotonic = self._created_monotonic
+        now = time.monotonic()
+        self.created_monotonic   = now
+        self.last_tick_monotonic = now
 
-        # Live best-ask state: None until we receive a confirmed ask price
         self._best_ask: dict[str, Optional[float]] = {
-            yes_token_id: None,
-            no_token_id:  None,
+            yes_token_id: None, no_token_id: None,
         }
-
-        # Per-leg tick size, learned from "book" snapshots (Polymarket includes
-        # tick_size in each book event). Threaded into the arb_tick so the maker
-        # pricer snaps bids to the market's grid (0.01 vs 0.001).
         self._tick_size: dict[str, Optional[float]] = {
-            yes_token_id: None,
-            no_token_id:  None,
+            yes_token_id: None, no_token_id: None,
         }
-
-        # Dedup: the WS emits an event on every book/price_change even when the
-        # best ask is unchanged.  Remember the last pushed pair so we never
-        # enqueue an identical tick (saves downstream re-evaluation + alerts).
         self._last_pushed: tuple[Optional[float], Optional[float]] = (None, None)
 
+    def owns(self, asset_id: str) -> bool:
+        return asset_id in self._best_ask
+
+    def reset(self) -> None:
+        """Invalidate best-asks (called on reconnect → await fresh snapshot)."""
+        self._best_ask = {self.yes_token_id: None, self.no_token_id: None}
+        self._last_pushed = (None, None)
+
     def idle_seconds(self, now: Optional[float] = None) -> float:
-        """Seconds since this feed last pushed a two-sided arb_tick.
-
-        For a feed that has never produced a tick this measures time since
-        construction, so persistently one-sided / dead markets become prunable.
-        """
         ref = now if now is not None else time.monotonic()
-        return ref - self._last_tick_monotonic
+        return ref - self.last_tick_monotonic
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Public control
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── Event handling ─────────────────────────────────────────────────────────
 
-    async def run(self) -> None:
-        """
-        Long-running coroutine.  Call as an asyncio Task; cancel to stop.
-        Reconnects automatically on any error with exponential back-off.
-        """
-        self._running = True
-        backoff = _INITIAL_BACKOFF
-
-        while self._running:
-            connected_at: Optional[float] = None
-            try:
-                # trust_env=False: explicitly bypass any HTTP_PROXY / HTTPS_PROXY
-                # env vars set by the REST ProxyRotator.  The WebSocket must
-                # connect directly to Polymarket for sub-millisecond ingestion.
-                async with aiohttp.ClientSession(trust_env=False) as session:
-                    async with session.ws_connect(
-                        _WS_URL,
-                        heartbeat=self._ping_interval,
-                        receive_timeout=60.0,
-                    ) as ws:
-                        # Fresh connection → invalidate stale prices so we
-                        # wait for the initial "book" snapshot before firing.
-                        self._reset_state()
-                        await self._subscribe(ws)
-                        connected_at = asyncio.get_event_loop().time()
-                        logger.info(
-                            "WS connected | yes=%s no=%s",
-                            self._yes_token_id[:12], self._no_token_id[:12],
-                        )
-
-                        async for msg in ws:
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                await self._dispatch(msg.data)
-                            elif msg.type == aiohttp.WSMsgType.ERROR:
-                                logger.warning("WS error frame: %s", msg.data)
-                                break
-                            elif msg.type in (
-                                aiohttp.WSMsgType.CLOSE,
-                                aiohttp.WSMsgType.CLOSING,
-                                aiohttp.WSMsgType.CLOSED,
-                            ):
-                                logger.info("WS closed by server")
-                                break
-
-            except asyncio.CancelledError:
-                self._running = False
-                logger.info("MarketFeed cancelled — shutting down")
-                return
-
-            except Exception as exc:  # noqa: BLE001
-                logger.error("WS error: %s", exc)
-
-            # Reset back-off if connection was stable long enough
-            if connected_at is not None:
-                uptime = asyncio.get_event_loop().time() - connected_at
-                if uptime >= _STABLE_AFTER:
-                    backoff = _INITIAL_BACKOFF
-
-            logger.info("WS reconnecting in %.1f s …", backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, _MAX_BACKOFF)
-
-    def stop(self) -> None:
-        """Signal the feed to stop after the current connection closes."""
-        self._running = False
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Internal helpers
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _reset_state(self) -> None:
-        """Invalidate both leg prices so we wait for a fresh book snapshot."""
-        self._best_ask = {
-            self._yes_token_id: None,
-            self._no_token_id:  None,
-        }
-
-    async def _subscribe(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        payload = json.dumps(
-            {"assets_ids": self._token_ids, "type": "market"}
-        )
-        await ws.send_str(payload)
-        logger.debug("Subscription sent: %s", payload)
-
-    async def _dispatch(self, raw: str) -> None:
-        """Parse one raw WS text frame and update best-ask state."""
-        _parse_t0 = time.monotonic()
-        try:
-            data = _loads(raw)
-        except json.JSONDecodeError:
-            logger.warning("Non-JSON WS message dropped: %s", raw[:120])
-            return
-        WS_PARSE_SECONDS.observe(time.monotonic() - _parse_t0)
-
-        # Polymarket may send a single dict or an array of event dicts.
-        events: list[dict] = data if isinstance(data, list) else [data]
-
-        updated = False
-        for event in events:
-            if isinstance(event, dict):
-                updated |= self._update_leg(event)
-
-        if updated:
-            self._maybe_push_tick()
-
-    def _update_leg(self, event: dict) -> bool:
-        """
-        Extract best-ask from a single event dict and update internal state.
-
-        Returns True if any leg's best-ask changed.
-        """
-        asset_id = (
-            event.get("asset_id")
-            or event.get("token_id")
-            or ""
-        )
+    def update_leg(self, asset_id: str, event: dict) -> bool:
+        """Update one leg's best-ask from an event.  Returns True if it changed."""
         if asset_id not in self._best_ask:
-            return False  # event for a token we don't track
-
+            return False
         event_type = event.get("event_type", "").lower()
-
         if event_type == "book":
             return self._handle_book(asset_id, event)
         elif event_type == "price_change":
             return self._handle_price_change(asset_id, event)
-        else:
-            # Unknown event type — attempt generic best-ask extraction
-            return self._handle_generic(asset_id, event)
+        return self._handle_generic(asset_id, event)
 
     def _handle_book(self, asset_id: str, event: dict) -> bool:
-        """
-        Full orderbook snapshot → take asks[0].price as the definitive best ask.
-        Asks are sorted ascending (lowest first) per Polymarket CLOB convention.
-        """
-        # Capture the market tick size from the snapshot (present on Polymarket
-        # book events) so the maker pricer can post on-grid bids.
+        # Capture tick size from the snapshot (Polymarket book events carry it).
         _ts = event.get("tick_size", event.get("tickSize"))
         if _ts is not None:
             try:
@@ -313,69 +163,35 @@ class MarketFeed:
                 return False
             changed = self._best_ask[asset_id] != price
             self._best_ask[asset_id] = price
-            if changed:
-                logger.debug(
-                    "BOOK  | %s ask=%.6f", asset_id[:12], price
-                )
             return changed
         except (KeyError, IndexError, TypeError, ValueError):
             return False
 
     def _handle_price_change(self, asset_id: str, event: dict) -> bool:
-        """
-        Price-level delta event.
-
-        side="SELL" means an ask-side level changed.
-        If the new price is lower than the current best ask, it is the new best.
-        If size="0", the level was removed; we invalidate our cached value to
-        await the next authoritative "book" snapshot.
-        """
         side = event.get("side", "").upper()
         if side not in ("SELL", "ASK"):
-            return False  # bid-side change; irrelevant for arb ask tracking
-
+            return False
         try:
             price = float(event["price"])
         except (KeyError, TypeError, ValueError):
             return False
-
-        # Level removed — invalidate to force a conservative re-evaluation.
         size_raw = event.get("size", "1")
         try:
             size = float(size_raw)
         except (TypeError, ValueError):
             size = 1.0
-
         if size <= 0.0:
             if self._best_ask[asset_id] is not None:
-                logger.debug(
-                    "PRICE_CHANGE | %s ask level %.6f removed — invalidating",
-                    asset_id[:12], self._best_ask[asset_id],
-                )
                 self._best_ask[asset_id] = None
                 return True
             return False
-
-        # New ask level; update if it beats the current best.
         current = self._best_ask[asset_id]
         if current is None or price < current:
             self._best_ask[asset_id] = price
-            logger.debug(
-                "PRICE_CHANGE | %s ask=%.6f (prev=%s)",
-                asset_id[:12], price,
-                f"{current:.6f}" if current is not None else "none",
-            )
             return True
-
         return False
 
     def _handle_generic(self, asset_id: str, event: dict) -> bool:
-        """
-        Fallback parser for events without a recognised event_type.
-
-        Tries asks[] first, then falls back to a top-level "price" field on
-        the ask side — mirrors the legacy midpoint-extraction heuristic.
-        """
         asks = event.get("asks", [])
         if asks:
             try:
@@ -387,7 +203,6 @@ class MarketFeed:
                     return changed
             except (KeyError, IndexError, TypeError, ValueError):
                 pass
-
         side = event.get("side", "").upper()
         if side in ("SELL", "ASK"):
             try:
@@ -398,50 +213,333 @@ class MarketFeed:
                     return True
             except (KeyError, TypeError, ValueError):
                 pass
-
         return False
 
-    def _maybe_push_tick(self) -> None:
+    def build_tick(self) -> Optional[dict]:
         """
-        If BOTH legs have a valid best-ask price, push a paired tick dict.
-
-        Drops the oldest entry when the queue is full (strategy-lag protection).
+        Return a paired arb_tick dict when BOTH legs have a fresh best-ask and
+        the pair changed since the last push, else None.  Updates dedup and
+        liveness state as a side effect (mirrors the old _maybe_push_tick).
         """
-        yes_ask = self._best_ask.get(self._yes_token_id)
-        no_ask  = self._best_ask.get(self._no_token_id)
-
+        yes_ask = self._best_ask.get(self.yes_token_id)
+        no_ask  = self._best_ask.get(self.no_token_id)
         if yes_ask is None or no_ask is None:
-            return  # still waiting for one or both legs
-
-        # Dedup — skip if neither leg's best ask changed since the last push.
+            return None
         if (yes_ask, no_ask) == self._last_pushed:
-            return
+            return None
         self._last_pushed = (yes_ask, no_ask)
 
         now = time.monotonic()
-        self._last_tick_monotonic = now   # liveness marker for stale-feed pruning
-        # Coarser of the two legs' ticks — both bids must be valid, so use the
-        # larger increment (None if neither leg reported one yet → pricer default).
-        _yt = self._tick_size.get(self._yes_token_id)
-        _nt = self._tick_size.get(self._no_token_id)
+        self.last_tick_monotonic = now
+        _yt = self._tick_size.get(self.yes_token_id)
+        _nt = self._tick_size.get(self.no_token_id)
         _ticks = [t for t in (_yt, _nt) if t is not None]
-        tick: dict = {
+        return {
             "type":         "arb_tick",
-            "condition_id": self._condition_id,
-            "yes_token_id": self._yes_token_id,
-            "no_token_id":  self._no_token_id,
+            "condition_id": self.condition_id,
+            "yes_token_id": self.yes_token_id,
+            "no_token_id":  self.no_token_id,
             "yes_ask":      yes_ask,
             "no_ask":       no_ask,
             "tick_size":    max(_ticks) if _ticks else None,
             "ts":           now,
         }
 
+
+def _queue_push(queue: asyncio.Queue, tick: dict) -> None:
+    """Enqueue a tick, evicting the oldest entry when the queue is full."""
+    try:
+        queue.put_nowait(tick)
+    except asyncio.QueueFull:
         try:
-            self._queue.put_nowait(tick)
-        except asyncio.QueueFull:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        queue.put_nowait(tick)
+        logger.debug("Queue full — oldest arb_tick evicted")
+
+
+def _parse_events(raw: str) -> list[dict]:
+    """Parse a raw WS text frame into a list of event dicts (or [] on error)."""
+    _parse_t0 = time.monotonic()
+    try:
+        data = _loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Non-JSON WS message dropped: %s", raw[:120])
+        return []
+    WS_PARSE_SECONDS.observe(time.monotonic() - _parse_t0)
+    events = data if isinstance(data, list) else [data]
+    return [e for e in events if isinstance(e, dict)]
+
+
+class MarketFeed:
+    """
+    Async WebSocket feed tracking the best-ask for both legs of ONE market.
+
+    Retained for the single-market path and direct testing.  Delegates all
+    event handling to a `_MarketState`; the multiplexed path uses MarketShard.
+
+    Usage::
+
+        queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=2048)
+        feed = MarketFeed("0xabc...", "0xdef...", "0x123...", queue)
+        asyncio.create_task(feed.run())
+    """
+
+    def __init__(
+        self,
+        yes_token_id: str,
+        no_token_id: str,
+        condition_id: str,
+        queue: asyncio.Queue,
+        *,
+        ping_interval: float = 20.0,
+    ) -> None:
+        self._yes_token_id = yes_token_id
+        self._no_token_id  = no_token_id
+        self._condition_id = condition_id
+        self._queue        = queue
+        self._ping_interval = ping_interval
+        self._running      = False
+        self._state = _MarketState(condition_id, yes_token_id, no_token_id)
+
+    def idle_seconds(self, now: Optional[float] = None) -> float:
+        """Seconds since this feed last pushed a two-sided arb_tick."""
+        return self._state.idle_seconds(now)
+
+    # ── Compat accessors (delegate to the underlying _MarketState) ─────────────
+    @property
+    def _best_ask(self) -> dict:
+        return self._state._best_ask
+
+    @property
+    def _last_tick_monotonic(self) -> float:
+        return self._state.last_tick_monotonic
+
+    def _maybe_push_tick(self) -> None:
+        """Build and enqueue a paired tick if both legs are known (compat)."""
+        tick = self._state.build_tick()
+        if tick is not None:
+            _queue_push(self._queue, tick)
+
+    async def run(self) -> None:
+        """Long-running coroutine.  Cancel to stop.  Auto-reconnects."""
+        self._running = True
+        backoff = _INITIAL_BACKOFF
+        while self._running:
+            connected_at: Optional[float] = None
             try:
-                self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-            self._queue.put_nowait(tick)
-            logger.debug("Queue full — oldest arb_tick evicted")
+                async with aiohttp.ClientSession(trust_env=False) as session:
+                    async with session.ws_connect(
+                        _WS_URL,
+                        heartbeat=self._ping_interval,
+                        receive_timeout=60.0,
+                    ) as ws:
+                        self._state.reset()
+                        await ws.send_str(json.dumps(
+                            {"assets_ids": self._state.token_ids, "type": "market"}
+                        ))
+                        connected_at = asyncio.get_event_loop().time()
+                        logger.info(
+                            "WS connected | yes=%s no=%s",
+                            self._yes_token_id[:12], self._no_token_id[:12],
+                        )
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                self._dispatch(msg.data)
+                            elif msg.type == aiohttp.WSMsgType.ERROR:
+                                logger.warning("WS error frame: %s", msg.data)
+                                break
+                            elif msg.type in (
+                                aiohttp.WSMsgType.CLOSE,
+                                aiohttp.WSMsgType.CLOSING,
+                                aiohttp.WSMsgType.CLOSED,
+                            ):
+                                logger.info("WS closed by server")
+                                break
+            except asyncio.CancelledError:
+                self._running = False
+                logger.info("MarketFeed cancelled — shutting down")
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.error("WS error: %s", exc)
+
+            if connected_at is not None:
+                uptime = asyncio.get_event_loop().time() - connected_at
+                if uptime >= _STABLE_AFTER:
+                    backoff = _INITIAL_BACKOFF
+            logger.info("WS reconnecting in %.1f s …", backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, _MAX_BACKOFF)
+
+    def stop(self) -> None:
+        self._running = False
+
+    def _dispatch(self, raw: str) -> None:
+        st = self._state
+        changed = False
+        for event in _parse_events(raw):
+            asset_id = event.get("asset_id") or event.get("token_id") or ""
+            changed |= st.update_leg(asset_id, event)
+        if changed:
+            tick = st.build_tick()
+            if tick is not None:
+                _queue_push(self._queue, tick)
+
+
+class MarketShard:
+    """
+    ONE multiplexed WebSocket connection carrying MANY markets.
+
+    Instead of one connection per market (which explodes the per-IP connection
+    count at scale), a shard subscribes to every member market's asset IDs on a
+    single connection and routes each incoming event by asset_id to the owning
+    `_MarketState`.  This keeps the connection count at ceil(N / capacity)
+    instead of N.
+
+    Membership is dynamic:
+      • add()    — subscribes the new market incrementally (one extra frame on
+                   the live socket; no reconnect, so peers are undisturbed).
+      • remove() — stops routing the market; its lingering subscription is
+                   dropped on the next reconnect, which re-subscribes to exactly
+                   the current member set.
+    """
+
+    def __init__(
+        self,
+        queue: asyncio.Queue,
+        *,
+        shard_id: int = 0,
+        ping_interval: float = 20.0,
+    ) -> None:
+        self._queue         = queue
+        self._shard_id      = shard_id
+        self._ping_interval = ping_interval
+        self._running       = False
+        self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
+
+        self._states:  dict[str, _MarketState] = {}   # condition_id → state
+        self._routing: dict[str, _MarketState] = {}   # asset_id     → state
+
+    # ── Membership ─────────────────────────────────────────────────────────────
+
+    @property
+    def count(self) -> int:
+        return len(self._states)
+
+    def condition_ids(self) -> list[str]:
+        return list(self._states.keys())
+
+    def contains(self, condition_id: str) -> bool:
+        return condition_id in self._states
+
+    def add(self, condition_id: str, yes_token_id: str, no_token_id: str) -> None:
+        """Add a market to this shard and (if connected) subscribe incrementally."""
+        if condition_id in self._states:
+            return
+        st = _MarketState(condition_id, yes_token_id, no_token_id)
+        self._states[condition_id] = st
+        self._routing[yes_token_id] = st
+        self._routing[no_token_id]  = st
+        if self._ws is not None and not self._ws.closed:
+            # Incremental subscribe on the live socket — no reconnect churn.
+            asyncio.ensure_future(self._subscribe([yes_token_id, no_token_id]))
+
+    def remove(self, condition_id: str) -> None:
+        """Stop tracking a market (its subscription is cleaned on next reconnect)."""
+        st = self._states.pop(condition_id, None)
+        if st is None:
+            return
+        self._routing.pop(st.yes_token_id, None)
+        self._routing.pop(st.no_token_id, None)
+
+    def idle_seconds(self, condition_id: str, now: Optional[float] = None) -> Optional[float]:
+        st = self._states.get(condition_id)
+        return None if st is None else st.idle_seconds(now)
+
+    # ── Connection lifecycle ────────────────────────────────────────────────────
+
+    async def run(self) -> None:
+        """Long-running coroutine.  Cancel to stop.  Auto-reconnects."""
+        self._running = True
+        backoff = _INITIAL_BACKOFF
+        while self._running:
+            connected_at: Optional[float] = None
+            try:
+                async with aiohttp.ClientSession(trust_env=False) as session:
+                    async with session.ws_connect(
+                        _WS_URL,
+                        heartbeat=self._ping_interval,
+                        receive_timeout=60.0,
+                    ) as ws:
+                        self._ws = ws
+                        for st in self._states.values():
+                            st.reset()
+                        all_ids = [tid for st in self._states.values()
+                                   for tid in st.token_ids]
+                        if all_ids:
+                            await self._subscribe(all_ids)
+                        connected_at = asyncio.get_event_loop().time()
+                        logger.info(
+                            "WS shard[%d] connected | markets=%d assets=%d",
+                            self._shard_id, len(self._states), len(all_ids),
+                        )
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                self._dispatch(msg.data)
+                            elif msg.type == aiohttp.WSMsgType.ERROR:
+                                logger.warning("WS shard[%d] error frame: %s",
+                                               self._shard_id, msg.data)
+                                break
+                            elif msg.type in (
+                                aiohttp.WSMsgType.CLOSE,
+                                aiohttp.WSMsgType.CLOSING,
+                                aiohttp.WSMsgType.CLOSED,
+                            ):
+                                logger.info("WS shard[%d] closed by server",
+                                            self._shard_id)
+                                break
+            except asyncio.CancelledError:
+                self._running = False
+                self._ws = None
+                logger.info("WS shard[%d] cancelled — shutting down", self._shard_id)
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.error("WS shard[%d] error: %s", self._shard_id, exc)
+            finally:
+                self._ws = None
+
+            if connected_at is not None:
+                uptime = asyncio.get_event_loop().time() - connected_at
+                if uptime >= _STABLE_AFTER:
+                    backoff = _INITIAL_BACKOFF
+            logger.info("WS shard[%d] reconnecting in %.1f s …",
+                        self._shard_id, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, _MAX_BACKOFF)
+
+    def stop(self) -> None:
+        self._running = False
+
+    async def _subscribe(self, asset_ids: list[str]) -> None:
+        ws = self._ws
+        if ws is None or ws.closed or not asset_ids:
+            return
+        with contextlib.suppress(Exception):
+            await ws.send_str(json.dumps(
+                {"assets_ids": asset_ids, "type": "market"}
+            ))
+
+    def _dispatch(self, raw: str) -> None:
+        changed: set[_MarketState] = set()
+        for event in _parse_events(raw):
+            asset_id = event.get("asset_id") or event.get("token_id") or ""
+            st = self._routing.get(asset_id)
+            if st is None:
+                continue   # event for a market we no longer track
+            if st.update_leg(asset_id, event):
+                changed.add(st)
+        for st in changed:
+            tick = st.build_tick()
+            if tick is not None:
+                _queue_push(self._queue, tick)

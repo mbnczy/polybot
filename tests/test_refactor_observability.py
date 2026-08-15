@@ -102,6 +102,7 @@ async def test_feeds_pruned_metric(monkeypatch):
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             return
+    monkeypatch.setattr("core.ws_feed.MarketShard.run", _idle, raising=True)
     monkeypatch.setattr("core.ws_feed.MarketFeed.run", _idle, raising=True)
 
     before = REGISTRY.get_sample_value("polly_feeds_pruned_total") or 0.0
@@ -110,8 +111,8 @@ async def test_feeds_pruned_metric(monkeypatch):
     reg = FeedRegistry(queue=q, max_feeds=5)
     await reg.add_market("c1", "y1", "n1")
     await reg.add_market("c2", "y2", "n2")
-    feed1, _ = reg._feeds["c1"]
-    monkeypatch.setattr(feed1, "idle_seconds", lambda now=None: 9999.0)
+    st1 = reg._by_condition["c1"]._states["c1"]
+    monkeypatch.setattr(st1, "idle_seconds", lambda now=None: 9999.0)
 
     pruned = await reg.prune_stale(max_idle_s=600)
     assert pruned == ["c1"]

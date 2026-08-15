@@ -53,6 +53,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import time
 import warnings
 from datetime import datetime, timezone
@@ -60,7 +61,7 @@ from typing import Awaitable, Callable
 
 import aiohttp
 
-from core.ws_feed import MarketFeed
+from core.ws_feed import MarketShard
 from strategy.arbitrage import _resolve_rebate
 from telemetry.metrics import (
     FEEDS_PRUNED,
@@ -86,6 +87,12 @@ _MAX_SCAN_MARKETS: int = 8000
 
 # ── Scanner defaults ────────────────────────────────────────────────────────
 SCAN_INTERVAL: float = 300.0   # seconds between full market-list polls (5 min)
+
+# ── WS multiplexing ──────────────────────────────────────────────────────────
+# Markets per multiplexed WebSocket shard connection. N markets → ceil(N/cap)
+# connections instead of N, keeping the per-IP connection count low at scale.
+# Env-tunable; 50 markets = 100 asset subscriptions per connection.
+_SHARD_CAPACITY: int = max(1, int(os.environ.get("WS_SHARD_CAPACITY", "50")))
 
 # ── V2 market-scoring parameters (docs/Scorer machine spec) ──────────────────
 # Target markets liquid enough for $100–500 positions but NOT yet fully
@@ -113,29 +120,32 @@ MarketCallback = Callable[[str, str, str], Awaitable[object]]
 
 class FeedRegistry:
     """
-    Manages one MarketFeed asyncio.Task per active Polymarket binary market.
+    Manages the live set of tracked markets across a small pool of multiplexed
+    WebSocket connections (MarketShard).  Each shard carries up to
+    WS_SHARD_CAPACITY markets on ONE connection, so the total connection count
+    is ceil(N / capacity) instead of one-per-market — the key to scaling market
+    coverage without hitting per-IP WebSocket limits.
 
-    Each feed runs independently; they all push arb_tick dicts to the shared
-    queue supplied at construction.  add_market() is idempotent — calling it
-    for an already-tracked condition_id is a no-op.
+    Public API is unchanged from the one-feed-per-market design: add_market,
+    prune_stale, remove_market, stop_all, condition_ids, active_count.  Markets
+    still push identical arb_tick dicts to the shared queue.
 
     Attributes
     ----------
-    condition_ids : frozenset[str]
-        Snapshot of all condition IDs currently being fed.
-    active_count : int
-        Number of live feed tasks.
+    condition_ids : frozenset[str]  — all currently tracked condition IDs.
+    active_count  : int             — number of tracked markets (NOT shards).
     """
 
     def __init__(self, queue: asyncio.Queue, max_feeds: int = 0) -> None:
         self._queue = queue
-        # condition_id → (MarketFeed, asyncio.Task)
-        self._feeds: dict[str, tuple[MarketFeed, asyncio.Task]] = {}
-        # Global hard cap on concurrently-active feeds (0 = unlimited). This is
-        # the real ceiling on WebSocket connections; the scanner's per-scan
-        # admission limit is separate and must not be allowed to grow feeds
-        # without bound across re-scans.
+        # Global hard cap on concurrently-tracked MARKETS (0 = unlimited).
         self._max_feeds = max(0, max_feeds)
+        self._shard_capacity = max(1, _SHARD_CAPACITY)
+        # Live shards and their run tasks.
+        self._shards: list[tuple[MarketShard, asyncio.Task]] = []
+        # condition_id → owning shard (for O(1) prune / removal).
+        self._by_condition: dict[str, MarketShard] = {}
+        self._next_shard_id = 0
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public API
@@ -148,17 +158,13 @@ class FeedRegistry:
         no_token_id:   str,
     ) -> bool:
         """
-        Register a market and start its WebSocket feed task.
-
-        Idempotent — returns True if already tracked.  Returns False (without
-        starting a feed) when the global max_feeds cap is reached, so the caller
-        can avoid marking the market as permanently seen and retry it later.
-        Returns False and logs (does not crash) if the feed task cannot start.
+        Register a market on a shard with spare capacity (creating a new shard
+        if needed).  Idempotent — returns True if already tracked.  Returns
+        False without registering when the global max_feeds cap is reached.
         """
-        if condition_id in self._feeds:
+        if condition_id in self._by_condition:
             return True
-
-        if self._max_feeds and len(self._feeds) >= self._max_feeds:
+        if self._max_feeds and len(self._by_condition) >= self._max_feeds:
             logger.debug(
                 "FeedRegistry | at cap (%d) — rejecting condition=%s",
                 self._max_feeds, condition_id[:16],
@@ -166,88 +172,103 @@ class FeedRegistry:
             return False
 
         try:
-            feed = MarketFeed(
-                yes_token_id=yes_token_id,
-                no_token_id=no_token_id,
-                condition_id=condition_id,
-                queue=self._queue,
-            )
-            task = asyncio.create_task(
-                feed.run(),
-                name=f"feed-{condition_id[:16]}",
-            )
-            self._feeds[condition_id] = (feed, task)
+            shard = self._shard_with_capacity()
+            shard.add(condition_id, yes_token_id, no_token_id)
+            self._by_condition[condition_id] = shard
             logger.info(
-                "FeedRegistry | feed started condition=%s yes=%s no=%s "
-                "(total_feeds=%d)",
+                "FeedRegistry | market added condition=%s yes=%s no=%s "
+                "(markets=%d, shards=%d)",
                 condition_id[:16], yes_token_id[:12], no_token_id[:12],
-                len(self._feeds),
+                len(self._by_condition), len(self._shards),
             )
             return True
         except Exception as exc:  # noqa: BLE001
             logger.error(
-                "FeedRegistry | failed to start feed for condition=%s: %s",
+                "FeedRegistry | failed to add condition=%s: %s",
                 condition_id[:16], exc,
             )
             return False
 
+    def _shard_with_capacity(self) -> MarketShard:
+        """Return an existing shard with a free slot, or start a new one."""
+        for shard, _task in self._shards:
+            if shard.count < self._shard_capacity:
+                return shard
+        shard = MarketShard(self._queue, shard_id=self._next_shard_id)
+        self._next_shard_id += 1
+        task = asyncio.create_task(shard.run(), name=f"ws-shard-{shard._shard_id}")
+        self._shards.append((shard, task))
+        logger.info(
+            "FeedRegistry | started WS shard #%d (capacity=%d, total_shards=%d)",
+            shard._shard_id, self._shard_capacity, len(self._shards),
+        )
+        return shard
+
     async def prune_stale(self, max_idle_s: float) -> list[str]:
         """
-        Remove feeds that have not produced a two-sided arb_tick within
-        `max_idle_s` seconds (dead / illiquid / one-sided markets).
-
-        Returns the list of pruned condition_ids so the caller can also forget
-        them and free the slot for a fresher candidate.
+        Remove markets that have not produced a two-sided arb_tick within
+        `max_idle_s` seconds.  Returns the pruned condition_ids so the caller
+        can free the slot for a fresher candidate.
         """
-        if max_idle_s <= 0 or not self._feeds:
+        if max_idle_s <= 0 or not self._by_condition:
             return []
         now   = time.monotonic()
         stale = [
-            cid for cid, (feed, _task) in self._feeds.items()
-            if feed.idle_seconds(now) > max_idle_s
+            cid for cid, shard in self._by_condition.items()
+            if (idle := shard.idle_seconds(cid, now)) is not None
+            and idle > max_idle_s
         ]
         for cid in stale:
             await self.remove_market(cid)
         if stale:
             FEEDS_PRUNED.inc(len(stale))
             logger.info(
-                "FeedRegistry | pruned %d stale feed(s) (idle > %.0fs) | remaining=%d",
-                len(stale), max_idle_s, len(self._feeds),
+                "FeedRegistry | pruned %d stale market(s) (idle > %.0fs) | "
+                "remaining=%d shards=%d",
+                len(stale), max_idle_s, len(self._by_condition), len(self._shards),
             )
         return stale
 
     async def remove_market(self, condition_id: str) -> None:
         """
-        Cancel and remove the feed for a specific condition ID.
-
-        Safe to call even if the market is not tracked (no-op in that case).
+        Stop tracking a market.  Safe to call for an untracked market (no-op).
+        A shard that becomes empty is stopped so its connection is released.
         """
-        entry = self._feeds.pop(condition_id, None)
-        if entry is None:
+        shard = self._by_condition.pop(condition_id, None)
+        if shard is None:
             return
-        feed, task = entry
-        feed.stop()
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        logger.info(
-            "FeedRegistry | feed removed condition=%s (remaining=%d)",
-            condition_id[:16], len(self._feeds),
-        )
+        shard.remove(condition_id)
+        if shard.count == 0:
+            await self._stop_shard(shard)
+
+    async def _stop_shard(self, shard: MarketShard) -> None:
+        for i, (s, task) in enumerate(self._shards):
+            if s is shard:
+                s.stop()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                self._shards.pop(i)
+                logger.info(
+                    "FeedRegistry | stopped empty WS shard #%d (remaining_shards=%d)",
+                    s._shard_id, len(self._shards),
+                )
+                return
 
     async def stop_all(self) -> None:
-        """Cancel all feed tasks for clean shutdown."""
-        if not self._feeds:
+        """Cancel all shard tasks for clean shutdown."""
+        if not self._shards:
             return
-        logger.info("FeedRegistry | stopping %d feed(s) …", len(self._feeds))
-        for _cond_id, (feed, task) in list(self._feeds.items()):
-            feed.stop()
+        logger.info("FeedRegistry | stopping %d shard(s) …", len(self._shards))
+        for shard, task in self._shards:
+            shard.stop()
             task.cancel()
         await asyncio.gather(
-            *(task for _, task in self._feeds.values()),
+            *(task for _, task in self._shards),
             return_exceptions=True,
         )
-        self._feeds.clear()
-        logger.info("FeedRegistry | all feeds stopped")
+        self._shards.clear()
+        self._by_condition.clear()
+        logger.info("FeedRegistry | all shards stopped")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Observability
@@ -256,12 +277,18 @@ class FeedRegistry:
     @property
     def condition_ids(self) -> frozenset[str]:
         """Snapshot of all currently tracked condition IDs."""
-        return frozenset(self._feeds.keys())
+        return frozenset(self._by_condition.keys())
 
     @property
     def active_count(self) -> int:
-        """Number of live feed tasks."""
-        return len(self._feeds)
+        """Number of tracked markets (not shards)."""
+        return len(self._by_condition)
+
+    @property
+    def shard_count(self) -> int:
+        """Number of live WebSocket shard connections."""
+        return len(self._shards)
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -113,12 +113,13 @@ class TestMinRealEdgeGuard:
 
 @pytest.fixture
 def _no_network_feed(monkeypatch):
-    """Stop MarketFeed.run from opening real WebSockets during registry tests."""
+    """Stop WS shards/feeds from opening real WebSockets during registry tests."""
     async def _idle(self):
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             return
+    monkeypatch.setattr("core.ws_feed.MarketShard.run", _idle, raising=True)
     monkeypatch.setattr("core.ws_feed.MarketFeed.run", _idle, raising=True)
 
 
@@ -146,11 +147,11 @@ async def test_feed_registry_prune_stale(_no_network_feed, monkeypatch):
     await reg.add_market("c1", "y1", "n1")
     await reg.add_market("c2", "y2", "n2")
 
-    # Force c1's feed to look stale, c2 fresh.
-    feed1, _ = reg._feeds["c1"]
-    feed2, _ = reg._feeds["c2"]
-    monkeypatch.setattr(feed1, "idle_seconds", lambda now=None: 9999.0)
-    monkeypatch.setattr(feed2, "idle_seconds", lambda now=None: 1.0)
+    # Force c1's market to look stale, c2 fresh (states live inside the shard).
+    st1 = reg._by_condition["c1"]._states["c1"]
+    st2 = reg._by_condition["c2"]._states["c2"]
+    monkeypatch.setattr(st1, "idle_seconds", lambda now=None: 9999.0)
+    monkeypatch.setattr(st2, "idle_seconds", lambda now=None: 1.0)
 
     pruned = await reg.prune_stale(max_idle_s=600)
     assert pruned == ["c1"]
@@ -174,7 +175,7 @@ async def test_feed_registry_prune_disabled(_no_network_feed):
 # ═══════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.asyncio
-async def test_scanner_volume_floor(_no_network_feed):
+async def test_scanner_volume_floor(_no_network_feed, monkeypatch):
     from core.scanner import FeedRegistry, MarketScanner
     from datetime import datetime, timedelta, timezone
 
@@ -210,8 +211,11 @@ async def test_scanner_volume_floor(_no_network_feed):
 
     async def _fake_fetch(self):
         return markets
-    import core.scanner as sc
-    sc.MarketScanner._fetch_all_active = _fake_fetch  # type: ignore
+    # monkeypatch (not a raw class assignment) so the patch reverts and does
+    # not leak into later tests' real _fetch_all_active (e.g. pagination tests).
+    monkeypatch.setattr(
+        "core.scanner.MarketScanner._fetch_all_active", _fake_fetch, raising=True,
+    )
 
     await scanner._scan_once_inner()
     assert "0xhigh" in added
