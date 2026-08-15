@@ -171,9 +171,13 @@ CAPITAL_RECYCLED_TOTAL = Counter(
 
 async def _metrics_handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
     output = generate_latest()
+    # CONTENT_TYPE_LATEST is "text/plain; version=0.0.4; charset=utf-8" — it
+    # embeds charset, which newer aiohttp rejects in the content_type= kwarg
+    # ("charset must not be in content_type argument"). Set it as a raw header
+    # instead so the exact Prometheus content type reaches the scraper.
     return aiohttp.web.Response(
         body=output,
-        content_type=CONTENT_TYPE_LATEST,
+        headers={"Content-Type": CONTENT_TYPE_LATEST},
     )
 
 
