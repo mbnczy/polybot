@@ -661,3 +661,142 @@ async def test_main_mock_negrisk_exec_off_alerts_without_trading(monkeypatch, tm
     assert status["orders_passed"] == 0, "no order may pass the breaker in off mode"
     assert status["open_positions"] == 0
     assert status["session_pnl"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_main_mock_negrisk_clob_mode_submits_and_hands_to_guard(
+    monkeypatch, tmp_path
+):
+    """
+    NEGRISK_EXEC_MODE=clob: the bundle goes out as N limit orders and the
+    guard takes ownership of the breaker reservation.
+
+    The guard — not the strategy loop — books P&L, because N limit orders can
+    fill in any subset and a partial bundle is not a smaller arb.
+    """
+    import risk.circuit_breaker as cb_mod
+    monkeypatch.setattr(cb_mod, "_DAILY_STATE_PATH", str(tmp_path / "daily.json"))
+    monkeypatch.setattr("main._negrisk_exec_mode", "clob", raising=True)
+
+    breaker       = CircuitBreaker(starting_balance=500.0)
+    notifier      = FakeTelegramNotifier(on_status=breaker.status_dict)
+    fee_engine    = FeeEngine(default_fee=0.0)
+    rebate_engine = MakerRebateEngine()
+    rebate_engine.prime_cache(NR_CID, rebate_rate=0.0)
+
+    submitted: list[list] = []
+
+    class _BundleClient:
+        async def execute_negrisk_clob_bundle(self, legs):
+            submitted.append(legs)
+            return [
+                {"status": "live", "order_id": f"o{i}", "token_id": leg.token_id}
+                for i, leg in enumerate(legs)
+            ]
+
+    class _RecordingGuard:
+        def __init__(self):
+            self.watched = []
+
+        def is_watching(self, _cid):
+            return bool(self.watched)
+
+        def watch_bundle(self, signal, responses):
+            self.watched.append((signal, responses))
+
+    class _NoopSigLogger:
+        def log_arb(self, *_a, **_kw):
+            pass
+
+    guard = _RecordingGuard()
+    queue: asyncio.Queue = asyncio.Queue()
+    strat = asyncio.create_task(strategy_loop(
+        queue,
+        ArbDetector(desired_net_margin=0.005, default_fee_rate=0.0),
+        DutchBookPricer(desired_net_margin=0.005),
+        NegRiskArbDetector(desired_net_margin=0.005),
+        rebate_engine, fee_engine, breaker,
+        _BundleClient(), notifier, _NoopSigLogger(),
+        negrisk_guard=guard,
+    ))
+
+    import time as _time
+    await queue.put({
+        "type":              "neg_risk_tick",
+        "condition_id":      NR_CID,
+        "outcome_token_ids": [NR_TOKEN_A, NR_TOKEN_B, NR_TOKEN_C],
+        "no_asks":           NR_NO_ASKS,
+        "no_ask_sizes":      [500.0, 500.0, 500.0],
+        "tick_size":         0.01,
+        "ts":                _time.monotonic(),
+    })
+    await asyncio.sleep(0.3)
+
+    strat.cancel()
+    await asyncio.gather(strat, return_exceptions=True)
+
+    assert len(submitted) == 1, "bundle was not submitted in clob mode"
+    assert len(submitted[0]) == 3
+    assert len(guard.watched) == 1, "guard never took ownership of the bundle"
+
+    status = breaker.status_dict()
+    assert status["open_positions"] == 1, "reservation must stay with the guard"
+    assert status["session_pnl"] == 0.0, "loop must not book P&L for the guard"
+
+
+@pytest.mark.asyncio
+async def test_main_mock_negrisk_clob_release_on_submit_failure(monkeypatch, tmp_path):
+    """A failed submission must give the reservation back, not leak a slot."""
+    import risk.circuit_breaker as cb_mod
+    monkeypatch.setattr(cb_mod, "_DAILY_STATE_PATH", str(tmp_path / "daily.json"))
+    monkeypatch.setattr("main._negrisk_exec_mode", "clob", raising=True)
+
+    breaker       = CircuitBreaker(starting_balance=500.0)
+    notifier      = FakeTelegramNotifier(on_status=breaker.status_dict)
+    fee_engine    = FeeEngine(default_fee=0.0)
+    rebate_engine = MakerRebateEngine()
+    rebate_engine.prime_cache(NR_CID, rebate_rate=0.0)
+
+    class _FailingClient:
+        async def execute_negrisk_clob_bundle(self, legs):
+            raise RuntimeError("exchange rejected the batch")
+
+    class _Guard:
+        def is_watching(self, _cid):
+            return False
+
+        def watch_bundle(self, *_a):
+            raise AssertionError("guard must not be handed a failed submission")
+
+    class _NoopSigLogger:
+        def log_arb(self, *_a, **_kw):
+            pass
+
+    queue: asyncio.Queue = asyncio.Queue()
+    strat = asyncio.create_task(strategy_loop(
+        queue,
+        ArbDetector(desired_net_margin=0.005, default_fee_rate=0.0),
+        DutchBookPricer(desired_net_margin=0.005),
+        NegRiskArbDetector(desired_net_margin=0.005),
+        rebate_engine, fee_engine, breaker,
+        _FailingClient(), notifier, _NoopSigLogger(),
+        negrisk_guard=_Guard(),
+    ))
+
+    import time as _time
+    await queue.put({
+        "type":              "neg_risk_tick",
+        "condition_id":      NR_CID,
+        "outcome_token_ids": [NR_TOKEN_A, NR_TOKEN_B, NR_TOKEN_C],
+        "no_asks":           NR_NO_ASKS,
+        "tick_size":         0.01,
+        "ts":                _time.monotonic(),
+    })
+    await asyncio.sleep(0.3)
+
+    strat.cancel()
+    await asyncio.gather(strat, return_exceptions=True)
+
+    status = breaker.status_dict()
+    assert status["open_positions"] == 0, "reservation leaked on submit failure"
+    assert status["session_pnl"] == 0.0

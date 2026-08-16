@@ -123,6 +123,26 @@ STALE_TICKS_SKIPPED = Counter(
     "polly_stale_ticks_skipped_total",
     "arb_ticks skipped because their age exceeded MAX_TICK_AGE_S",
 )
+
+# ── NegRisk multi-outcome metrics ─────────────────────────────────────────────
+NEGRISK_GROUPS_TRACKED = Gauge(
+    "polly_negrisk_groups_tracked",
+    "NegRisk groups (negRiskMarketID) currently registered as multi-outcome feeds",
+)
+NEGRISK_SIGNALS_TOTAL = Counter(
+    "polly_negrisk_signals_total",
+    "NegRisk bundle signals that passed every detector gate",
+)
+NEGRISK_LEGS_SELECTED = Gauge(
+    "polly_negrisk_legs_selected",
+    "Legs kept in the most recent NegRisk signal after the probability floor "
+    "and top-K cut (arXiv:2508.03474 §5.1/§6.2)",
+)
+NEGRISK_RELATIVE_EDGE = Gauge(
+    "polly_negrisk_relative_edge",
+    "Profit-on-the-dollar (net_edge / payout) of the latest NegRisk signal",
+)
+
 REAL_EDGE_BPS = Gauge(
     "polly_real_edge_bps",
     "Real (pre-rebate) Dutch-book edge of the latest detected signal, in bps "
