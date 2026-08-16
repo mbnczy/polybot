@@ -168,6 +168,15 @@ class _MarketState:
             return False
 
     def _handle_price_change(self, asset_id: str, event: dict) -> bool:
+        # Prefer the best_ask the exchange states outright: it is correct on
+        # every kind of book move, including the best level being consumed
+        # (where a level delta alone would only tell us it disappeared).
+        explicit = _explicit_best_ask(event)
+        if explicit is not None:
+            changed = self._best_ask[asset_id] != explicit
+            self._best_ask[asset_id] = explicit
+            return changed
+
         side = event.get("side", "").upper()
         if side not in ("SELL", "ASK"):
             return False
@@ -246,6 +255,193 @@ class _MarketState:
         }
 
 
+class _NegRiskGroupState:
+    """
+    Best-ask state for ONE NegRisk group — the N mutually exclusive outcomes
+    that share a `negRiskMarketID`.
+
+    Only the NO token of each outcome is tracked: the bundle strategy buys NO on
+    every selected outcome, so the YES legs are dead weight on the socket (a
+    51-outcome group would otherwise cost 102 subscriptions instead of 51).
+
+    Ask *size* is captured alongside price because NegRiskArbDetector sizes the
+    bundle from the shallowest leg (arXiv:2508.03474 §6.2) — without depth the
+    bundle can be sized past what the book can fill, leaving legs unhedged.
+
+    Emitted tick::
+
+        { "type":             "neg_risk_tick",
+          "condition_id":     "<negRiskMarketID>",
+          "outcome_token_ids": [no_token, ...],   # only legs with a live ask
+          "no_asks":          [float, ...],
+          "no_ask_sizes":     [float, ...],
+          "tick_size":        float | None,
+          "n_group_outcomes": int,                # full group size
+          "ts":               float }             # time.monotonic()
+    """
+
+    # A group is only actionable once at least this many legs are quoted; a
+    # single quoted leg can never form a bundle.
+    MIN_QUOTED_LEGS = 2
+
+    def __init__(self, group_id: str, no_token_ids: list[str]) -> None:
+        self.group_id     = group_id
+        self.no_token_ids = list(no_token_ids)
+        self.token_ids    = list(no_token_ids)   # shard subscribes to these
+
+        now = time.monotonic()
+        self.created_monotonic   = now
+        self.last_tick_monotonic = now
+
+        self._best_ask:  dict[str, Optional[float]] = {t: None for t in no_token_ids}
+        self._ask_size:  dict[str, Optional[float]] = {t: None for t in no_token_ids}
+        self._tick_size: dict[str, Optional[float]] = {t: None for t in no_token_ids}
+        self._last_pushed: tuple = ()
+
+    def owns(self, asset_id: str) -> bool:
+        return asset_id in self._best_ask
+
+    def reset(self) -> None:
+        """Invalidate all legs (called on reconnect → await fresh snapshots)."""
+        for t in self.no_token_ids:
+            self._best_ask[t] = None
+            self._ask_size[t] = None
+        self._last_pushed = ()
+
+    def idle_seconds(self, now: Optional[float] = None) -> float:
+        ref = now if now is not None else time.monotonic()
+        return ref - self.last_tick_monotonic
+
+    # ── Event handling ─────────────────────────────────────────────────────────
+
+    def update_leg(self, asset_id: str, event: dict) -> bool:
+        """Update one outcome's best ask/size.  Returns True if it changed."""
+        if asset_id not in self._best_ask:
+            return False
+        event_type = event.get("event_type", "").lower()
+        if event_type == "price_change":
+            return self._handle_price_change(asset_id, event)
+        # "book" snapshots and any unknown shape carrying an asks ladder.
+        return self._handle_book(asset_id, event)
+
+    def _handle_book(self, asset_id: str, event: dict) -> bool:
+        _ts = event.get("tick_size", event.get("tickSize"))
+        if _ts is not None:
+            try:
+                self._tick_size[asset_id] = float(_ts)
+            except (TypeError, ValueError):
+                pass
+
+        asks = event.get("asks", [])
+        if not asks:
+            return False
+        try:
+            entry = asks[0]
+            if isinstance(entry, dict):
+                price = float(entry["price"])
+                size  = float(entry.get("size", 0.0) or 0.0)
+            else:
+                price, size = float(entry), 0.0
+            if price <= 0.0:
+                return False
+            changed = (
+                self._best_ask[asset_id] != price
+                or self._ask_size[asset_id] != size
+            )
+            self._best_ask[asset_id] = price
+            self._ask_size[asset_id] = size
+            return changed
+        except (KeyError, IndexError, TypeError, ValueError):
+            return False
+
+    def _handle_price_change(self, asset_id: str, event: dict) -> bool:
+        # Authoritative top-of-book from the exchange (see _explicit_best_ask).
+        explicit = _explicit_best_ask(event)
+        if explicit is not None:
+            if self._best_ask[asset_id] == explicit:
+                return False
+            self._best_ask[asset_id] = explicit
+            # The batched frame states the price but not the depth AT that
+            # price. None = "unknown", which the detector treats as uncapped —
+            # distinct from 0.0, which means the level is genuinely empty. The
+            # next `book` snapshot restores a real depth reading.
+            self._ask_size[asset_id] = None
+            return True
+
+        side = event.get("side", "").upper()
+        if side not in ("SELL", "ASK"):
+            return False
+        try:
+            price = float(event["price"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        try:
+            size = float(event.get("size", "1"))
+        except (TypeError, ValueError):
+            size = 1.0
+
+        if size <= 0.0:
+            # Level removed. Only invalidates the leg when it was *the* best ask;
+            # a deeper level being pulled says nothing about the top of book.
+            if self._best_ask[asset_id] == price:
+                self._best_ask[asset_id] = None
+                self._ask_size[asset_id] = None
+                return True
+            return False
+
+        current = self._best_ask[asset_id]
+        if current is None or price < current:
+            self._best_ask[asset_id] = price
+            self._ask_size[asset_id] = size
+            return True
+        if price == current and self._ask_size[asset_id] != size:
+            # Same price level, depth changed — matters for bundle sizing.
+            self._ask_size[asset_id] = size
+            return True
+        return False
+
+    def build_tick(self) -> Optional[dict]:
+        """
+        Return a `neg_risk_tick` covering every currently quoted leg, or None
+        when fewer than MIN_QUOTED_LEGS are quoted or nothing changed since the
+        last push.  Updates dedup/liveness state as a side effect.
+        """
+        token_ids: list[str]   = []
+        asks:      list[float] = []
+        sizes:     list[float | None] = []
+        for t in self.no_token_ids:
+            ask = self._best_ask.get(t)
+            if ask is None:
+                continue
+            token_ids.append(t)
+            asks.append(ask)
+            # None propagates as "depth unknown" — see _handle_price_change.
+            sizes.append(self._ask_size.get(t))
+
+        if len(token_ids) < self.MIN_QUOTED_LEGS:
+            return None
+
+        fingerprint = (tuple(token_ids), tuple(asks), tuple(sizes))
+        if fingerprint == self._last_pushed:
+            return None
+        self._last_pushed = fingerprint
+
+        now = time.monotonic()
+        self.last_tick_monotonic = now
+        _ticks = [v for v in self._tick_size.values() if v is not None]
+        return {
+            "type":              "neg_risk_tick",
+            "condition_id":      self.group_id,
+            "outcome_token_ids": token_ids,
+            "no_asks":           asks,
+            "no_ask_sizes":      sizes,
+            # Coarsest observed grid — valid on every member market.
+            "tick_size":         max(_ticks) if _ticks else None,
+            "n_group_outcomes":  len(self.no_token_ids),
+            "ts":                now,
+        }
+
+
 def _queue_push(queue: asyncio.Queue, tick: dict) -> None:
     """Enqueue a tick, evicting the oldest entry when the queue is full."""
     try:
@@ -259,8 +455,54 @@ def _queue_push(queue: asyncio.Queue, tick: dict) -> None:
         logger.debug("Queue full — oldest arb_tick evicted")
 
 
+def _expand_price_changes(event: dict) -> list[dict]:
+    """
+    Fan a batched `price_change` frame out into one event per asset.
+
+    Polymarket does NOT send the flat shape this module originally assumed
+    ({"event_type": "price_change", "asset_id": …, "price": …, "side": …}).
+    The live frame batches every affected asset into a `price_changes` array
+    and carries NO top-level asset_id:
+
+        {"market": "0x…",
+         "price_changes": [
+             {"asset_id": "…", "price": "0.5", "size": "2430", "side": "BUY",
+              "best_bid": "0.997", "best_ask": "0.998"}, …],
+         "timestamp": "…"}
+
+    Routing keys off asset_id, so an unexpanded frame resolves to "" and is
+    dropped outright — the feed then only ever updates from `book` snapshots
+    and goes minutes at a time without seeing a quote move.  Expanding here
+    keeps every downstream handler working on plain per-asset events.
+
+    Each entry also carries an authoritative `best_ask`, which beats inferring
+    the top of book from level deltas: when the best level is consumed, a delta
+    tells us only that it vanished, while `best_ask` names the new top.
+    """
+    changes = event.get("price_changes")
+    if not isinstance(changes, list):
+        return [event]
+    out: list[dict] = []
+    for ch in changes:
+        if not isinstance(ch, dict):
+            continue
+        asset_id = ch.get("asset_id") or ch.get("token_id") or ""
+        if not asset_id:
+            continue
+        out.append({
+            "event_type": "price_change",
+            "asset_id":   asset_id,
+            "price":      ch.get("price"),
+            "size":       ch.get("size"),
+            "side":       ch.get("side", ""),
+            "best_ask":   ch.get("best_ask"),
+            "best_bid":   ch.get("best_bid"),
+        })
+    return out
+
+
 def _parse_events(raw: str) -> list[dict]:
-    """Parse a raw WS text frame into a list of event dicts (or [] on error)."""
+    """Parse a raw WS text frame into a list of per-asset event dicts."""
     _parse_t0 = time.monotonic()
     try:
         data = _loads(raw)
@@ -269,7 +511,23 @@ def _parse_events(raw: str) -> list[dict]:
         return []
     WS_PARSE_SECONDS.observe(time.monotonic() - _parse_t0)
     events = data if isinstance(data, list) else [data]
-    return [e for e in events if isinstance(e, dict)]
+    out: list[dict] = []
+    for e in events:
+        if isinstance(e, dict):
+            out.extend(_expand_price_changes(e))
+    return out
+
+
+def _explicit_best_ask(event: dict) -> Optional[float]:
+    """Authoritative best ask carried on the event, when present and sane."""
+    raw = event.get("best_ask")
+    if raw is None:
+        return None
+    try:
+        price = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return price if 0.0 < price < 1.0 else None
 
 
 class MarketFeed:
@@ -418,8 +676,12 @@ class MarketShard:
         self._running       = False
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
 
-        self._states:  dict[str, _MarketState] = {}   # condition_id → state
-        self._routing: dict[str, _MarketState] = {}   # asset_id     → state
+        # condition_id (or negRiskMarketID) → _MarketState | _NegRiskGroupState
+        self._states:  dict[str, object] = {}
+        # asset_id → every state that wants this token's events.  A NO token can
+        # belong to BOTH a binary market and a NegRisk group, so routing is
+        # one-to-many; a plain dict would silently drop one of the two.
+        self._routing: dict[str, list] = {}
 
     # ── Membership ─────────────────────────────────────────────────────────────
 
@@ -433,25 +695,50 @@ class MarketShard:
     def contains(self, condition_id: str) -> bool:
         return condition_id in self._states
 
+    def _route(self, asset_id: str, state: object) -> None:
+        self._routing.setdefault(asset_id, []).append(state)
+
+    def _unroute(self, asset_id: str, state: object) -> None:
+        handlers = self._routing.get(asset_id)
+        if not handlers:
+            return
+        try:
+            handlers.remove(state)
+        except ValueError:
+            return
+        if not handlers:
+            self._routing.pop(asset_id, None)
+
     def add(self, condition_id: str, yes_token_id: str, no_token_id: str) -> None:
         """Add a market to this shard and (if connected) subscribe incrementally."""
         if condition_id in self._states:
             return
         st = _MarketState(condition_id, yes_token_id, no_token_id)
         self._states[condition_id] = st
-        self._routing[yes_token_id] = st
-        self._routing[no_token_id]  = st
+        self._route(yes_token_id, st)
+        self._route(no_token_id,  st)
         if self._ws is not None and not self._ws.closed:
             # Incremental subscribe on the live socket — no reconnect churn.
             asyncio.ensure_future(self._subscribe([yes_token_id, no_token_id]))
+
+    def add_neg_risk_group(self, group_id: str, no_token_ids: list[str]) -> None:
+        """Track a NegRisk group's NO legs on this shard."""
+        if group_id in self._states or len(no_token_ids) < 2:
+            return
+        st = _NegRiskGroupState(group_id, no_token_ids)
+        self._states[group_id] = st
+        for tid in no_token_ids:
+            self._route(tid, st)
+        if self._ws is not None and not self._ws.closed:
+            asyncio.ensure_future(self._subscribe(list(no_token_ids)))
 
     def remove(self, condition_id: str) -> None:
         """Stop tracking a market (its subscription is cleaned on next reconnect)."""
         st = self._states.pop(condition_id, None)
         if st is None:
             return
-        self._routing.pop(st.yes_token_id, None)
-        self._routing.pop(st.no_token_id, None)
+        for tid in st.token_ids:
+            self._unroute(tid, st)
 
     def idle_seconds(self, condition_id: str, now: Optional[float] = None) -> Optional[float]:
         st = self._states.get(condition_id)
@@ -531,14 +818,12 @@ class MarketShard:
             ))
 
     def _dispatch(self, raw: str) -> None:
-        changed: set[_MarketState] = set()
+        changed: list = []
         for event in _parse_events(raw):
             asset_id = event.get("asset_id") or event.get("token_id") or ""
-            st = self._routing.get(asset_id)
-            if st is None:
-                continue   # event for a market we no longer track
-            if st.update_leg(asset_id, event):
-                changed.add(st)
+            for st in self._routing.get(asset_id, ()):   # () = no longer tracked
+                if st.update_leg(asset_id, event) and st not in changed:
+                    changed.append(st)
         for st in changed:
             tick = st.build_tick()
             if tick is not None:

@@ -65,6 +65,7 @@ from core.ws_feed import MarketShard
 from strategy.arbitrage import _resolve_rebate
 from telemetry.metrics import (
     FEEDS_PRUNED,
+    NEGRISK_GROUPS_TRACKED,
     SCANNER_ADMITTED,
     SCANNER_CANDIDATES,
     SCANNER_FEEDS_FETCHED,
@@ -87,6 +88,17 @@ _MAX_SCAN_MARKETS: int = 8000
 
 # ── Scanner defaults ────────────────────────────────────────────────────────
 SCAN_INTERVAL: float = 300.0   # seconds between full market-list polls (5 min)
+
+# ── NegRisk group discovery ─────────────────────────────────────────────────
+# NO legs subscribed per NegRisk group.  arXiv:2508.03474 §5.1 reduces markets
+# to their top-4 conditions by traded volume ("over 90% of all liquidity in a
+# market resides in the top 4 conditions"); we subscribe to a slightly wider
+# slice so NegRiskArbDetector can re-rank on live prices instead of scan-time
+# volume, and still cut to its own top-K.  Live groups reach 51 outcomes, so an
+# unbounded slice would blow the socket budget on one event.
+NEGRISK_FEED_OUTCOMES: int = max(
+    2, int(os.environ.get("NEGRISK_FEED_OUTCOMES", "8"))
+)
 
 # ── WS multiplexing ──────────────────────────────────────────────────────────
 # Markets per multiplexed WebSocket shard connection. N markets → ceil(N/cap)
@@ -186,6 +198,49 @@ class FeedRegistry:
             logger.error(
                 "FeedRegistry | failed to add condition=%s: %s",
                 condition_id[:16], exc,
+            )
+            return False
+
+    async def add_neg_risk_group(
+        self,
+        group_id:     str,
+        no_token_ids: list[str],
+    ) -> bool:
+        """
+        Register a NegRisk group (the N mutually exclusive outcomes sharing a
+        `negRiskMarketID`) as a single tracked entity emitting neg_risk_tick.
+
+        The group occupies ONE registry slot but subscribes to N asset IDs, so a
+        shard's market count understates its subscription load — acceptable
+        because callers cap group size before registering (see
+        MarketScanner._register_neg_risk_groups).
+        """
+        if group_id in self._by_condition:
+            return True
+        if len(no_token_ids) < 2:
+            return False
+        if self._max_feeds and len(self._by_condition) >= self._max_feeds:
+            logger.debug(
+                "FeedRegistry | at cap (%d) — rejecting negrisk group=%s",
+                self._max_feeds, group_id[:16],
+            )
+            return False
+
+        try:
+            shard = self._shard_with_capacity()
+            shard.add_neg_risk_group(group_id, no_token_ids)
+            self._by_condition[group_id] = shard
+            logger.info(
+                "FeedRegistry | negrisk group added id=%s outcomes=%d "
+                "(entries=%d, shards=%d)",
+                group_id[:16], len(no_token_ids),
+                len(self._by_condition), len(self._shards),
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "FeedRegistry | failed to add negrisk group=%s: %s",
+                group_id[:16], exc,
             )
             return False
 
@@ -480,6 +535,8 @@ class MarketScanner:
         prune_idle_s:       float = 0.0,
         min_volume_24h:     float = 0.0,
         on_admit:           "Callable[[str, dict], None] | None" = None,
+        on_neg_risk_group:  "Callable[[str, list[str]], Awaitable[bool]] | None" = None,
+        negrisk_feed_outcomes: int = NEGRISK_FEED_OUTCOMES,
     ) -> None:
         self._on_market_added = on_market_added
         self._scan_interval   = scan_interval
@@ -498,6 +555,11 @@ class MarketScanner:
         # callers can pre-warm fee/rebate caches BEFORE the first tick arrives,
         # removing a network round-trip from the hot path. Synchronous + cheap.
         self._on_admit        = on_admit
+        # NegRisk group registration. None = NegRisk discovery disabled entirely
+        # (the bot then sees only the individual member markets as binaries).
+        self._on_neg_risk_group  = on_neg_risk_group
+        self._negrisk_feed_outcomes = max(2, negrisk_feed_outcomes)
+        self._known_groups: set[str] = set()
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public control
@@ -564,6 +626,14 @@ class MarketScanner:
 
         markets = await self._fetch_all_active()
         SCANNER_FEEDS_FETCHED.inc(len(markets))
+
+        # NegRisk groups are registered independently of the binary path: every
+        # member market ALSO stays a binary candidate, because single-condition
+        # arbitrage (YES+NO < $1 inside one outcome) is a separate strategy and
+        # the paper measures it as the second-largest realised profit pool
+        # ($10.6M of the $39.6M total).  Routing is one-to-many in MarketShard,
+        # so a NO token can feed both detectors.
+        await self._register_neg_risk_groups(markets)
 
         if self._max_feeds == 0:
             # ── original path (unchanged) ───────────────────────────────────
@@ -720,6 +790,64 @@ class MarketScanner:
                 new_count, len(self._known),
             )
 
+    async def _register_neg_risk_groups(self, markets: list[dict]) -> None:
+        """
+        Group the scanned universe by `negRiskMarketID` and register each group
+        as one NegRisk feed entity.
+
+        Outcome reduction (arXiv:2508.03474 §5.1)
+        ─────────────────────────────────────────
+        Live groups run to 51 outcomes, and subscribing to every leg of every
+        group would dominate the socket budget.  The paper reduces each market
+        "to 4 or fewer conditions with the most total traded volume", reporting
+        that "over 90% of all liquidity in a market resides in the top 4
+        conditions".  We keep the same ranking but track `negrisk_feed_outcomes`
+        legs (default 8) rather than 4, so the detector still has headroom to
+        apply its own probability filter and top-K cut at tick time on fresh
+        prices instead of stale scan-time volume.
+        """
+        if self._on_neg_risk_group is None:
+            return
+
+        groups: dict[str, list[dict]] = {}
+        for m in markets:
+            if not m.get("negRisk"):
+                continue
+            group_id = str(m.get("negRiskMarketID") or "").strip()
+            if not group_id or group_id in self._known_groups:
+                continue
+            if MarketScorer._is_expired(m):
+                continue
+            groups.setdefault(group_id, []).append(m)
+
+        for group_id, members in groups.items():
+            # Rank by traded volume, keep the top slice, resolve NO token IDs.
+            members.sort(key=_market_volume, reverse=True)
+            no_ids: list[str] = []
+            for m in members[:self._negrisk_feed_outcomes]:
+                _yes_id, no_id = _extract_token_ids(m)
+                if no_id:
+                    no_ids.append(no_id)
+
+            if len(no_ids) < 2:
+                logger.debug(
+                    "MarketScanner | negrisk group=%s skipped — %d parseable "
+                    "NO token(s)", group_id[:16], len(no_ids),
+                )
+                continue
+
+            result = await self._on_neg_risk_group(group_id, no_ids)
+            if result is False:
+                continue      # cap reached — stay eligible for a later scan
+            self._known_groups.add(group_id)
+            logger.info(
+                "MarketScanner | negrisk group condition=%s outcomes=%d/%d "
+                "(top by volume)",
+                group_id[:16], len(no_ids), len(members),
+            )
+
+        NEGRISK_GROUPS_TRACKED.set(len(self._known_groups))
+
     async def _fetch_all_active(self) -> list[dict]:
         """
         Page through the Gamma API and collect all active, non-closed,
@@ -812,6 +940,21 @@ class MarketScanner:
 # ═══════════════════════════════════════════════════════════════════════════
 # Helpers — Gamma API response parsing
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _market_volume(market: dict) -> float:
+    """24h traded volume, falling back to lifetime volume then 0.0."""
+    raw = (
+        market.get("volume24hr")
+        or market.get("volume_24h")
+        or market.get("volume")
+        or 0.0
+    )
+    try:
+        vol = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return vol if math.isfinite(vol) else 0.0
+
 
 def _is_binary(market: dict) -> bool:
     """Return True if market has exactly 2 non-empty, distinct CLOB token IDs."""

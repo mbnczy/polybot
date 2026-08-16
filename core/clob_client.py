@@ -1155,6 +1155,138 @@ class PolyClient:
         return yes_resp, no_resp
 
     # ──────────────────────────────────────────────────────────────────────────
+    # Public async API — N-leg NegRisk bundle via CLOB limit orders
+    # ──────────────────────────────────────────────────────────────────────────
+
+    async def execute_negrisk_clob_bundle(
+        self,
+        legs: list[BundleLeg],
+    ) -> list[dict]:
+        """
+        Submit an N-leg NegRisk bundle as N concurrent GTC limit orders.
+
+        This is the supported replacement for `execute_arb_maker_bundle`, whose
+        on-chain matchOrders path died with the April 2026 pUSD migration and
+        required exchange-operator registration even before that.  Ordinary CLOB
+        limit orders need no special wallet role.
+
+        What this method does NOT give you
+        ──────────────────────────────────
+        Atomicity.  matchOrders either minted the whole bundle or reverted; N
+        independent limit orders can fill in any subset.  A partly filled bundle
+        is NOT a smaller arbitrage — holding NO on M' of the M selected outcomes
+        guarantees only `M'−1` at expiry against a cost of `Σ no_bid`, which goes
+        negative as M' shrinks.  arXiv:2508.03474 §6 names this directly: "since
+        placing multiple orders in an order book is non-atomic (only a subset of
+        the attempts may succeed), there is some inherent risk to attempting
+        arbitrage."
+
+        The caller MUST therefore hand every response to NegRiskBundleGuard
+        (execution/negrisk_guard.py), which cancels the stragglers and unwinds
+        whatever filled if the bundle does not complete inside its timeout.
+
+        `leg.bid` values must already be clamped below their best asks by
+        NegRiskArbDetector; this method trusts them as valid post-only bids.
+
+        Returns one response dict per leg, in the order given.  A leg whose
+        submission raised is normalised to {"status": "error", ...} rather than
+        aborting the batch — a surviving sibling that reached the book must stay
+        visible to the guard, never be orphaned.
+        """
+        if not legs:
+            raise ValueError("execute_negrisk_clob_bundle: legs list is empty")
+
+        bundle_cost = sum(leg.bid for leg in legs)          # cost of 1 bundle
+        payout      = float(len(legs) - 1)                  # NegRisk floor payout
+        if bundle_cost >= payout:
+            raise ClobApiError(
+                0,
+                f"bundle cost {bundle_cost:.6f} USDC ≥ payout {payout:.1f} USDC "
+                f"({len(legs)} legs) — not profitable; refusing to submit",
+            )
+
+        total_cost = sum(leg.bid * leg.size for leg in legs)
+        if total_cost > _MAX_BUNDLE_USDC:
+            raise ClobApiError(
+                0,
+                f"Bundle cost {total_cost:.4f} USDC exceeds "
+                f"${_MAX_BUNDLE_USDC:.0f} cap ({len(legs)} legs)",
+            )
+
+        if _PAPER_TRADE:
+            logger.info(
+                "PAPER NEGRISK CLOB BUNDLE | %d legs | total_cost=%.4f USDC "
+                "payout=%.1f",
+                len(legs), total_cost, payout,
+            )
+            responses: list[dict] = []
+            for i, leg in enumerate(legs):
+                responses.append({
+                    "status":   "paper",
+                    "order_id": f"paper-negrisk-{i}-{uuid.uuid4()}",
+                    "token_id": leg.token_id,
+                    "side":     "BUY",
+                    "price":    leg.bid,
+                    "size":     leg.size,
+                    "maker":    True,
+                    "leg_idx":  i,
+                })
+                logger.info(
+                    "  leg[%d] token=%s bid=%.4f size=%.2f",
+                    i, leg.token_id[:12], leg.bid, leg.size,
+                )
+            return responses
+
+        # ── Concurrent ECDSA signing ──────────────────────────────────────────
+        signed = await asyncio.gather(*(
+            self._run_with_retry(
+                self._create_limit,
+                token_id=leg.token_id, price=leg.bid, size=leg.size, side="BUY",
+            )
+            for leg in legs
+        ), return_exceptions=True)
+
+        # ── Concurrent submission ─────────────────────────────────────────────
+        # Legs that failed to sign never reach the book; submit only the rest,
+        # then stitch the results back into leg order.
+        submit_idx = [i for i, s in enumerate(signed)
+                      if not isinstance(s, BaseException)]
+        posted = await asyncio.gather(*(
+            self._run_with_retry(self._post, signed[i]) for i in submit_idx
+        ), return_exceptions=True)
+
+        results: list[dict] = [
+            {"status": "error", "error": str(s)}
+            for s in signed
+        ]
+        for slot, resp in zip(submit_idx, posted):
+            if isinstance(resp, BaseException):
+                logger.error(
+                    "NegRisk leg[%d] token=%s submission FAILED (siblings may "
+                    "have reached the book — guard takes over): %s",
+                    slot, legs[slot].token_id[:12], resp,
+                )
+                results[slot] = {"status": "error", "error": str(resp)}
+            else:
+                results[slot] = resp
+
+        for i, (leg, resp) in enumerate(zip(legs, results)):
+            resp.setdefault("token_id", leg.token_id)
+            resp.setdefault("price", leg.bid)
+            resp.setdefault("size", leg.size)
+            resp["leg_idx"] = i
+
+        ok = sum(1 for r in results if str(r.get("status", "")).lower() != "error")
+        logger.info(
+            "NEGRISK CLOB BUNDLE placed | %d/%d legs accepted | "
+            "total_cost=%.4f USDC payout=%.1f",
+            ok, len(legs), total_cost, payout,
+        )
+        if ok == 0:
+            raise ClobApiError(0, "every NegRisk leg failed to submit")
+        return results
+
+    # ──────────────────────────────────────────────────────────────────────────
     # Internal helpers — CTF Exchange V2 on-chain matchOrders
     # ──────────────────────────────────────────────────────────────────────────
 

@@ -57,8 +57,13 @@ Environment variables
   PAPER_TRADE_MODE        "true" → simulate orders locally
   REDEEM_POLL_INTERVAL    seconds between redemption scans (default 300)
   SCAN_INTERVAL           seconds between Gamma API market scans (default 300)
-  NEGRISK_EXEC_MODE       "off" (detect+alert only, default) | "onchain"
-                          (matchOrders — registered operator wallets only)
+  NEGRISK_ENABLED         discover + feed NegRisk groups (default true)
+  NEGRISK_EXEC_MODE       "off" (detect+alert only, default) | "clob"
+                          (N post-only limit orders + NegRiskBundleGuard) |
+                          "onchain" (legacy matchOrders — obsolete, raises)
+  NEGRISK_MIN_OUTCOME_PROB / NEGRISK_MAX_LEGS / NEGRISK_MIN_RELATIVE_EDGE
+                          detector heuristics from arXiv:2508.03474; see
+                          .env.example for the derivation of each default
   TELEGRAM_HEARTBEAT_S    seconds between Telegram health pings
                           (default 3600 = hourly; 0 = disabled)
 
@@ -97,6 +102,7 @@ from core.clob_client import PolyClient, classify_fills            # noqa: E402
 from core.scanner import FeedRegistry, MarketScanner               # noqa: E402
 from execution.auto_redeem import AutoRedeemer                     # noqa: E402
 from execution.inventory_manager import InventoryManager           # noqa: E402
+from execution.negrisk_guard import NegRiskBundleGuard             # noqa: E402
 from execution.pair_guard import MakerPairGuard                    # noqa: E402
 from risk.circuit_breaker import (                                 # noqa: E402
     ArbOrderIntent,
@@ -125,6 +131,9 @@ from telemetry.metrics import (                                    # noqa: E402
     ARB_UNWIND_FAILURES,
     CUMULATIVE_PNL,
     EVAL_LATENCY,
+    NEGRISK_LEGS_SELECTED,
+    NEGRISK_RELATIVE_EDGE,
+    NEGRISK_SIGNALS_TOTAL,
     REAL_EDGE_BPS,
     STALE_TICKS_SKIPPED,
     TICK_TO_ACK_SECONDS,
@@ -174,6 +183,11 @@ _arb_duration_min_s = _cfg.arb_duration_min_s
 # NegRisk execution mode — "off" (detect+alert only, default) or "onchain"
 # (matchOrders; requires the wallet to be a registered CTF Exchange operator).
 _negrisk_exec_mode = _cfg.negrisk_exec_mode
+# NegRisk group discovery + detector heuristics (arXiv:2508.03474).
+_negrisk_enabled           = _cfg.negrisk_enabled
+_negrisk_min_outcome_prob  = _cfg.negrisk_min_outcome_prob
+_negrisk_max_legs          = _cfg.negrisk_max_legs
+_negrisk_min_relative_edge = _cfg.negrisk_min_relative_edge
 # Maker (Dutch Book) arb path toggle. Default on. Set MAKER_ARB_ENABLED=false
 # to disable resting-bid maker orders (one-leg risk) and trade taker-only.
 _maker_arb_enabled = os.environ.get("MAKER_ARB_ENABLED", "true").strip().lower() != "false"
@@ -215,6 +229,7 @@ async def strategy_loop(
     sig_logger:     SignalLogger,
     inventory:      "InventoryManager | None" = None,
     pair_guard:     "MakerPairGuard | None" = None,
+    negrisk_guard:  "NegRiskBundleGuard | None" = None,
 ) -> None:
     """
     Consumes arb_tick / neg_risk_tick snapshots from ALL active market feeds.
@@ -223,8 +238,11 @@ async def strategy_loop(
       1. Taker arb — FeeEngine → ArbDetector → FOK execution
       2. Maker arb fallback — MakerRebateEngine → DutchBookPricer → GTC execution
 
-    neg_risk_tick path (multi-outcome NegRisk market):
-      MakerRebateEngine → NegRiskArbDetector → matchOrders bundle execution
+    neg_risk_tick path (multi-outcome NegRisk group):
+      MakerRebateEngine → NegRiskArbDetector → (NEGRISK_EXEC_MODE)
+        off     → Telegram alert only
+        clob    → N post-only limit orders + NegRiskBundleGuard
+        onchain → legacy matchOrders bundle (obsolete; raises on the live path)
     """
     logger.info("strategy_loop started")
 
@@ -398,9 +416,9 @@ async def strategy_loop(
                 outcome_token_ids: list[str]   = tick["outcome_token_ids"]
                 no_asks:           list[float]  = tick["no_asks"]
 
-                WS_LATENCY_MS.set(
-                    (asyncio.get_event_loop().time() - tick.get("ts", 0)) * 1000
-                )
+                # ws_feed stamps tick["ts"] with time.monotonic(); compare on
+                # the SAME clock (NOT loop.time(), which differs under uvloop).
+                WS_LATENCY_MS.set((time.monotonic() - tick["ts"]) * 1000)
 
                 rebate = rebate_engine.peek_maker_rebate(condition_id)
                 if rebate is None:
@@ -411,20 +429,24 @@ async def strategy_loop(
                     no_asks=no_asks,
                     max_position_usdc=MAX_ARB_PAIR_USDC,
                     maker_rebate=rebate,
+                    tick_size=tick.get("tick_size"),
+                    no_ask_sizes=tick.get("no_ask_sizes"),
                 )
                 if nr_signal is None:
                     continue
 
-                if _negrisk_exec_mode != "onchain":
-                    # Detect-and-alert only: matchOrders would revert for a
-                    # non-operator wallet, so we surface the opportunity on
-                    # Telegram (throttled) without submitting anything.
+                NEGRISK_SIGNALS_TOTAL.inc()
+                NEGRISK_LEGS_SELECTED.set(nr_signal.n_outcomes)
+                NEGRISK_RELATIVE_EDGE.set(nr_signal.relative_edge)
+
+                if _negrisk_exec_mode == "off":
+                    # Detect-and-alert only: surface the opportunity on Telegram
+                    # (throttled) without submitting anything.
                     logger.info(
-                        "NEG RISK signal (exec %s) | condition=%s outcomes=%d "
+                        "NEG RISK signal (exec off) | condition=%s legs=%d "
                         "combined_bid=%.4f relative_edge=%.4f — not executed",
-                        _negrisk_exec_mode, condition_id[:16],
-                        nr_signal.n_outcomes, nr_signal.combined_bid,
-                        nr_signal.relative_edge,
+                        condition_id[:16], nr_signal.n_outcomes,
+                        nr_signal.combined_bid, nr_signal.relative_edge,
                     )
                     notifier.send_arb_detected(
                         condition_id=condition_id,
@@ -437,6 +459,15 @@ async def strategy_loop(
                             if len(nr_signal.legs) > 1 else 0.0
                         ),
                         category=f"negrisk×{nr_signal.n_outcomes} (exec off)",
+                    )
+                    continue
+
+                # One live bundle per group: a second entry while the first is
+                # still resting would pyramid unhedged multi-leg exposure.
+                if negrisk_guard is not None and negrisk_guard.is_watching(condition_id):
+                    logger.debug(
+                        "NegRisk signal on busy group %s — skipping",
+                        condition_id[:16],
                     )
                     continue
 
@@ -461,6 +492,38 @@ async def strategy_loop(
                     BundleLeg(token_id=leg.token_id, bid=leg.no_bid, size=leg.size)
                     for leg in nr_signal.legs
                 ]
+
+                if _negrisk_exec_mode == "clob":
+                    # N independent post-only limit orders. They are NOT atomic,
+                    # so the guard owns the breaker reservation from here and
+                    # unwinds anything that fills without the rest of the bundle.
+                    breaker.on_arb_open()
+                    try:
+                        responses = await client.execute_negrisk_clob_bundle(
+                            bundle_legs
+                        )
+                    except CircuitBreakerTripped:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        breaker.release_open()
+                        logger.error("NegRisk CLOB bundle submission failed: %s", exc)
+                        await notifier.notify(f"NEG RISK SUBMIT ERROR: {exc}")
+                        continue
+
+                    if negrisk_guard is not None:
+                        negrisk_guard.watch_bundle(nr_signal, responses)
+                    else:
+                        # No guard wired — nothing can resolve resting legs, so
+                        # do not hold the reservation open forever.
+                        logger.error(
+                            "NegRisk bundle submitted with NO guard on %s — "
+                            "releasing reservation; resting legs are unmanaged",
+                            condition_id[:16],
+                        )
+                        breaker.release_open()
+                    continue
+
+                # ── legacy onchain matchOrders bundle ─────────────────────────
                 try:
                     await client.execute_arb_maker_bundle(bundle_legs)
 
@@ -783,10 +846,17 @@ async def main() -> None:
     )
     if _negrisk_exec_mode == "onchain":
         logger.warning(
-            "NEGRISK_EXEC_MODE=onchain — matchOrders requires the wallet to be "
-            "a REGISTERED CTF Exchange V2 operator; a normal user wallet will "
-            "revert every NegRisk bundle."
+            "NEGRISK_EXEC_MODE=onchain — the matchOrders bundle path is OBSOLETE "
+            "since the April 2026 pUSD migration (and operator-only before it); "
+            "every live bundle will raise. Use NEGRISK_EXEC_MODE=clob."
         )
+    logger.info(
+        "NegRisk | discovery=%s exec=%s | min_outcome_prob=%.3f max_legs=%d "
+        "min_relative_edge=%.4f",
+        "ENABLED" if _negrisk_enabled else "DISABLED",
+        _negrisk_exec_mode, _negrisk_min_outcome_prob, _negrisk_max_legs,
+        _negrisk_min_relative_edge,
+    )
     logger.info(
         "Maker arb path: %s | extreme band [%.2f, %.2f] | min_real_edge=%.4f",
         "ENABLED" if _maker_arb_enabled else "DISABLED (taker-only)",
@@ -811,7 +881,13 @@ async def main() -> None:
                          extreme_hi=_extreme_hi,
                          min_real_edge=_min_real_edge,
                      )
-    neg_risk_det   = NegRiskArbDetector(desired_net_margin=_desired_margin)
+    neg_risk_det   = NegRiskArbDetector(
+                         desired_net_margin=_desired_margin,
+                         min_outcome_prob=_negrisk_min_outcome_prob,
+                         max_legs=_negrisk_max_legs,
+                         min_relative_edge=_negrisk_min_relative_edge,
+                         extreme_hi=_extreme_hi,
+                     )
 
     # ── signal logger (async WAL-mode SQLite, zero hot-path latency) ──────
     sig_logger = SignalLogger()
@@ -862,6 +938,9 @@ async def main() -> None:
         prune_idle_s=_prune_idle_s,
         min_volume_24h=_min_volume_24h,
         on_admit=_prewarm_caches,
+        on_neg_risk_group=(
+            feed_registry.add_neg_risk_group if _negrisk_enabled else None
+        ),
     )
 
     # ── auto redeemer ─────────────────────────────────────────────────────
@@ -880,6 +959,15 @@ async def main() -> None:
     #    If the market moves and only one leg fills, the guard cancels the
     #    stale order and hedges/unwinds the naked leg within HEDGE_TIMEOUT_S.
     pair_guard = MakerPairGuard(client, breaker, notifier, inventory=inventory)
+
+    # ── negrisk bundle guard: partial-fill protection for the N-leg CLOB path.
+    #    N limit orders are not atomic, and a partly-filled NegRisk bundle is a
+    #    directional bet rather than a smaller arb, so the guard cancels the
+    #    stragglers and unwinds whatever filled. Only needed when executing.
+    negrisk_guard = (
+        NegRiskBundleGuard(client, breaker, notifier)
+        if _negrisk_exec_mode == "clob" else None
+    )
 
     await notifier.notify(
         f"Polymarket ARB Bot v7 online\n"
@@ -931,12 +1019,15 @@ async def main() -> None:
                 fee_engine, breaker, client, notifier, sig_logger,
                 inventory=inventory,
                 pair_guard=pair_guard,
+                negrisk_guard=negrisk_guard,
             ),
             name="strategy",
         ),
         asyncio.create_task(auto_redeem_loop(redeemer),                        name="auto_redeem"),
         asyncio.create_task(inventory.run(),                                   name="inventory"),
         asyncio.create_task(pair_guard.run(),                                  name="pair_guard"),
+        *([asyncio.create_task(negrisk_guard.run(), name="negrisk_guard")]
+          if negrisk_guard is not None else []),
         asyncio.create_task(heartbeat_loop(breaker, notifier, feed_registry),  name="heartbeat"),
         asyncio.create_task(telegram_loop(notifier),                           name="telegram"),
         asyncio.create_task(sig_logger.run(),                                  name="sig_logger"),

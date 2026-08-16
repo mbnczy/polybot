@@ -186,6 +186,42 @@ EXTREME_PRICE_HI: float = 0.95   # skip if yes_ask or no_ask > this (≈ resolve
 # upside, not the sole justification.
 MIN_REAL_EDGE: float = 0.0
 
+# ── NegRisk selection heuristics ─────────────────────────────────────────────
+# Empirical defaults from Saguillo, Ghafouri, Kiffer & Suarez-Tangil,
+# "Unravelling the Probabilistic Forest: Arbitrage in Prediction Markets"
+# (arXiv:2508.03474), which measured a year of Polymarket order-book history.
+#
+# Why each one matters for the buy-NO-on-every-outcome bundle:
+#
+#   NEGRISK_MIN_OUTCOME_PROB — §6.2 sizes bundles from "the minimum volume
+#     across all conditions that have a probability more than 2%".  Dropping a
+#     near-zero-probability outcome is *risk-free* here (see the subset lemma in
+#     evaluate_neg_risk) but frees ~$1 of capital per dropped leg, because a
+#     3%-probability outcome sells NO at ~$0.97 while contributing only ~$0.03
+#     of edge.  Pure capital-efficiency win.
+#
+#   NEGRISK_MAX_LEGS — §5.1 reduces every market to its top-4 conditions,
+#     showing "over 90% of all liquidity in a market resides in the top 4
+#     conditions".  It also bounds the paper's own caveat that "placing multiple
+#     orders in an order book is non-atomic (only a subset of the attempts may
+#     succeed)": leg count is exactly the number of ways a bundle can go
+#     half-filled, and live NegRisk groups run to 51 outcomes.
+#
+#   NEGRISK_MIN_RELATIVE_EDGE — §6 restricts the study "to opportunities with a
+#     profit of at least $0.05 on the dollar to focus on the higher-reward
+#     opportunities given the risk".  Their profit-on-the-dollar is
+#     net_edge / payout, i.e. exactly our `relative_edge`.  This is a NegRisk-
+#     only floor and deliberately 10× the binary DESIRED_NET_MARGIN — the
+#     binary path is atomic per pair, an N-leg bundle is not.
+#
+#   NEGRISK_MIN_LEG_SHARES — not from the paper: Polymarket's Gamma metadata
+#     reports orderMinSize = 5 on live NegRisk outcomes, so a bundle sized below
+#     5 shares has every leg rejected at submission.
+NEGRISK_MIN_OUTCOME_PROB:  float = 0.02   # paper §6.2 — ignore <2 % outcomes
+NEGRISK_MAX_LEGS:          int   = 4      # paper §5.1 — top-4 hold >90 % liquidity
+NEGRISK_MIN_RELATIVE_EDGE: float = 0.05   # paper §6   — $0.05 on the dollar
+NEGRISK_MIN_LEG_SHARES:    float = 5.0    # Gamma orderMinSize on live markets
+
 
 def _within_quality_band(
     yes_ask: float,
@@ -920,18 +956,25 @@ class NegRiskArbDetector:
     of every mutually exclusive outcome.  At expiry N−1 of the N NO tokens pay
     $1, guaranteeing a positive return when the bundle cost is low enough.
 
-    NegRisk formula (per bundle of 1 NO share per outcome):
+    NegRisk formula (per bundle of 1 NO share per SELECTED outcome):
     ─────────────────────────────────────────────────────────
         no_bid_i      = no_ask_i − TICK_SIZE
-        combined_bid  = Σ no_bid_i
-        payout        = N − 1
+        combined_bid  = Σ no_bid_i          over the M selected outcomes
+        payout        = M − 1
         effective_cost = combined_bid × (1 − maker_rebate)
         net_edge      = payout − effective_cost
         relative_edge = net_edge / payout       ← normalised; directly comparable
                                                    to DESIRED_NET_MARGIN (binary)
 
     Signal condition:
-        relative_edge > DESIRED_NET_MARGIN
+        relative_edge > DESIRED_NET_MARGIN  AND  relative_edge ≥ min_relative_edge
+
+    Outcome selection (arXiv:2508.03474 heuristics)
+    ───────────────────────────────────────────────
+    M is a *subset* of the group's N outcomes: outcomes below
+    `min_outcome_prob` are dropped and at most `max_legs` are kept, ranked by
+    implied probability.  See evaluate_neg_risk for why subsetting preserves the
+    profit guarantee.
 
     Usage::
 
@@ -958,13 +1001,36 @@ class NegRiskArbDetector:
         self,
         desired_net_margin:  float = DESIRED_NET_MARGIN,
         default_rebate_rate: float = DEFAULT_MAKER_REBATE,
+        *,
+        min_outcome_prob:    float = NEGRISK_MIN_OUTCOME_PROB,
+        max_legs:            int   = NEGRISK_MAX_LEGS,
+        min_relative_edge:   float = NEGRISK_MIN_RELATIVE_EDGE,
+        min_leg_shares:      float = NEGRISK_MIN_LEG_SHARES,
+        extreme_hi:          float = EXTREME_PRICE_HI,
     ) -> None:
         if not (0.0 < desired_net_margin < 1.0):
             raise ValueError(
                 f"desired_net_margin must be in (0, 1); got {desired_net_margin}"
             )
-        self._net_margin     = desired_net_margin
-        self._default_rebate = max(0.0, min(default_rebate_rate, MAX_MAKER_REBATE))
+        if not (0.0 <= min_outcome_prob < 1.0):
+            raise ValueError(
+                f"min_outcome_prob must be in [0, 1); got {min_outcome_prob}"
+            )
+        if max_legs < 2:
+            raise ValueError(f"max_legs must be ≥ 2; got {max_legs}")
+        if not (0.0 <= min_relative_edge < 1.0):
+            raise ValueError(
+                f"min_relative_edge must be in [0, 1); got {min_relative_edge}"
+            )
+        if min_leg_shares < 0.0:
+            raise ValueError(f"min_leg_shares must be ≥ 0; got {min_leg_shares}")
+        self._net_margin       = desired_net_margin
+        self._default_rebate   = max(0.0, min(default_rebate_rate, MAX_MAKER_REBATE))
+        self._min_outcome_prob = min_outcome_prob
+        self._max_legs         = max_legs
+        self._min_rel_edge     = min_relative_edge
+        self._min_leg_shares   = min_leg_shares
+        self._extreme_hi       = extreme_hi
 
     def evaluate_neg_risk(
         self,
@@ -974,23 +1040,45 @@ class NegRiskArbDetector:
         max_position_usdc:  float = 50.0,
         maker_rebate:       float | None = None,
         tick_size:          float | None = None,
+        no_ask_sizes:       list[float] | None = None,
     ) -> Optional[NegRiskSignal]:
         """
-        Evaluate whether buying NO on all N outcomes yields a NegRisk edge.
+        Evaluate whether buying NO on a subset of the group's outcomes pays.
+
+        Subset lemma (why dropping outcomes is safe)
+        ────────────────────────────────────────────
+        Take any M outcomes out of a mutually exclusive set and hold one NO
+        share on each.  At most one outcome in the whole group resolves YES, so:
+
+          • the winner is one of our M  → the other M−1 NO shares pay $1 → M−1
+          • the winner is outside our M → all M NO shares pay $1        → M
+
+        The floor is M−1 either way, so `payout = M − 1` stays a hard guarantee
+        for *any* subset.  Exhaustiveness is not required — only mutual
+        exclusivity, which the NegRisk contract enforces by construction.  That
+        is what makes the paper's <2 % filter a free capital saving rather than
+        a risk trade: an outcome priced at 1 % costs ~$0.99 of NO and removes
+        only $0.01 from `Σ implied_yes`, the quantity the edge is made of.
 
         Parameters
         ----------
-        condition_id      : Polymarket condition ID (used for logging).
+        condition_id      : NegRisk group ID (negRiskMarketID); used for logging.
         outcome_token_ids : NO token IDs — one per outcome, same order as no_asks.
         no_asks           : Current best NO asks from the WS feed.
-        max_position_usdc : Hard capital ceiling (default $50; enforced again by
-                            execute_arb_maker_bundle).
+        max_position_usdc : Hard capital ceiling (default $50).
         maker_rebate      : Pre-fetched rate from MakerRebateEngine.  Pass None
                             to use the conservative default.
+        tick_size         : Market tick grid for the synthetic post-only bids.
+        no_ask_sizes      : Displayed ask depth (shares) per outcome, same order
+                            as `no_asks`.  When given, the bundle is capped at
+                            the *minimum* depth across the selected legs — the
+                            paper's §6.2 sizing rule — so no leg is sized beyond
+                            what the book can actually fill.  None → capital-only
+                            sizing (legacy behaviour).
 
         Returns
         -------
-        NegRiskSignal if relative_edge > DESIRED_NET_MARGIN, else None.
+        NegRiskSignal when every gate passes, else None.
         """
         n = len(outcome_token_ids)
 
@@ -1002,33 +1090,95 @@ class NegRiskArbDetector:
             )
             return None
 
+        if no_ask_sizes is not None and len(no_ask_sizes) != n:
+            logger.error(
+                "NegRiskArbDetector | no_ask_sizes length %d ≠ outcomes %d",
+                len(no_ask_sizes), n,
+            )
+            return None
+
         if n < 2:
             logger.debug(
                 "NegRiskArbDetector | need ≥ 2 outcomes; got %d — skip", n
             )
             return None
 
-        # ── 2. Validate all ask prices ────────────────────────────────────────
-        for i, ask in enumerate(no_asks):
+        # ── 2. Candidate legs — drop unusable quotes ──────────────────────────
+        # A malformed/absent quote only costs us that outcome's contribution to
+        # the edge (subset lemma), so drop the leg instead of the whole group.
+        candidates: list[tuple[str, float, float, float]] = []   # id, ask, prob, depth
+        for i, (token_id, ask) in enumerate(zip(outcome_token_ids, no_asks)):
             if not (0.01 <= ask <= 0.99):
                 logger.debug(
-                    "NegRiskArbDetector | outcome %d invalid no_ask=%.4f — skip",
+                    "NegRiskArbDetector | outcome %d invalid no_ask=%.4f — drop leg",
                     i, ask,
                 )
-                return None
+                continue
+            # None = depth unknown (a batched price_change states the price but
+            # not the size at it) → uncapped, the guard absorbs a short fill.
+            # 0 = the level is genuinely empty → the leg is unfillable, drop it.
+            raw_depth = no_ask_sizes[i] if no_ask_sizes is not None else None
+            if raw_depth is None:
+                depth = math.inf
+            else:
+                depth = float(raw_depth)
+                if depth <= 0.0:
+                    logger.debug(
+                        "NegRiskArbDetector | outcome %d has no ask depth — drop leg",
+                        i,
+                    )
+                    continue
+            candidates.append((token_id, ask, 1.0 - ask, depth))
 
-        # ── 3. Synthetic post-only NO bids ────────────────────────────────────
-        no_bids = [snap_post_only_bid(ask, tick_size) for ask in no_asks]
+        if len(candidates) < 2:
+            return None
 
-        # ── 4. Resolve maker rebate ───────────────────────────────────────────
+        # ── 3. Near-resolved guard (paper §6) ─────────────────────────────────
+        # The study only looks at times when no position is worth more than
+        # $0.95, i.e. the group is still genuinely contested.  An implied YES
+        # above the band means the group is decided and the remaining "edge" is
+        # rebate noise on a book nobody fills.
+        top_prob = max(c[2] for c in candidates)
+        if top_prob > self._extreme_hi:
+            logger.debug(
+                "NegRiskArbDetector | condition=%s top outcome implied %.4f > %.2f "
+                "— group effectively resolved, skip",
+                condition_id[:16], top_prob, self._extreme_hi,
+            )
+            return None
+
+        # ── 4. Outcome selection (paper §6.2 + §5.1) ──────────────────────────
+        selected = [c for c in candidates if c[2] >= self._min_outcome_prob]
+        dropped_lowprob = len(candidates) - len(selected)
+        if len(selected) < 2:
+            logger.debug(
+                "NegRiskArbDetector | condition=%s only %d outcome(s) above the "
+                "%.0f%% probability floor — skip",
+                condition_id[:16], len(selected), self._min_outcome_prob * 100,
+            )
+            return None
+
+        selected.sort(key=lambda c: c[2], reverse=True)
+        dropped_tail = max(0, len(selected) - self._max_legs)
+        selected = selected[:self._max_legs]
+
+        m = len(selected)
+        sel_ids   = [c[0] for c in selected]
+        sel_asks  = [c[1] for c in selected]
+        sel_depth = [c[3] for c in selected]
+
+        # ── 5. Synthetic post-only NO bids ────────────────────────────────────
+        no_bids = [snap_post_only_bid(ask, tick_size) for ask in sel_asks]
+
+        # ── 6. Resolve maker rebate ───────────────────────────────────────────
         rebate = (
             max(0.0, min(maker_rebate, MAX_MAKER_REBATE))
             if maker_rebate is not None
             else self._default_rebate
         )
 
-        # ── 5. NegRisk math ───────────────────────────────────────────────────
-        payout         = float(n - 1)
+        # ── 7. NegRisk math over the SELECTED subset ──────────────────────────
+        payout         = float(m - 1)
         combined_bid   = sum(no_bids)
         effective_cost = combined_bid * (1.0 - rebate)
         net_edge       = round(payout - effective_cost, 6)
@@ -1036,30 +1186,44 @@ class NegRiskArbDetector:
 
         if relative_edge <= self._net_margin:
             logger.debug(
-                "NegRiskArbDetector | no edge — outcomes=%d combined=%.6f "
+                "NegRiskArbDetector | no edge — legs=%d/%d combined=%.6f "
                 "payout=%.1f rebate=%.4f(%.2f%%) effective=%.6f "
                 "relative_edge=%.6f < margin=%.4f",
-                n, combined_bid, payout, rebate, rebate * 100,
+                m, n, combined_bid, payout, rebate, rebate * 100,
                 effective_cost, relative_edge, self._net_margin,
             )
             return None
 
-        # ── 6. Size within capital ceiling ────────────────────────────────────
+        # Paper §6: only opportunities worth ≥ $0.05 on the dollar are worth the
+        # non-atomic multi-leg risk.
+        if relative_edge < self._min_rel_edge:
+            logger.debug(
+                "NegRiskArbDetector | condition=%s relative_edge=%.6f below the "
+                "%.4f on-the-dollar floor — skip",
+                condition_id[:16], relative_edge, self._min_rel_edge,
+            )
+            return None
+
+        # ── 8. Size: capital ceiling ∧ shallowest leg (paper §6.2) ────────────
         if combined_bid <= 0.0:
             return None
 
         raw_bundles = max_position_usdc / combined_bid
+        depth_cap   = min(sel_depth)          # inf when no depth was supplied
+        raw_bundles = min(raw_bundles, depth_cap)
         n_bundles   = math.floor(raw_bundles * 100) / 100.0
 
-        if n_bundles < 0.01:
-            logger.warning(
-                "NegRiskArbDetector | n_bundles %.4f below minimum "
-                "(combined_bid=%.4f cap=%.2f)",
-                n_bundles, combined_bid, max_position_usdc,
+        if n_bundles < self._min_leg_shares:
+            logger.debug(
+                "NegRiskArbDetector | condition=%s n_bundles %.2f below the "
+                "%.2f-share exchange minimum (combined_bid=%.4f cap=%.2f "
+                "depth_cap=%.2f) — skip",
+                condition_id[:16], n_bundles, self._min_leg_shares,
+                combined_bid, max_position_usdc, depth_cap,
             )
             return None
 
-        # ── 7. Build per-outcome leg tuple ────────────────────────────────────
+        # ── 9. Build per-outcome leg tuple ────────────────────────────────────
         legs = tuple(
             ArbLeg(
                 token_id=token_id,
@@ -1067,13 +1231,13 @@ class NegRiskArbDetector:
                 no_bid=bid,
                 size=n_bundles,
             )
-            for token_id, ask, bid in zip(outcome_token_ids, no_asks, no_bids)
+            for token_id, ask, bid in zip(sel_ids, sel_asks, no_bids)
         )
 
         spread_bps = round(relative_edge * 10_000, 1)
         signal = NegRiskSignal(
             condition_id=condition_id,
-            n_outcomes=n,
+            n_outcomes=m,
             legs=legs,
             combined_bid=round(combined_bid, 6),
             payout=payout,
@@ -1085,10 +1249,13 @@ class NegRiskArbDetector:
         )
 
         logger.info(
-            "NEG RISK SIGNAL | condition=%s outcomes=%d "
+            "NEG RISK SIGNAL | condition=%s legs=%d/%d "
+            "(dropped %d <%.0f%%, %d beyond top-%d) "
             "combined_bid=%.6f payout=%.1f rebate=%.2f%% "
             "effective=%.6f net_edge=%.6f relative=%.6f(%+.1f bps) bundles=%.2f",
-            condition_id[:16], n,
+            condition_id[:16], m, n,
+            dropped_lowprob, self._min_outcome_prob * 100,
+            dropped_tail, self._max_legs,
             combined_bid, payout, rebate * 100,
             effective_cost, net_edge, relative_edge, spread_bps, n_bundles,
         )

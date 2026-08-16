@@ -31,6 +31,9 @@ from strategy.arbitrage import (
     EXTREME_PRICE_LO,
     MAX_TAKER_FEE,
     MIN_REAL_EDGE,
+    NEGRISK_MAX_LEGS,
+    NEGRISK_MIN_OUTCOME_PROB,
+    NEGRISK_MIN_RELATIVE_EDGE,
 )
 
 
@@ -54,6 +57,18 @@ def _i(name: str, default: int) -> int:
         raise ValueError(f"{name}={raw!r} is not a valid int") from exc
 
 
+def _b(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return bool(default)
+    val = raw.strip().lower()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    if val in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name}={raw!r} is not a valid boolean")
+
+
 @dataclass(frozen=True, slots=True)
 class BotConfig:
     """Validated, immutable snapshot of all env-driven settings."""
@@ -75,12 +90,24 @@ class BotConfig:
     # Execution concurrency (Phase 2 non-blocking dispatch)
     exec_concurrency:   int
     # NegRisk multi-outcome execution mode:
-    #   "off"     — detect + alert only (default).  The live NegRisk path calls
-    #               CTF Exchange V2 matchOrders directly, which REVERTS unless
-    #               the wallet is a registered exchange operator — a normal
-    #               user wallet is not, so execution is disabled by default.
-    #   "onchain" — legacy matchOrders execution (operator wallets only).
+    #   "off"     — detect + alert only (default).  Groups are still discovered,
+    #               fed and evaluated; signals are surfaced on Telegram but
+    #               nothing is submitted.
+    #   "clob"    — submit the bundle as N post-only CLOB limit orders, guarded
+    #               by NegRiskBundleGuard.  Works with an ordinary wallet.
+    #   "onchain" — legacy CTF Exchange V2 matchOrders bundle.  OBSOLETE since
+    #               the April 2026 pUSD migration and operator-only before that;
+    #               the live path raises rather than submitting.  Kept so the
+    #               setting still parses; do not use.
     negrisk_exec_mode:  str
+    # NegRisk discovery: False disables group scanning/feeding entirely, so the
+    # member markets are only seen as individual binaries.
+    negrisk_enabled:    bool
+    # Detector heuristics from arXiv:2508.03474 — see strategy/arbitrage.py for
+    # the derivation of each default.
+    negrisk_min_outcome_prob:  float
+    negrisk_max_legs:          int
+    negrisk_min_relative_edge: float
     # Arb-duration reporting: only report windows lasting at least this long
     arb_duration_min_s: float
     # Single-market ENV seed (optional, backward-compatible)
@@ -104,6 +131,12 @@ class BotConfig:
             min_volume_24h     = _f("MIN_VOLUME_24H",     0.0),
             exec_concurrency   = _i("EXEC_CONCURRENCY",   6),
             negrisk_exec_mode  = os.environ.get("NEGRISK_EXEC_MODE", "off").strip().lower(),
+            negrisk_enabled    = _b("NEGRISK_ENABLED", True),
+            negrisk_min_outcome_prob  = _f("NEGRISK_MIN_OUTCOME_PROB",
+                                           NEGRISK_MIN_OUTCOME_PROB),
+            negrisk_max_legs          = _i("NEGRISK_MAX_LEGS", NEGRISK_MAX_LEGS),
+            negrisk_min_relative_edge = _f("NEGRISK_MIN_RELATIVE_EDGE",
+                                           NEGRISK_MIN_RELATIVE_EDGE),
             arb_duration_min_s = _f("ARB_DURATION_MIN_S", 0.0),
             yes_token_id       = os.environ.get("YES_TOKEN_ID", "").strip(),
             no_token_id        = os.environ.get("NO_TOKEN_ID",  "").strip(),
@@ -143,10 +176,24 @@ class BotConfig:
             raise ValueError(f"MIN_VOLUME_24H must be ≥ 0; got {self.min_volume_24h}")
         if self.exec_concurrency < 1:
             raise ValueError(f"EXEC_CONCURRENCY must be ≥ 1; got {self.exec_concurrency}")
-        if self.negrisk_exec_mode not in ("off", "onchain"):
+        if self.negrisk_exec_mode not in ("off", "clob", "onchain"):
             raise ValueError(
-                f"NEGRISK_EXEC_MODE must be 'off' or 'onchain'; "
+                f"NEGRISK_EXEC_MODE must be 'off', 'clob' or 'onchain'; "
                 f"got {self.negrisk_exec_mode!r}"
+            )
+        if not (0.0 <= self.negrisk_min_outcome_prob < 1.0):
+            raise ValueError(
+                f"NEGRISK_MIN_OUTCOME_PROB must be in [0, 1); "
+                f"got {self.negrisk_min_outcome_prob}"
+            )
+        if self.negrisk_max_legs < 2:
+            raise ValueError(
+                f"NEGRISK_MAX_LEGS must be ≥ 2; got {self.negrisk_max_legs}"
+            )
+        if not (0.0 <= self.negrisk_min_relative_edge < 1.0):
+            raise ValueError(
+                f"NEGRISK_MIN_RELATIVE_EDGE must be in [0, 1); "
+                f"got {self.negrisk_min_relative_edge}"
             )
         if self.arb_duration_min_s < 0.0:
             raise ValueError(
