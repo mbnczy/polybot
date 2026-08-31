@@ -98,7 +98,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from config import BotConfig                                       # noqa: E402
-from core.clob_client import PolyClient, classify_fills            # noqa: E402
+from core.clob_client import (                                     # noqa: E402
+    PolyClient, classify_fills, prime_market_meta,
+)
 from core.scanner import FeedRegistry, MarketScanner               # noqa: E402
 from execution.auto_redeem import AutoRedeemer                     # noqa: E402
 from execution.inventory_manager import InventoryManager           # noqa: E402
@@ -926,6 +928,14 @@ async def main() -> None:
             fee = _normalise_fee(fee_raw)
             if fee is not None:
                 fee_engine.prime_cache(condition_id, fee)
+        # Tick size + neg-risk for both legs.  Without this the V2 SDK issues
+        # two blocking CLOB round-trips per signature and one more per post
+        # (~112 ms measured), which alone exceeds a typical arb window.
+        if not prime_market_meta(market):
+            logger.debug(
+                "prewarm | no market-meta on condition=%s (signing will fetch)",
+                condition_id[:16],
+            )
 
     # ── scanner: pre-populate known set with any ENV-seeded condition ─────
     seed_ids: set[str] = {seed_cond} if seed_cond and CONDITION_ID else set()

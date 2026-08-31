@@ -69,6 +69,7 @@ Environment variables
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -78,7 +79,8 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from functools import partial
+from decimal import Decimal
+from functools import partial, wraps
 from typing import Any
 
 from eth_account import Account
@@ -111,6 +113,157 @@ _SIGNER_THREADS = max(2, int(os.environ.get("CLOB_SIGNER_THREADS", "8")))
 _executor = ThreadPoolExecutor(
     max_workers=_SIGNER_THREADS, thread_name_prefix="clob-worker"
 )
+
+# ── Market-meta cache (tick size + neg-risk) ─────────────────────────────────
+# The V2 SDK re-fetches /tick-size and /neg-risk from the CLOB on EVERY order
+# build (prepare_{limit,market}_order_draft_sync) and again on every post
+# (place.py), with no cache of its own.  Measured from the Montreal box that is
+# ~112 ms of blocking network I/O per signature — larger than the whole arb
+# window we are trying to hit (measured: 119.6 ms cold vs 7.8 ms primed).
+#
+# Both values are immutable properties of a market, and the scanner already
+# fetches them from Gamma (`orderPriceMinTickSize` / `negRisk`), so priming this
+# cache on market admission costs zero extra requests.  Verified against the
+# CLOB's authoritative /markets/{condition_id} over the top-40 markets by 24h
+# volume: 40/40 exact agreement on tick size, neg-risk and token IDs.
+_MARKET_META: dict[str, tuple[Decimal, bool]] = {}
+_META_LOCK = threading.Lock()
+
+# Set once _install_market_meta_cache() has patched the SDK fetchers.
+_META_CACHE_INSTALLED = False
+
+
+def prime_market_meta(market: dict) -> int:
+    """
+    Populate the market-meta cache from a Gamma market dict.
+
+    Returns the number of token IDs primed (0 when the dict lacks the fields —
+    callers treat that as a no-op, never an error).
+    """
+    raw_tokens = market.get("clobTokenIds")
+    tick_raw   = market.get("orderPriceMinTickSize")
+    if raw_tokens is None or tick_raw is None:
+        return 0
+
+    try:
+        token_ids = (
+            json.loads(raw_tokens) if isinstance(raw_tokens, str) else list(raw_tokens)
+        )
+        # str() first: Decimal(0.001) from a float carries binary-float noise.
+        tick = Decimal(str(tick_raw))
+    except (ValueError, TypeError, ArithmeticError, json.JSONDecodeError):
+        return 0
+    if tick <= 0:
+        return 0
+
+    neg_risk = bool(market.get("negRisk"))
+    primed = 0
+    with _META_LOCK:
+        for tid in token_ids:
+            tid = str(tid).strip()
+            if tid:
+                _MARKET_META[tid] = (tick, neg_risk)
+                primed += 1
+    return primed
+
+
+def peek_market_meta(token_id: str) -> tuple[Decimal, bool] | None:
+    """Synchronous cache peek — never fetches.  None on miss."""
+    return _MARKET_META.get(str(token_id))
+
+
+def market_meta_cache_size() -> int:
+    """Number of token IDs currently cached (diagnostics / tests)."""
+    return len(_MARKET_META)
+
+
+def clear_market_meta_cache() -> None:
+    """Drop every cached entry (tests only)."""
+    with _META_LOCK:
+        _MARKET_META.clear()
+
+
+def _install_market_meta_cache() -> None:
+    """
+    Wrap the SDK's tick-size / neg-risk fetchers with a cache lookup.
+
+    The consuming modules bind these names at import time
+    (`from ...market_data import fetch_tick_size_sync`), so patching
+    `market_data` alone would not take effect — each consumer's own namespace
+    has to be rebound.
+
+    Only the *sync* variants are patched: PolyClient drives the synchronous
+    SecureClient through `_executor`, so the async paths are never reached.
+    A miss falls through to the original fetcher and stores its result, which
+    keeps behaviour identical when the cache has not been primed.
+    """
+    global _META_CACHE_INSTALLED
+    if _META_CACHE_INSTALLED:
+        return
+
+    try:
+        from polymarket._internal.actions.orders import (  # noqa: PLC0415
+            estimate as _estimate,
+            limit as _limit,
+            market as _market,
+            market_data as _market_data,
+            place as _place,
+        )
+    except ImportError as exc:  # SDK layout changed — degrade to no cache.
+        logger.warning(
+            "Market-meta cache NOT installed (SDK layout changed: %s) — order "
+            "signing keeps its per-call network round-trips", exc,
+        )
+        return
+
+    def _wrap_tick(orig):
+        @wraps(orig)
+        def wrapper(ctx, *, token_id: str):
+            hit = _MARKET_META.get(str(token_id))
+            if hit is not None:
+                return hit[0]
+            tick = orig(ctx, token_id=token_id)
+            with _META_LOCK:
+                _, neg = _MARKET_META.get(str(token_id), (tick, False))
+                _MARKET_META[str(token_id)] = (tick, neg)
+            return tick
+        return wrapper
+
+    def _wrap_neg(orig):
+        @wraps(orig)
+        def wrapper(ctx, *, token_id: str):
+            hit = _MARKET_META.get(str(token_id))
+            if hit is not None:
+                return hit[1]
+            neg = orig(ctx, token_id=token_id)
+            with _META_LOCK:
+                tick, _ = _MARKET_META.get(str(token_id), (TICK_SIZE_FALLBACK, neg))
+                _MARKET_META[str(token_id)] = (tick, neg)
+            return neg
+        return wrapper
+
+    tick_cached = _wrap_tick(_market_data.fetch_tick_size_sync)
+    neg_cached  = _wrap_neg(_market_data.fetch_neg_risk_sync)
+
+    # Rebind in every module that imported the names directly.
+    for mod in (_market_data, _limit, _market, _place, _estimate):
+        if hasattr(mod, "fetch_tick_size_sync"):
+            mod.fetch_tick_size_sync = tick_cached
+        if hasattr(mod, "fetch_neg_risk_sync"):
+            mod.fetch_neg_risk_sync = neg_cached
+
+    _META_CACHE_INSTALLED = True
+    logger.info(
+        "Market-meta cache installed — /tick-size and /neg-risk are served from "
+        "cache on the order hot path"
+    )
+
+
+# Fallback used only when neg-risk is cached before tick size (never on the
+# primed path, where both land together).  Matches the strategy-wide default.
+TICK_SIZE_FALLBACK = Decimal(str(TICK_SIZE))
+
+_install_market_meta_cache()
 
 # ── Paper-trade toggle — evaluated once at module load; never changes at runtime
 _PAPER_TRADE: bool = (
