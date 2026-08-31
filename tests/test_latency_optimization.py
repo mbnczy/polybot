@@ -163,3 +163,117 @@ def test_orjson_jsondecodeerror_is_caught():
     from core.ws_feed import _loads
     with pytest.raises(json.JSONDecodeError):
         _loads("{not json")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# L3 — market-meta cache (tick size + neg-risk) on the order hot path
+#
+# The V2 SDK re-fetches /tick-size and /neg-risk from the CLOB on every order
+# build and again on every post, with no cache of its own (~140 ms of blocking
+# network I/O per signature, measured).  Both values are immutable per market
+# and already present in the Gamma dict the scanner fetches, so admission can
+# prime them for free.
+# ═══════════════════════════════════════════════════════════════════════════
+
+from decimal import Decimal  # noqa: E402
+
+import core.clob_client as cc  # noqa: E402
+
+
+GAMMA_MARKET = {
+    "conditionId": "0xmeta",
+    "clobTokenIds": '["tok_YES", "tok_NO"]',   # Gamma ships this as a JSON string
+    "orderPriceMinTickSize": 0.001,
+    "negRisk": True,
+}
+
+
+@pytest.fixture(autouse=True)
+def _clean_meta_cache():
+    cc.clear_market_meta_cache()
+    yield
+    cc.clear_market_meta_cache()
+
+
+class TestPrimeMarketMeta:
+    def test_primes_both_legs_from_gamma_dict(self):
+        assert cc.prime_market_meta(GAMMA_MARKET) == 2
+        assert cc.peek_market_meta("tok_YES") == (Decimal("0.001"), True)
+        assert cc.peek_market_meta("tok_NO")  == (Decimal("0.001"), True)
+
+    def test_accepts_list_token_ids(self):
+        assert cc.prime_market_meta(
+            {"clobTokenIds": ["a", "b"], "orderPriceMinTickSize": "0.01"}
+        ) == 2
+        assert cc.peek_market_meta("a") == (Decimal("0.01"), False)
+
+    def test_tick_size_has_no_binary_float_noise(self):
+        # Decimal(0.001) from a float would carry ...00000000208 tails.
+        cc.prime_market_meta(GAMMA_MARKET)
+        tick, _ = cc.peek_market_meta("tok_YES")
+        assert str(tick) == "0.001"
+
+    def test_miss_returns_none(self):
+        assert cc.peek_market_meta("nope") is None
+
+    @pytest.mark.parametrize("bad", [
+        {},                                                    # no fields
+        {"clobTokenIds": '["a"]'},                             # no tick size
+        {"orderPriceMinTickSize": 0.01},                       # no tokens
+        {"clobTokenIds": "not-json", "orderPriceMinTickSize": 0.01},
+        {"clobTokenIds": '["a"]', "orderPriceMinTickSize": "abc"},
+        {"clobTokenIds": '["a"]', "orderPriceMinTickSize": 0},  # non-positive
+    ])
+    def test_malformed_input_is_a_noop_not_an_error(self, bad):
+        assert cc.prime_market_meta(bad) == 0
+        assert cc.market_meta_cache_size() == 0
+
+
+class TestSdkFetchersUseCache:
+    """The patched SDK fetchers must serve primed values without network I/O."""
+
+    def test_patch_is_installed(self):
+        assert cc._META_CACHE_INSTALLED is True
+
+    def test_cache_hit_skips_the_network(self):
+        from polymarket._internal.actions.orders import limit, place
+
+        cc.prime_market_meta(GAMMA_MARKET)
+        # A ctx that raises if anything reaches the network.
+        class _Boom:
+            def __getattr__(self, _):
+                raise AssertionError("network call on a cache hit")
+
+        assert limit.fetch_tick_size_sync(_Boom(), token_id="tok_YES") == Decimal("0.001")
+        assert limit.fetch_neg_risk_sync(_Boom(), token_id="tok_YES") is True
+        # place.py posts orders and re-fetches neg-risk — must hit cache too.
+        assert place.fetch_neg_risk_sync(_Boom(), token_id="tok_NO") is True
+
+    def test_miss_falls_through_and_backfills(self, monkeypatch):
+        from polymarket._internal.actions.orders import limit
+
+        calls: list[str] = []
+
+        def _orig(ctx, *, token_id):
+            calls.append(token_id)
+            return Decimal("0.01")
+
+        # Re-wrap a fresh original so we can observe fall-through.
+        monkeypatch.setattr(cc, "_META_CACHE_INSTALLED", False, raising=True)
+        monkeypatch.setattr(
+            "polymarket._internal.actions.orders.market_data.fetch_tick_size_sync",
+            _orig, raising=True,
+        )
+        cc._install_market_meta_cache()
+
+        assert limit.fetch_tick_size_sync(object(), token_id="cold") == Decimal("0.01")
+        assert calls == ["cold"]                      # fetched once …
+        assert limit.fetch_tick_size_sync(object(), token_id="cold") == Decimal("0.01")
+        assert calls == ["cold"]                      # … then served from cache
+
+    def test_install_is_idempotent(self):
+        before = cc.market_meta_cache_size()
+        cc._install_market_meta_cache()
+        cc._install_market_meta_cache()
+        assert cc._META_CACHE_INSTALLED is True
+        assert cc.market_meta_cache_size() == before
