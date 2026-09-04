@@ -678,6 +678,47 @@ class PolyClient:
         """
         return str(getattr(self._client, "wallet", "") or self._funder)
 
+    async def open_positions_detail(self) -> "list[dict] | None":
+        """
+        Current share positions held by the trading wallet, with market names.
+
+        Reads Polymarket's data API, which already returns the human-readable
+        `title` per position, so the daily summary can say "Fed rate hike in
+        2026?" rather than a bare condition ID.
+
+        Returns a list of {title, outcome, size, avg_price, cur_price, value,
+        pnl}, or None if the query fails.
+        """
+        url    = "https://data-api.polymarket.com/positions"
+        params = {"user": self.trading_wallet, "sizeThreshold": 0.0001}
+        try:
+            import httpx  # noqa: PLC0415 — optional at import time
+            async with httpx.AsyncClient(timeout=20.0) as http:
+                resp = await http.get(url, params=params)
+            if resp.status_code != 200:
+                logger.warning(
+                    "Positions query returned HTTP %d", resp.status_code
+                )
+                return None
+            rows = resp.json()
+            if not isinstance(rows, list):
+                return None
+            out: list[dict] = []
+            for r in rows:
+                out.append({
+                    "title":     str(r.get("title") or "")[:80],
+                    "outcome":   str(r.get("outcome") or ""),
+                    "size":      float(r.get("size") or 0.0),
+                    "avg_price": float(r.get("avgPrice") or 0.0),
+                    "cur_price": float(r.get("curPrice") or 0.0),
+                    "value":     float(r.get("currentValue") or 0.0),
+                    "pnl":       float(r.get("cashPnl") or 0.0),
+                })
+            return out
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Positions query failed: %s", exc)
+            return None
+
     async def collateral_balance(self) -> "float | None":
         """
         Read the ACTUAL collateral (pUSD) balance held by the trading wallet.
