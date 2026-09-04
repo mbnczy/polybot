@@ -50,6 +50,7 @@ import asyncio
 import html
 import logging
 import os
+import re
 import time
 from typing import Callable, Coroutine, Optional
 
@@ -60,6 +61,23 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 logger = logging.getLogger(__name__)
 
 _API_BASE = "https://api.telegram.org"
+
+
+def _scrub(text: object) -> str:
+    """
+    Strip bot tokens out of text destined for the log.
+
+    aiohttp/httpx embed the full request URL in their exception messages, and
+    the Telegram API puts the bot token in the path -- so logging a raw
+    exception leaks the credential into the journal.
+    """
+    out = str(text)
+    tok = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if tok:
+        out = out.replace(tok, "<REDACTED>")
+    # belt and braces: catch any bot<digits>:<secret> pattern, incl. a stale token
+    out = re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot<REDACTED>", out)
+    return out
 
 
 def _h(value: object) -> str:
@@ -119,11 +137,10 @@ class TelegramNotifier:
         self._last_arb_alert: dict[str, float] = {}   # condition_id → monotonic ts
 
         # python-telegram-bot Application (command listener only)
+        self._closing: bool = False
         self._app: Optional[Application] = None
         if self._enabled:
-            self._app = Application.builder().token(self._token).build()
-            self._app.add_handler(CommandHandler("status", self._cmd_status))
-            self._app.add_handler(CommandHandler("halt",   self._cmd_halt))
+            self._app = self._build_app()
             logger.info("TelegramNotifier ready | chat_id=%s", self._chat_id)
         else:
             logger.warning(
@@ -133,6 +150,31 @@ class TelegramNotifier:
     # ──────────────────────────────────────────────────────────────────────────
     # Halt callback (set after construction to break circular reference)
     # ──────────────────────────────────────────────────────────────────────────
+
+    def _build_app(self) -> Application:
+        """
+        Construct the python-telegram-bot Application with explicit timeouts.
+
+        The defaults (5 s connect) are too tight for a lossy path to
+        api.telegram.org: a dropped SYN alone exceeds the budget before TCP
+        can retransmit, which killed the listener at startup every boot.
+        Rebuilt on each supervisor retry -- a part-initialised Application
+        cannot safely be re-entered.
+        """
+        app = (
+            Application.builder()
+            .token(self._token)
+            .connect_timeout(20.0)
+            .read_timeout(20.0)
+            .write_timeout(20.0)
+            .pool_timeout(20.0)
+            .get_updates_connect_timeout(20.0)
+            .get_updates_read_timeout(40.0)
+            .build()
+        )
+        app.add_handler(CommandHandler("status", self._cmd_status))
+        app.add_handler(CommandHandler("halt",   self._cmd_halt))
+        return app
 
     def set_halt_callback(self, cb: Callable[[], Coroutine]) -> None:
         """Attach the coroutine that will be awaited when /halt is received."""
@@ -144,13 +186,21 @@ class TelegramNotifier:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            # The path to api.telegram.org intermittently resets/blackholes
+            # connections. Cap connect separately so a dead attempt fails fast
+            # and the retry in notify() gets a fresh connection quickly,
+            # rather than burning the whole 10 s budget on one hung connect.
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=aiohttp.ClientTimeout(total=15, sock_connect=4, sock_read=10)
             )
         return self._session
 
     async def close(self) -> None:
         """Close the underlying HTTP session (call on shutdown)."""
+        # Signals run_listener()'s supervisor to stop retrying. Without this the
+        # retry loop keeps the process alive after main() has finished, and
+        # systemd SIGKILLs the unit at TimeoutStopSec.
+        self._closing = True
         if self._session and not self._session.closed:
             await self._session.close()
 
@@ -173,18 +223,39 @@ class TelegramNotifier:
         if parse_mode:
             payload["parse_mode"] = parse_mode
 
-        try:
-            session = await self._get_session()
-            async with session.post(url, json=payload) as resp:
-                if resp.status == 200:
-                    logger.debug("Telegram OK | %s", text[:60])
-                    return True
-                body = await resp.text()
-                logger.error("Telegram error %d: %s", resp.status, body[:200])
-                return False
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Telegram send failed: %s", exc)
-            return False
+        # ~35 % of connections to api.telegram.org fail from this host, so a
+        # single attempt silently drops roughly a third of all alerts. Retry
+        # transient failures only; 4xx (bad token/chat_id, rate limit) is
+        # permanent and must not be hammered. _fire() detaches delivery, so
+        # these waits never touch the trading hot path.
+        attempts  = 5
+        last_err: object = None
+        for attempt in range(1, attempts + 1):
+            try:
+                session = await self._get_session()
+                async with session.post(url, json=payload) as resp:
+                    if resp.status == 200:
+                        logger.debug("Telegram OK | %s", text[:60])
+                        return True
+                    body = await resp.text()
+                    if 400 <= resp.status < 500:
+                        logger.error(
+                            "Telegram error %d (permanent): %s",
+                            resp.status, body[:200],
+                        )
+                        return False
+                    last_err = f"HTTP {resp.status}: {body[:200]}"
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+            if attempt < attempts:
+                await asyncio.sleep(min(0.5 * (2 ** (attempt - 1)), 4.0))
+        logger.error(
+            "Telegram send failed after %d attempts: %s",
+            attempts, _scrub(last_err),
+        )
+        return False
 
     # ──────────────────────────────────────────────────────────────────────────
     # Convenience helpers
@@ -458,21 +529,53 @@ class TelegramNotifier:
             "Telegram command listener starting (long-polling) | "
             "commands: /status /halt"
         )
-        try:
-            async with self._app:
-                await self._app.start()
-                await self._app.updater.start_polling(drop_pending_updates=True)
-                logger.info("Telegram command listener active")
+        # Supervised: a transient failure must never permanently disarm /halt.
+        # The path to api.telegram.org drops a significant share of connections,
+        # so start_polling() can fail on any given attempt. Retry with backoff
+        # instead of letting the coroutine die (which silently lost the kill
+        # switch while the bot kept trading).
+        backoff  = 5.0
+        attempt  = 0
+        while True:
+            attempt += 1
+            try:
+                async with self._app:
+                    await self._app.start()
+                    await self._app.updater.start_polling(drop_pending_updates=True)
+                    logger.info(
+                        "Telegram command listener active (attempt %d)", attempt
+                    )
+                    backoff = 5.0          # reset once a start has succeeded
+                    try:
+                        # Hold here; cancelled by the gather when the bot shuts down.
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        pass
+                    finally:
+                        await self._app.updater.stop()
+                        await self._app.stop()
+                        logger.info("Telegram command listener stopped")
+                return                     # clean shutdown -- do not retry
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if self._closing:
+                    logger.info(
+                        "Telegram command listener stopping (shutdown in "
+                        "progress): %s", _scrub(exc),
+                    )
+                    return
+                logger.warning(
+                    "Telegram command listener failed (attempt %d): %s -- "
+                    "retrying in %.0fs", attempt, _scrub(exc), backoff,
+                )
+                await asyncio.sleep(backoff)
+                if self._closing:          # shutdown may land during the wait
+                    return
+                backoff = min(backoff * 2, 60.0)
                 try:
-                    # Hold here; cancelled by the gather when the bot shuts down.
-                    await asyncio.Event().wait()
-                except asyncio.CancelledError:
-                    pass
-                finally:
-                    await self._app.updater.stop()
-                    await self._app.stop()
-                    logger.info("Telegram command listener stopped")
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Telegram command listener crashed: %s", exc)
+                    self._app = self._build_app()
+                except Exception as rebuild_exc:  # noqa: BLE001
+                    logger.error(
+                        "Telegram listener rebuild failed: %s", rebuild_exc
+                    )
