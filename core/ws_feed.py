@@ -501,13 +501,29 @@ def _expand_price_changes(event: dict) -> list[dict]:
     return out
 
 
+# Plain-text frames the CLOB WS emits as a matter of course. Polymarket answers
+# aiohttp's protocol-level keepalive PING (heartbeat=20s) with the text
+# "INVALID OPERATION" rather than a pong, so one arrives per shard roughly every
+# 20-30s: ~101k WARNING lines per day across 34 shards, which buried real errors
+# and grew the journal by ~160 MB. The feeds are unaffected, so these are logged
+# at DEBUG. Anything NOT on this list is still a WARNING with its payload.
+_BENIGN_WS_TEXT: frozenset[str] = frozenset({
+    "INVALID OPERATION",
+    "PONG",
+    "PING",
+})
+
+
 def _parse_events(raw: str) -> list[dict]:
     """Parse a raw WS text frame into a list of per-asset event dicts."""
     _parse_t0 = time.monotonic()
     try:
         data = _loads(raw)
     except json.JSONDecodeError:
-        logger.warning("Non-JSON WS message dropped: %s", raw[:120])
+        if raw.strip().upper() in _BENIGN_WS_TEXT:
+            logger.debug("WS control frame: %s", raw[:40])
+        else:
+            logger.warning("Non-JSON WS message dropped: %s", raw[:120])
         return []
     WS_PARSE_SECONDS.observe(time.monotonic() - _parse_t0)
     events = data if isinstance(data, list) else [data]
