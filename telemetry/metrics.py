@@ -215,7 +215,7 @@ async def metrics_server(port: int = METRICS_PORT) -> None:
 
     runner = aiohttp.web.AppRunner(app, access_log=None)
     await runner.setup()
-    site = aiohttp.web.TCPSite(runner, "0.0.0.0", port)
+    site = aiohttp.web.TCPSite(runner, "127.0.0.1", port)
     await site.start()
     logger.info("Prometheus metrics server listening on :%d/metrics", port)
 

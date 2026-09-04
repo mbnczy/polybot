@@ -157,6 +157,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
+# Telegram bot token leaks into logs via httpx's INFO-level request URLs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # ── configuration ──────────────────────────────────────────────────────────
 # Single, validated source of truth — fails fast at startup on any bad value.
 _cfg = BotConfig.from_env()
