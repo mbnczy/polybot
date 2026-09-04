@@ -139,6 +139,7 @@ _UNRESOLVED_TTL_S: float = float(
 )
 # Small gap between requests so a cold scan does not burst into the rate limit.
 _GAMMA_GAP_S: float = float(os.environ.get("REDEEM_GAMMA_GAP_S", 0.10))
+_GAMMA_GAP_MAX_S: float = float(os.environ.get("REDEEM_GAMMA_GAP_MAX_S", 2.0))
 _POLL_INTERVAL   = float(os.environ.get("REDEEM_POLL_INTERVAL", 300))
 _GAS_LIMIT       = int(os.environ.get("REDEEM_GAS_LIMIT",       200_000))
 _PAPER_TRADE     = os.environ.get("PAPER_TRADE_MODE", "false").strip().lower() == "true"
@@ -229,6 +230,11 @@ class AutoRedeemer:
         self._resolution_cache: dict[str, tuple[int | None, float]] = {}
         # condition_id -> monotonic ts of the last 'not resolved' answer
         self._unresolved_at: dict[str, float] = {}
+        # Gamma rate-limits hard. Widen the inter-request gap when it says
+        # 429 and let it relax again on success, so the scan self-tunes to
+        # whatever the API currently tolerates.
+        self._gap_s: float = _GAMMA_GAP_S
+        self._rate_limited: bool = False
         # Markets already fully redeemed (skip on subsequent polls)
         self._redeemed: set[str] = set()
 
@@ -290,8 +296,8 @@ class AutoRedeemer:
 
         async with aiohttp.ClientSession() as session:
             for idx, cid in enumerate(due):
-                if idx and _GAMMA_GAP_S > 0:
-                    await asyncio.sleep(_GAMMA_GAP_S)
+                if idx and self._gap_s > 0:
+                    await asyncio.sleep(self._gap_s)
                 try:
                     await self._check_one(cid, session)
                 except asyncio.CancelledError:
@@ -308,11 +314,14 @@ class AutoRedeemer:
         session:      aiohttp.ClientSession,
     ) -> None:
         """Check a single market and redeem if resolved with a position balance."""
+        self._rate_limited = False
         winner_index = await self._get_winner_index(condition_id, session)
         if winner_index is None:
-            # Not resolved (or the fetch failed). Remember when we asked so the
-            # next few polls skip it instead of re-querying every 300 s.
-            self._unresolved_at[condition_id] = time.monotonic()
+            if not self._rate_limited:
+                # Genuinely unresolved: remember when we asked so the next few
+                # polls skip it instead of re-querying every 300 s. A rate-limited
+                # answer proves nothing, so it is deliberately NOT cached.
+                self._unresolved_at[condition_id] = time.monotonic()
             return
 
         # Compute the ERC-1155 position token ID for the winning side
@@ -381,6 +390,17 @@ class AutoRedeemer:
                 params={"conditionId": condition_id},
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
+                if getattr(resp, "status", None) == 429:
+                    # Rate limited. This is NOT evidence the market is
+                    # unresolved, so flag it: the caller must not cache a
+                    # negative result, and the scan widens its gap.
+                    self._rate_limited = True
+                    self._gap_s = min(self._gap_s * 2.0, _GAMMA_GAP_MAX_S)
+                    logger.debug(
+                        "AutoRedeemer | Gamma 429 for %s — gap now %.2fs",
+                        condition_id[:16], self._gap_s,
+                    )
+                    return None
                 resp.raise_for_status()
                 data = await resp.json(content_type=None)
         except Exception as exc:
@@ -389,6 +409,10 @@ class AutoRedeemer:
                 condition_id[:16], exc,
             )
             return None
+
+        # A clean answer: let the gap relax back toward the configured floor.
+        if self._gap_s > _GAMMA_GAP_S:
+            self._gap_s = max(_GAMMA_GAP_S, self._gap_s * 0.9)
 
         # Response may be a list or a dict with a nested list
         markets: list[dict] = data if isinstance(data, list) else data.get("data", [])

@@ -12,6 +12,7 @@ from tests.mocks.fake_clob_ws import FakeAiohttpSession, FakeWebSocket
 
 class _FakeResolutionResponse:
     def __init__(self, payload: list[dict]) -> None:
+        self.status = 200      # real aiohttp responses always carry this
         self._payload = payload
 
     async def __aenter__(self):
