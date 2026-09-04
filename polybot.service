@@ -18,6 +18,11 @@ Description=Polymarket arb bot (polybot)
 After=network-online.target
 Wants=network-online.target
 
+# systemd only honours these in [Unit]; they were previously under
+# [Service], where they were silently ignored.
+StartLimitIntervalSec=120s
+StartLimitBurst=5
+
 [Service]
 User=ubuntu
 Group=ubuntu
@@ -27,8 +32,6 @@ ExecStart=/home/ubuntu/polybot/.venv/bin/python -u main.py
 
 Restart=on-failure
 RestartSec=5s
-StartLimitIntervalSec=120s
-StartLimitBurst=5
 
 StandardOutput=journal
 StandardError=journal
