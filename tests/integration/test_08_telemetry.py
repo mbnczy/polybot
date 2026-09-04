@@ -235,8 +235,13 @@ async def test_heartbeat_sends_html_message(monkeypatch):
     assert captured, "No HTTP call made"
     payload = captured[0]
     assert payload.get("parse_mode") == "HTML"
-    assert "Heartbeat" in payload.get("text", "")
-    assert "session_pnl" in payload.get("text", "")
+    text = payload.get("text", "")
+    assert "Heartbeat" in text
+    # The heartbeat is a grouped daily summary, not a raw key dump: assert the
+    # human label and the actual value rather than the snake_case field name.
+    assert "session" in text.lower()
+    assert "2.5" in text
+    assert "Active shares" in text
 
 
 @pytest.mark.asyncio

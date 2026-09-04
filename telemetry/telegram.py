@@ -268,12 +268,77 @@ class TelegramNotifier:
             parse_mode="HTML",
         )
 
-    async def heartbeat(self, status: dict) -> bool:
-        """Format and send a system health heartbeat via HTML."""
-        lines = ["<b>Polymarket Arb Bot — Heartbeat</b>"]
-        for k, v in status.items():
-            lines.append(f"  {_h(k)}: <code>{_h(v)}</code>")
-        return await self.notify("\n".join(lines), parse_mode="HTML")
+    async def heartbeat(
+        self,
+        status:    dict,
+        *,
+        extra:     Optional[dict] = None,
+        positions: Optional[list] = None,
+    ) -> bool:
+        """
+        Send a grouped health summary via HTML.
+
+        `status` is CircuitBreaker.status_dict(). `extra` carries scanning and
+        config context (market counts, tuner-adjusted margin, NegRisk mode).
+        `positions` is the output of PolyClient.open_positions_detail() — the
+        actual shares held, named by market rather than by condition ID.
+
+        At the default daily cadence this is the one message a day, so it is
+        grouped for reading rather than dumped as raw keys.
+        """
+        extra = extra or {}
+        L: list[str] = ["<b>📊 Polybot — Daily Heartbeat</b>"]
+
+        if extra.get("uptime_h") is not None:
+            L.append(f"<i>uptime {_h(extra['uptime_h'])}</i>")
+
+        L.append("")
+        L.append("<b>Balance</b>")
+        L.append(f"  collateral   <code>{_h(round(status.get('starting_balance', 0.0), 4))}</code> pUSD")
+        L.append(f"  session P&amp;L  <code>{_h(status.get('session_pnl', 0.0)):}</code>")
+        L.append(f"  daily P&amp;L    <code>{_h(status.get('daily_pnl', 0.0))}</code>"
+                 f" (limit <code>{_h(status.get('daily_loss_limit'))}</code>)")
+
+        L.append("")
+        L.append("<b>Scanning</b>")
+        L.append(f"  markets      <code>{_h(extra.get('markets', '?'))}</code>"
+                 f" across <code>{_h(extra.get('shards', '?'))}</code> shards")
+        L.append(f"  named        <code>{_h(extra.get('titles_known', '?'))}</code>")
+
+        L.append("")
+        L.append("<b>Activity</b>")
+        L.append(f"  orders passed  <code>{_h(status.get('orders_passed', 0))}</code>")
+        L.append(f"  orders blocked <code>{_h(status.get('orders_blocked', 0))}</code>")
+        L.append(f"  open positions <code>{_h(status.get('open_positions', 0))}</code>"
+                 f" / <code>{_h(extra.get('max_positions', '?'))}</code>")
+        L.append(f"  breaker        <code>{'TRIPPED' if status.get('tripped') else 'ok'}</code>")
+
+        L.append("")
+        L.append("<b>Config</b>")
+        L.append(f"  net margin   <code>{_h(extra.get('net_margin', '?'))}</code>"
+                 f" (tuner-adjusted)")
+        L.append(f"  pair cap     <code>{_h(status.get('pair_cap_usdc'))}</code> USDC")
+        L.append(f"  negrisk      <code>{_h(extra.get('negrisk_mode', '?'))}</code>"
+                 f" @ <code>{_h(extra.get('negrisk_edge', '?'))}</code>")
+
+        L.append("")
+        L.append("<b>Active shares</b>")
+        if positions is None:
+            L.append("  <i>unavailable (query failed)</i>")
+        elif not positions:
+            L.append("  none — fully in cash")
+        else:
+            for p in positions[:10]:
+                L.append(
+                    f"  <b>{_h(p.get('title', '?'))}</b>\n"
+                    f"    {_h(p.get('size'))} × {_h(p.get('outcome'))} "
+                    f"@ {_h(p.get('avg_price'))} → now {_h(p.get('cur_price'))} "
+                    f"(P&amp;L <code>{_h(round(p.get('pnl', 0.0), 4))}</code>)"
+                )
+            if len(positions) > 10:
+                L.append(f"  <i>… and {len(positions) - 10} more</i>")
+
+        return await self.notify("\n".join(L), parse_mode="HTML")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Fire-and-forget helpers (never block the trading loop)

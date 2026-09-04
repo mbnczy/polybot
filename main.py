@@ -101,6 +101,7 @@ from config import BotConfig                                       # noqa: E402
 from core.clob_client import (                                     # noqa: E402
     PolyClient, classify_fills, prime_market_meta,
 )
+from core import market_titles                                  # noqa: E402
 from core.scanner import FeedRegistry, MarketScanner               # noqa: E402
 from execution.auto_redeem import AutoRedeemer                     # noqa: E402
 from execution.inventory_manager import InventoryManager           # noqa: E402
@@ -166,6 +167,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 _cfg = BotConfig.from_env()
 
 STARTING_BALANCE:    float = _cfg.starting_balance
+_started_monotonic: float = time.monotonic()
 HEARTBEAT_INTERVAL:  float = 60.0
 # Telegram health-ping cadence (seconds); 0 disables the Telegram heartbeat
 # entirely.  Metrics/journal heartbeats stay on the 60-s cadence regardless.
@@ -757,6 +759,8 @@ async def heartbeat_loop(
     breaker:       CircuitBreaker,
     notifier:      TelegramNotifier,
     feed_registry: FeedRegistry,
+    client:        "PolyClient | None"   = None,
+    detector:      "ArbDetector | None"  = None,
 ) -> None:
     """
     Refresh metrics every HEARTBEAT_INTERVAL (60 s) and send a Telegram health
@@ -782,7 +786,29 @@ async def heartbeat_loop(
                 and now - last_tg_ping >= _telegram_heartbeat_s
             ):
                 last_tg_ping = now
-                await notifier.heartbeat(status)
+                # Named positions cost one read; at the daily cadence that is
+                # cheap, and it is the only place the summary can report the
+                # actual shares held rather than a slot count.
+                positions = (
+                    await client.open_positions_detail() if client else None
+                )
+                await notifier.heartbeat(
+                    status,
+                    extra={
+                        "markets":       feed_registry.active_count,
+                        "shards":        len(getattr(feed_registry, "_shards", [])),
+                        "titles_known":  market_titles.count(),
+                        "max_positions": int(os.environ.get("MAX_POSITIONS", 5)),
+                        # the tuner rewrites this in place, so read it live
+                        "net_margin":    round(
+                            getattr(detector, "_net_margin", _desired_margin), 4
+                        ),
+                        "negrisk_mode":  _negrisk_exec_mode,
+                        "negrisk_edge":  _negrisk_min_relative_edge,
+                        "uptime_h":      f"{(now - _started_monotonic) / 3600.0:.1f}h",
+                    },
+                    positions=positions,
+                )
 
             # ── Metrics: refresh balance + market count (60-s cadence) ────
             USDC_BALANCE.set(
@@ -1065,7 +1091,7 @@ async def main() -> None:
         asyncio.create_task(pair_guard.run(),                                  name="pair_guard"),
         *([asyncio.create_task(negrisk_guard.run(), name="negrisk_guard")]
           if negrisk_guard is not None else []),
-        asyncio.create_task(heartbeat_loop(breaker, notifier, feed_registry),  name="heartbeat"),
+        asyncio.create_task(heartbeat_loop(breaker, notifier, feed_registry, client, detector), name="heartbeat"),
         asyncio.create_task(telegram_loop(notifier),                           name="telegram"),
         asyncio.create_task(sig_logger.run(),                                  name="sig_logger"),
         asyncio.create_task(metrics_server(),                                  name="metrics"),
