@@ -339,18 +339,36 @@ class MakerPairGuard:
             return
 
         if order is None:
-            # Order no longer tracked by the CLOB: it either fully filled or
-            # was cancelled.  If we did not request the cancel, assume FILLED —
-            # over-estimating exposure is safe (we hedge), under-estimating is not.
+            # Untracked by the CLOB: fully filled OR cancelled, and the response
+            # cannot tell them apart. Resolve against the chain instead of
+            # guessing — guessing "filled" fabricates P&L and unwinds shares
+            # that do not exist; guessing "cancelled" leaves a filled leg naked.
             leg.open = False
             if not leg.cancel_requested:
-                if leg.matched < leg.size - _SHARE_EPS:
-                    logger.warning(
-                        "PairGuard | order %s vanished without cancel — "
-                        "assuming fully filled (%.2f shares)",
+                held = await self._client.share_balance(leg.token_id)
+                if held is None:
+                    logger.error(
+                        "PairGuard | order %s untracked and share balance "
+                        "unavailable — assuming filled (%.2f shares); verify "
+                        "the wallet manually",
                         leg.order_id[:12], leg.size,
                     )
-                leg.matched = leg.size
+                    leg.matched = leg.size
+                else:
+                    verified = min(leg.size, held)
+                    if verified > leg.matched + _SHARE_EPS:
+                        logger.warning(
+                            "PairGuard | order %s untracked — chain confirms "
+                            "%.2f share(s) held, treating as filled",
+                            leg.order_id[:12], verified,
+                        )
+                    elif verified < _SHARE_EPS:
+                        logger.info(
+                            "PairGuard | order %s untracked and wallet holds "
+                            "no shares — cancelled, not filled",
+                            leg.order_id[:12],
+                        )
+                    leg.matched = max(leg.matched, verified)
             return
 
         status  = str(order.get("status", "")).strip().lower()

@@ -288,18 +288,41 @@ class NegRiskBundleGuard:
             return
 
         if order is None:
-            # Untracked by the CLOB: filled or cancelled.  Absent an explicit
-            # cancel from us, assume FILLED — over-estimating exposure makes us
-            # unwind unnecessarily, under-estimating leaves naked shares.
+            # Untracked by the CLOB. That covers BOTH fully filled and
+            # cancelled and the response cannot distinguish them, so ask the
+            # chain rather than guess. Guessing "filled" fabricates P&L and
+            # triggers unwinds of shares that do not exist; guessing
+            # "cancelled" leaves a filled leg naked. Both were observed live
+            # on 2026-09-04.
             leg.open = False
             if not leg.cancel_requested:
-                if leg.matched < leg.size - _SHARE_EPS:
-                    logger.warning(
-                        "NegRiskGuard | order %s vanished without cancel — "
-                        "assuming fully filled (%.2f shares)",
+                held = await self._client.share_balance(leg.token_id)
+                if held is None:
+                    # Chain unreachable: fall back to the conservative
+                    # assumption (filled) so we unwind rather than sit on a
+                    # naked leg — but make the uncertainty loud.
+                    logger.error(
+                        "NegRiskGuard | order %s untracked and share balance "
+                        "unavailable — assuming filled (%.2f shares); verify "
+                        "the wallet manually",
                         leg.order_id[:12], leg.size,
                     )
-                leg.matched = leg.size
+                    leg.matched = leg.size
+                else:
+                    verified = min(leg.size, held)
+                    if verified > leg.matched + _SHARE_EPS:
+                        logger.warning(
+                            "NegRiskGuard | order %s untracked — chain confirms "
+                            "%.2f share(s) held, treating as filled",
+                            leg.order_id[:12], verified,
+                        )
+                    elif verified < _SHARE_EPS:
+                        logger.info(
+                            "NegRiskGuard | order %s untracked and wallet holds no "
+                            "shares — cancelled, not filled",
+                            leg.order_id[:12],
+                        )
+                    leg.matched = max(leg.matched, verified)
             return
 
         status  = str(order.get("status", "")).strip().lower()

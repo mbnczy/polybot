@@ -664,6 +664,12 @@ class _StubClient:
         self.cancelled: list[str] = []
         self.unwound:   list[tuple[str, float]] = []
         self.unwind_fails = False
+        # token_id -> on-chain share balance. The guard consults this to tell a
+        # FILLED untracked order from a CANCELLED one instead of guessing.
+        self.share_balances: dict[str, float] = {}
+
+    async def share_balance(self, token_id: str):
+        return self.share_balances.get(token_id, 0.0)
 
     async def get_order_status(self, order_id: str) -> dict | None:
         return self._statuses.get(order_id)
@@ -792,12 +798,14 @@ class TestNegRiskBundleGuard:
         assert breaker.released == 0
 
     @pytest.mark.asyncio
-    async def test_vanished_order_treated_as_filled(self):
-        """An order the CLOB no longer knows about is assumed filled."""
+    async def test_vanished_order_filled_when_chain_holds_shares(self):
+        """Untracked order + shares on-chain => genuinely filled."""
         from execution.negrisk_guard import NegRiskBundleGuard
 
         sig = _signal()
         client = _StubClient({"o0": None, "o1": None, "o2": None})
+        # The chain is the arbiter: all three legs really did fill.
+        client.share_balances = {"T0": 10.0, "T1": 10.0, "T2": 10.0}
         breaker, notifier = _StubBreaker(), _StubNotifier()
         guard = NegRiskBundleGuard(client, breaker, notifier)
 
@@ -805,6 +813,30 @@ class TestNegRiskBundleGuard:
         await guard.poll_once()
 
         assert breaker.filled == [pytest.approx(11.0)]
+
+    @pytest.mark.asyncio
+    async def test_vanished_order_not_filled_when_wallet_is_empty(self):
+        """
+        Untracked order + NO shares on-chain => cancelled, not filled.
+
+        Regression for 2026-09-04: treating "untracked" as "filled" fabricated a
+        +0.3040 profit, booked it to daily_state.json, and then tried to unwind
+        shares that did not exist ("balance: 0, order amount: 10190000").
+        """
+        from execution.negrisk_guard import NegRiskBundleGuard
+
+        sig = _signal()
+        client = _StubClient({"o0": None, "o1": None, "o2": None})
+        client.share_balances = {}          # wallet holds nothing
+        breaker, notifier = _StubBreaker(), _StubNotifier()
+        guard = NegRiskBundleGuard(client, breaker, notifier)
+
+        guard.watch_bundle(sig, _acks())
+        await guard.poll_once()
+
+        # No phantom fill, so no fabricated P&L and no bogus unwind.
+        assert breaker.filled == []
+        assert client.unwound == []
 
     @pytest.mark.asyncio
     async def test_failed_submission_leg_is_not_polled(self):

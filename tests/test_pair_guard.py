@@ -37,9 +37,15 @@ class FakeGuardClient:
         self.unwound: list[tuple[str, float]] = []
         self.taker_buys: list[tuple[str, float, float]] = []
         self.best_asks: dict[str, float] = {}
+        # token_id -> on-chain share balance; the guard consults this to
+        # tell a FILLED untracked order from a CANCELLED one.
+        self.share_balances: dict[str, float] = {}
         self.taker_fill_status: str = "matched"
         # Price the naked leg sells at on unwind (proceeds = size × this).
         self.unwind_sell_price: float = 0.40
+
+    async def share_balance(self, token_id: str):
+        return self.share_balances.get(token_id, 0.0)
 
     async def get_order_status(self, order_id: str):
         return self.orders.get(order_id)
@@ -251,10 +257,12 @@ async def test_no_fills_ttl_cancels_both_and_releases():
 
 
 @pytest.mark.asyncio
-async def test_vanished_order_without_cancel_assumed_filled():
+async def test_vanished_order_filled_when_chain_holds_shares():
+    """Untracked order + shares on-chain => genuinely filled, P&L booked."""
     client = FakeGuardClient()
-    client.orders["oy"] = None    # 404 — vanished, we never cancelled it
+    client.orders["oy"] = None    # vanished, we never cancelled it
     client.orders["on"] = {"status": "matched", "size_matched": 10.0}
+    client.share_balances["tok-yes"] = 10.0   # the chain confirms the fill
     inventory = FakeInventory()
     guard, breaker, _ = _build_guard(client, inventory)
 
@@ -263,11 +271,34 @@ async def test_vanished_order_without_cancel_assumed_filled():
 
     await guard.poll_once()
 
-    # Vanished YES leg is assumed fully filled → pair is complete, P&L booked.
     assert len(breaker.fills) == 1
     assert breaker.fills[0] == pytest.approx(0.22, abs=1e-6)
     assert inventory.paired == ["0xcond"]
     assert guard.watched_count == 0
+
+
+@pytest.mark.asyncio
+async def test_vanished_order_not_filled_when_wallet_is_empty():
+    """
+    Untracked order + NO shares on-chain => cancelled, not filled.
+
+    Regression for 2026-09-04: assuming "filled" fabricated P&L and triggered an
+    unwind of shares that did not exist.
+    """
+    client = FakeGuardClient()
+    client.orders["oy"] = None
+    client.orders["on"] = {"status": "matched", "size_matched": 10.0}
+    client.share_balances = {}                # wallet holds nothing
+    inventory = FakeInventory()
+    guard, breaker, _ = _build_guard(client, inventory)
+
+    guard.watch_pair(_maker_signal(10.0), 10.0,
+                     _resting_resp("oy"), _resting_resp("on"))
+
+    await guard.poll_once()
+
+    # The YES leg must NOT be counted as filled, so no phantom paired P&L.
+    assert inventory.paired == []
 
 
 @pytest.mark.asyncio

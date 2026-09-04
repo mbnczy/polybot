@@ -91,7 +91,7 @@ from web3.middleware import ExtraDataToPOAMiddleware
 # Polymarket unified V2 SDK (the archived py-clob-client signs pre-migration
 # orders that the CLOB now rejects with "invalid order version").
 from polymarket import BuilderApiKey, SecureClient
-from polymarket.errors import RateLimitError
+from polymarket.errors import RateLimitError, UnexpectedResponseError
 
 from telemetry.metrics import MATCH_ORDERS_TOTAL, SIGN_SECONDS, SUBMIT_SECONDS
 from strategy.arbitrage import TICK_SIZE   # single source of truth for tick size
@@ -111,6 +111,15 @@ _PROXY_SESSION_PLACEHOLDER = "{session}"   # embedded in residential proxy URLs
 # contention point. Size via CLOB_SIGNER_THREADS (default 8) to keep signing off
 # the critical path under concurrent execution.
 _SIGNER_THREADS = max(2, int(os.environ.get("CLOB_SIGNER_THREADS", "8")))
+_CTF_ADDRESS_1155 = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+_ERC1155_MIN_ABI = [
+    {"constant": True,
+     "inputs": [{"name": "owner", "type": "address"},
+                {"name": "id", "type": "uint256"}],
+     "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}],
+     "stateMutability": "view", "type": "function"},
+]
+
 _ERC20_MIN_ABI = [
     {"constant": True, "inputs": [{"name": "_owner", "type": "address"}],
      "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}],
@@ -576,6 +585,32 @@ def _backoff_secs(attempt: int) -> float:
 # PolyClient
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _is_untracked_order(exc: Exception) -> bool:
+    """
+    True when the SDK raised purely because the CLOB returned a null body.
+
+    The CLOB answers `null` for an order it no longer tracks. The SDK feeds that
+    None into model_validate() and raises UnexpectedResponseError instead of
+    returning None.
+
+    NOTE: "untracked" means filled OR cancelled — the response cannot tell them
+    apart. Callers must resolve the ambiguity against the chain (see
+    PolyClient.share_balance); assuming either way is unsafe.
+
+    Narrow on purpose: only a validation failure whose offending input is None
+    counts, so genuine schema drift still surfaces as an error.
+    """
+    cause  = getattr(exc, "__cause__", None)
+    errors = getattr(cause, "errors", None)
+    if not callable(errors):
+        return False
+    try:
+        rows = errors()
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(rows) and all(r.get("input", "sentinel") is None for r in rows)
+
+
 class PolyClient:
     """
     Async-friendly Polymarket CLOB client.
@@ -677,6 +712,40 @@ class PolyClient:
         Balance-scanning components must target this address.
         """
         return str(getattr(self._client, "wallet", "") or self._funder)
+
+    async def share_balance(self, token_id: str) -> "float | None":
+        """
+        On-chain share balance for a CLOB token — ground truth for "did it fill".
+
+        A Polymarket CLOB token_id IS the ERC-1155 position id on the
+        ConditionalTokens contract, so balanceOf(wallet, token_id) is the
+        authoritative count of shares held.
+
+        This exists because order status alone cannot answer the question. The
+        CLOB returns a null body for any order it no longer tracks, which covers
+        BOTH "fully filled" and "cancelled" — indistinguishable from the
+        response. Guessing either way is harmful: assuming cancelled leaves a
+        filled leg naked, assuming filled fabricates P&L and triggers unwinds of
+        shares that do not exist (observed live 2026-09-04). The chain knows.
+
+        Returns None on failure so callers can fall back rather than guess.
+        """
+        def _read() -> float:
+            ctf = self._w3.eth.contract(
+                address=Web3.to_checksum_address(_CTF_ADDRESS_1155),
+                abi=_ERC1155_MIN_ABI,
+            )
+            wallet = Web3.to_checksum_address(self.trading_wallet)
+            raw    = ctf.functions.balanceOf(wallet, int(token_id)).call()
+            return raw / 1e6      # CTF positions carry 6 decimals, like the collateral
+
+        try:
+            return await asyncio.get_running_loop().run_in_executor(_executor, _read)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Share balance query failed for %s: %s", str(token_id)[:16], exc
+            )
+            return None
 
     async def open_positions_detail(self) -> "list[dict] | None":
         """
@@ -1029,10 +1098,19 @@ class PolyClient:
         Returns the order dict if found, or None if the order is no longer
         tracked (fully filled or cancelled / unknown to the CLOB).
         """
+        def _fetch():
+            try:
+                return self._client.get_order(order_id=order_id)
+            except UnexpectedResponseError as exc:
+                # Null body: the CLOB no longer tracks this order. Return None
+                # rather than burning five retries — but None means "filled OR
+                # cancelled", so the caller must check the chain to tell which.
+                if _is_untracked_order(exc):
+                    return None
+                raise
+
         try:
-            order = await self._run_with_retry(
-                lambda: self._client.get_order(order_id=order_id)
-            )
+            order = await self._run_with_retry(_fetch)
         except ClobApiError as exc:
             if exc.status_code == 404:
                 return None   # order fully consumed or never existed
