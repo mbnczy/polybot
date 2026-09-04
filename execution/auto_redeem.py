@@ -127,6 +127,18 @@ _CTF_ABI = [
 
 # ── Configuration ────────────────────────────────────────────────────────────
 _GAMMA_API_BASE  = "https://gamma-api.polymarket.com"
+
+# The registry tracks up to MAX_FEEDS markets (2000). Re-querying Gamma for
+# every one of them on every poll meant ~1690 unthrottled requests per 300 s
+# cycle, which Gamma answered with ~1100 HTTP 429s per day. Almost all of those
+# markets are nowhere near resolution, so a negative result is cached: a market
+# found unresolved is not re-checked for _UNRESOLVED_TTL_S. Redemption is not
+# time-critical (winnings do not expire), so an hour of staleness is harmless.
+_UNRESOLVED_TTL_S: float = float(
+    os.environ.get("REDEEM_UNRESOLVED_TTL_S", 3600.0)
+)
+# Small gap between requests so a cold scan does not burst into the rate limit.
+_GAMMA_GAP_S: float = float(os.environ.get("REDEEM_GAMMA_GAP_S", 0.10))
 _POLL_INTERVAL   = float(os.environ.get("REDEEM_POLL_INTERVAL", 300))
 _GAS_LIMIT       = int(os.environ.get("REDEEM_GAS_LIMIT",       200_000))
 _PAPER_TRADE     = os.environ.get("PAPER_TRADE_MODE", "false").strip().lower() == "true"
@@ -215,6 +227,8 @@ class AutoRedeemer:
 
         # Per-market resolution cache: condition_id → (winner_index | None, cached_ts)
         self._resolution_cache: dict[str, tuple[int | None, float]] = {}
+        # condition_id -> monotonic ts of the last 'not resolved' answer
+        self._unresolved_at: dict[str, float] = {}
         # Markets already fully redeemed (skip on subsequent polls)
         self._redeemed: set[str] = set()
 
@@ -262,8 +276,22 @@ class AutoRedeemer:
             len(condition_ids),
         )
 
+        now      = time.monotonic()
+        due      = [
+            cid for cid in condition_ids
+            if now - self._unresolved_at.get(cid, 0.0) >= _UNRESOLVED_TTL_S
+        ]
+        skipped  = len(condition_ids) - len(due)
+        if skipped:
+            logger.debug(
+                "AutoRedeemer | %d market(s) due, %d still within the "
+                "unresolved TTL", len(due), skipped,
+            )
+
         async with aiohttp.ClientSession() as session:
-            for cid in condition_ids:
+            for idx, cid in enumerate(due):
+                if idx and _GAMMA_GAP_S > 0:
+                    await asyncio.sleep(_GAMMA_GAP_S)
                 try:
                     await self._check_one(cid, session)
                 except asyncio.CancelledError:
@@ -282,7 +310,10 @@ class AutoRedeemer:
         """Check a single market and redeem if resolved with a position balance."""
         winner_index = await self._get_winner_index(condition_id, session)
         if winner_index is None:
-            return   # market not yet resolved
+            # Not resolved (or the fetch failed). Remember when we asked so the
+            # next few polls skip it instead of re-querying every 300 s.
+            self._unresolved_at[condition_id] = time.monotonic()
+            return
 
         # Compute the ERC-1155 position token ID for the winning side
         pos_id  = _compute_position_id(condition_id, winner_index)
