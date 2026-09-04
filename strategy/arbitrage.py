@@ -125,6 +125,8 @@ from typing import Optional
 
 import aiohttp
 
+from core import market_titles          # dependency-free registry
+
 logger = logging.getLogger(__name__)
 
 # ── Maker rebate schedule — 2026 Polymarket category rates ──────────────────
@@ -661,11 +663,11 @@ class DutchBookPricer:
         )
 
         logger.info(
-            "DUTCH BOOK SIGNAL | condition=%s "
+            "DUTCH BOOK SIGNAL | %s "
             "yes_ask=%.4f→bid=%.4f no_ask=%.4f→bid=%.4f "
             "rebate=%.2f%% effective_cost=%.6f maker_net_edge=%.6f(%+.1f bps) "
             "shares=%.2f",
-            condition_id[:16],
+            market_titles.label(condition_id),
             yes_ask, yes_bid, no_ask, no_bid,
             rebate * 100, effective_cost, maker_net_edge, spread_bps,
             n_shares,

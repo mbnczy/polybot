@@ -75,6 +75,8 @@ if TYPE_CHECKING:
     from strategy.arbitrage import NegRiskSignal
     from telemetry.telegram import TelegramNotifier
 
+from core import market_titles
+
 logger = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -201,9 +203,9 @@ class NegRiskBundleGuard:
             created_at=time.monotonic(),
         )
         logger.info(
-            "NegRiskGuard watching | group=%s legs=%d bundles=%.2f "
+            "NegRiskGuard watching | %s legs=%d bundles=%.2f "
             "accepted=%d filled_at_ack=%d",
-            signal.condition_id[:16], len(legs), signal.n_bundles,
+            market_titles.label(signal.condition_id), len(legs), signal.n_bundles,
             sum(1 for l in legs if l.order_id),
             sum(1 for l in legs if l.fully_matched),
         )

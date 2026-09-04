@@ -61,6 +61,7 @@ from typing import Awaitable, Callable
 
 import aiohttp
 
+from core import market_titles
 from core.ws_feed import MarketShard
 from strategy.arbitrage import _resolve_rebate
 from telemetry.metrics import (
@@ -681,6 +682,9 @@ class MarketScanner:
         scored_pairs: list[ScoredCandidate] = []
         for m in markets:
             condition_id = _extract_condition_id(m)
+            # Remember the question text before any skip path — a market we do
+            # not feed today may still be named in a later alert.
+            market_titles.remember(condition_id, m)
             if not condition_id or condition_id in self._known:
                 continue
             # Skip expired markets before scoring.
@@ -823,6 +827,10 @@ class MarketScanner:
         for group_id, members in groups.items():
             # Rank by traded volume, keep the top slice, resolve NO token IDs.
             members.sort(key=_market_volume, reverse=True)
+            # Name the group after its highest-volume member so alerts and the
+            # daily summary can say what the arb is actually about.
+            if members:
+                market_titles.remember(group_id, members[0])
             no_ids: list[str] = []
             for m in members[:self._negrisk_feed_outcomes]:
                 _yes_id, no_id = _extract_token_ids(m)
