@@ -16,6 +16,9 @@ venv/
 # ── Generated / runtime data (reproducible; not source) ───────────────────────
 data/
 signals.db
+signals.db-wal
+signals.db-shm
+daily_state.json
 *.log
 
 # ── Local scratch / IDE ───────────────────────────────────────────────────────
