@@ -111,6 +111,15 @@ _PROXY_SESSION_PLACEHOLDER = "{session}"   # embedded in residential proxy URLs
 # contention point. Size via CLOB_SIGNER_THREADS (default 8) to keep signing off
 # the critical path under concurrent execution.
 _SIGNER_THREADS = max(2, int(os.environ.get("CLOB_SIGNER_THREADS", "8")))
+_ERC20_MIN_ABI = [
+    {"constant": True, "inputs": [{"name": "_owner", "type": "address"}],
+     "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}],
+     "stateMutability": "view", "type": "function"},
+    {"constant": True, "inputs": [],
+     "name": "decimals", "outputs": [{"name": "", "type": "uint8"}],
+     "stateMutability": "view", "type": "function"},
+]
+
 _executor = ThreadPoolExecutor(
     max_workers=_SIGNER_THREADS, thread_name_prefix="clob-worker"
 )
@@ -668,6 +677,38 @@ class PolyClient:
         Balance-scanning components must target this address.
         """
         return str(getattr(self._client, "wallet", "") or self._funder)
+
+    async def collateral_balance(self) -> "float | None":
+        """
+        Read the ACTUAL collateral (pUSD) balance held by the trading wallet.
+
+        The circuit breaker anchors its drawdown maths to this figure, so it
+        must reflect the wallet rather than a hand-maintained .env constant.
+        The collateral token address comes from the SDK's environment config,
+        so a future protocol migration does not silently read the wrong token.
+
+        Returns None on any failure so the caller can fall back to .env.
+        """
+        def _read() -> float:
+            ctx = getattr(self._client, "_ctx", None)
+            cfg = getattr(ctx, "environment_config", None)
+            token_addr = getattr(cfg, "collateral_token", None)
+            if not token_addr:
+                raise RuntimeError("collateral_token missing from SDK env config")
+            erc20 = self._w3.eth.contract(
+                address=Web3.to_checksum_address(token_addr),
+                abi=_ERC20_MIN_ABI,
+            )
+            addr = Web3.to_checksum_address(self.trading_wallet)
+            raw  = erc20.functions.balanceOf(addr).call()
+            dec  = erc20.functions.decimals().call()
+            return raw / (10 ** dec)
+
+        try:
+            return await asyncio.get_running_loop().run_in_executor(_executor, _read)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Collateral balance query failed: %s", exc)
+            return None
 
     # ──────────────────────────────────────────────────────────────────────────
     # Internal dispatch helpers

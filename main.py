@@ -843,6 +843,7 @@ def _register_shutdown_signals(
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def main() -> None:
+    global STARTING_BALANCE
     logger.info("=== Polymarket ARB Bot — Phase 8 starting ===")
     logger.info(
         "Config | balance=%.2f net_margin=%.3f default_fee=%.3f pair_cap=%.2f USDC "
@@ -871,6 +872,28 @@ async def main() -> None:
 
     # ── initialise components ─────────────────────────────────────────────
     client         = PolyClient()
+
+    # Anchor risk maths to the ACTUAL wallet balance. STARTING_BALANCE from
+    # .env is a hand-maintained constant that goes stale after the first fill
+    # or fee, and MAX_SESSION_DRAWDOWN_PCT / the /status report are both
+    # measured against it. Fall back to the .env value if the query fails.
+    _chain_balance = await client.collateral_balance()
+    if _chain_balance is not None and _chain_balance > 0.0:
+        if abs(_chain_balance - STARTING_BALANCE) > 0.005:
+            logger.warning(
+                "STARTING_BALANCE=%.4f (.env) differs from on-chain %.4f — "
+                "using the on-chain value for risk limits",
+                STARTING_BALANCE, _chain_balance,
+            )
+        STARTING_BALANCE = round(_chain_balance, 6)
+        logger.info("Balance | anchored to wallet: %.6f", STARTING_BALANCE)
+    else:
+        logger.warning(
+            "On-chain balance query failed — falling back to .env "
+            "STARTING_BALANCE=%.4f (risk limits may be measured against a "
+            "stale figure)", STARTING_BALANCE,
+        )
+
     breaker        = CircuitBreaker(starting_balance=STARTING_BALANCE)
     notifier       = TelegramNotifier(on_status=breaker.status_dict)
     fee_engine     = FeeEngine(default_fee=_default_fee)
