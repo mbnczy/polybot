@@ -148,7 +148,8 @@ def _resting_resp(order_id: str) -> dict:
     return {"status": "live", "order_id": order_id}
 
 
-def _build_guard(client, inventory=None, hedge_timeout_s=0.0, order_ttl_s=60.0):
+def _build_guard(client, inventory=None, hedge_timeout_s=0.0, order_ttl_s=60.0,
+                 index_grace=0.0):
     breaker  = FakeBreaker()
     notifier = FakeNotifier()
     guard = MakerPairGuard(
@@ -158,6 +159,10 @@ def _build_guard(client, inventory=None, hedge_timeout_s=0.0, order_ttl_s=60.0):
         hedge_timeout_s=hedge_timeout_s,
         order_ttl_s=order_ttl_s,
         taker_fee_est=0.02,
+        # Judge untracked orders at once unless a test says otherwise: the
+        # indexing grace window is exercised by its own tests, and leaving it on
+        # here would make every other case pass by simply doing nothing.
+        index_grace=index_grace,
     )
     return guard, breaker, notifier
 

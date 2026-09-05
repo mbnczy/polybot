@@ -77,6 +77,12 @@ PAIR_GUARD_POLL_S: float = float(os.environ.get("PAIR_GUARD_POLL_S", 1.0))
 HEDGE_TIMEOUT_S:   float = float(os.environ.get("HEDGE_TIMEOUT_S", 8.0))
 MAKER_ORDER_TTL_S: float = float(os.environ.get("MAKER_ORDER_TTL_S", 45.0))
 
+# Grace period before an order the CLOB does not know about is judged. A null
+# body also covers "accepted a moment ago and not indexed yet"; judging inside
+# that window abandons a live resting order. See the NegRisk guard for the
+# incident that exposed it.
+ORDER_INDEX_GRACE_S: float = float(os.environ.get("ORDER_INDEX_GRACE_S", 5.0))
+
 # Shares are quoted to 2 d.p.; anything below half an increment is noise.
 _SHARE_EPS: float = 0.005
 
@@ -96,6 +102,9 @@ class _Leg:
     matched:          float = 0.0
     open:             bool  = True
     cancel_requested: bool  = False
+    # monotonic clock at submission — an order cannot be judged before the
+    # exchange has had time to index it.
+    placed_at:        float = field(default_factory=time.monotonic)
 
     @property
     def fully_matched(self) -> bool:
@@ -147,6 +156,7 @@ class MakerPairGuard:
         hedge_timeout_s: float = HEDGE_TIMEOUT_S,
         order_ttl_s:     float = MAKER_ORDER_TTL_S,
         taker_fee_est:   float = DEFAULT_TAKER_FEE,
+        index_grace:     float = ORDER_INDEX_GRACE_S,
     ) -> None:
         self._client    = clob_client
         self._breaker   = circuit_breaker
@@ -156,6 +166,7 @@ class MakerPairGuard:
         self._hedge_s   = hedge_timeout_s
         self._ttl_s     = order_ttl_s
         self._fee_est   = taker_fee_est
+        self._grace     = max(0.0, index_grace)
         self._pairs: dict[str, _WatchedPair] = {}
         logger.info(
             "MakerPairGuard init | poll=%.2fs hedge_timeout=%.1fs order_ttl=%.1fs",
@@ -339,8 +350,21 @@ class MakerPairGuard:
             return
 
         if order is None:
-            # Untracked by the CLOB: fully filled OR cancelled, and the response
-            # cannot tell them apart. Resolve against the chain instead of
+            # A null body also covers "accepted a moment ago and not indexed
+            # yet". Judging that as filled-or-cancelled abandons a live resting
+            # order, so wait out the grace window and let the next poll decide.
+            if (
+                not leg.cancel_requested
+                and time.monotonic() - leg.placed_at < self._grace
+            ):
+                logger.debug(
+                    "PairGuard | order %s not indexed yet — still watching",
+                    leg.order_id[:12],
+                )
+                return
+
+            # Past the grace window: fully filled OR cancelled, and the response
+            # cannot tell them apart. Resolve against the trade feed instead of
             # guessing — guessing "filled" fabricates P&L and unwinds shares
             # that do not exist; guessing "cancelled" leaves a filled leg naked.
             leg.open = False

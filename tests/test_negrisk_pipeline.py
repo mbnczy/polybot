@@ -771,7 +771,9 @@ class TestNegRiskBundleGuard:
             "o2": {"status": "live",    "size_matched": 0.0},
         })
         breaker, notifier = _StubBreaker(), _StubNotifier()
-        guard = NegRiskBundleGuard(client, breaker, notifier, bundle_timeout=0.0)
+        guard = NegRiskBundleGuard(
+            client, breaker, notifier, bundle_timeout=0.0, index_grace=0.0
+        )
 
         guard.watch_bundle(sig, _acks())
         await guard.poll_once()
@@ -794,7 +796,9 @@ class TestNegRiskBundleGuard:
         })
         client.unwind_fails = True
         breaker, notifier = _StubBreaker(), _StubNotifier()
-        guard = NegRiskBundleGuard(client, breaker, notifier, bundle_timeout=0.0)
+        guard = NegRiskBundleGuard(
+            client, breaker, notifier, bundle_timeout=0.0, index_grace=0.0
+        )
 
         guard.watch_bundle(sig, _acks(2))
         await guard.poll_once()
@@ -813,7 +817,7 @@ class TestNegRiskBundleGuard:
         # The trade feed is the arbiter: all three legs really did fill.
         client.order_fills = {"o0": 10.0, "o1": 10.0, "o2": 10.0}
         breaker, notifier = _StubBreaker(), _StubNotifier()
-        guard = NegRiskBundleGuard(client, breaker, notifier)
+        guard = NegRiskBundleGuard(client, breaker, notifier, index_grace=0.0)
 
         guard.watch_bundle(sig, _acks())
         await guard.poll_once()
@@ -835,7 +839,7 @@ class TestNegRiskBundleGuard:
         client = _StubClient({"o0": None, "o1": None, "o2": None})
         client.order_fills = {}             # no fills attributed to any leg
         breaker, notifier = _StubBreaker(), _StubNotifier()
-        guard = NegRiskBundleGuard(client, breaker, notifier)
+        guard = NegRiskBundleGuard(client, breaker, notifier, index_grace=0.0)
 
         guard.watch_bundle(sig, _acks())
         await guard.poll_once()
@@ -879,7 +883,9 @@ class TestNegRiskBundleGuard:
         # bundle_timeout=0 so a flatten decision is reachable on this pass —
         # without it the test would pass merely because the imbalance clock had
         # not expired, which is not what it is meant to prove.
-        guard = NegRiskBundleGuard(client, breaker, notifier, bundle_timeout=0.0)
+        guard = NegRiskBundleGuard(
+            client, breaker, notifier, bundle_timeout=0.0, index_grace=0.0
+        )
 
         guard.watch_bundle(sig, _acks())
         await guard.poll_once()
@@ -906,7 +912,9 @@ class TestNegRiskBundleGuard:
         breaker, notifier = _StubBreaker(), _StubNotifier()
         # bundle_timeout=0: tolerate no imbalance, so the flatten happens on the
         # same pass that detects it.
-        guard = NegRiskBundleGuard(client, breaker, notifier, bundle_timeout=0.0)
+        guard = NegRiskBundleGuard(
+            client, breaker, notifier, bundle_timeout=0.0, index_grace=0.0
+        )
 
         guard.watch_bundle(sig, _acks())
         await guard.poll_once()
@@ -934,7 +942,8 @@ class TestNegRiskBundleGuard:
         client.order_fills = {"o0": 10.0, "o1": 10.0}     # o2 never filled
         breaker, notifier = _StubBreaker(), _StubNotifier()
         guard = NegRiskBundleGuard(
-            client, breaker, notifier, bundle_timeout=0.0, group_cooldown=60.0
+            client, breaker, notifier, bundle_timeout=0.0, group_cooldown=60.0,
+            index_grace=0.0,
         )
 
         guard.watch_bundle(sig, _acks())
@@ -952,7 +961,8 @@ class TestNegRiskBundleGuard:
         client.order_fills = {"o0": 10.0, "o1": 10.0}
         breaker, notifier = _StubBreaker(), _StubNotifier()
         guard = NegRiskBundleGuard(
-            client, breaker, notifier, bundle_timeout=0.0, group_cooldown=0.0
+            client, breaker, notifier, bundle_timeout=0.0, group_cooldown=0.0,
+            index_grace=0.0,
         )
 
         guard.watch_bundle(sig, _acks())
@@ -1179,13 +1189,29 @@ class TestDuplicateOrderIsTerminal:
     @pytest.mark.parametrize("msg", [
         "429 Too Many Requests",
         "connection reset by peer",
-        "order is invalid. Insufficient balance.",
         "",
     ])
-    def test_other_failures_stay_retryable(self, msg):
-        """Only the duplicate case is terminal; do not swallow real retries."""
-        from core.clob_client import _is_duplicate_order
-        assert _is_duplicate_order(RuntimeError(msg)) is False
+    def test_transport_failures_stay_retryable(self, msg):
+        """Do not swallow the retries that actually help."""
+        from core.clob_client import _terminal_order_error
+        assert _terminal_order_error(RuntimeError(msg)) is None
+
+    def test_insufficient_balance_is_terminal(self):
+        """
+        Nothing about the wallet changes while we back off, so retrying a
+        rejection the exchange derived from our balance just re-sends it.
+        """
+        from core.clob_client import _terminal_order_error
+        exc = RuntimeError(
+            "not enough balance / allowance: the balance is not enough -> "
+            "balance: 4885275, order amount: 4997830"
+        )
+        assert _terminal_order_error(exc) == "insufficient balance/allowance"
+
+    def test_duplicate_is_named_distinctly(self):
+        from core.clob_client import _terminal_order_error
+        exc = RuntimeError("order 0xabc is invalid. Duplicated.")
+        assert _terminal_order_error(exc) == "duplicate order"
 
 
 class TestGroupCooldownOnSubmissionFailure:
@@ -1212,3 +1238,79 @@ class TestGroupCooldownOnSubmissionFailure:
         )
         guard.cool_down("0xgroup")
         assert not guard.is_busy("0xgroup")
+
+
+class TestFreshOrdersAreNotJudged:
+    """
+    Regression for 2026-09-05 23:33-23:41, the costliest fault of the night.
+
+    The CLOB returns a null body for an order it does not track — and it returns
+    the SAME null body for an order it does not track YET. A limit order is not
+    queryable for a moment after it is accepted.
+
+    The guard judged inside that window: eight bundles were released ~200 ms
+    after being placed, every leg logged "untracked with no attributed fills —
+    cancelled, not filled", and the slot was handed back. But the orders were
+    live on the book. Six of those 24 abandoned legs filled with nobody
+    watching, turning 29 pUSD of cash into 30.42 shares of a single outcome —
+    an unmanaged naked directional position, which is precisely what this guard
+    exists to prevent. The guard's own log said nothing had filled.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_just_placed_order_is_left_alone(self):
+        from execution.negrisk_guard import NegRiskBundleGuard
+
+        sig = _signal()
+        # every leg untracked, as a freshly accepted order looks
+        client = _StubClient({"o0": None, "o1": None, "o2": None})
+        client.order_fills = {}
+        breaker, notifier = _StubBreaker(), _StubNotifier()
+        guard = NegRiskBundleGuard(
+            client, breaker, notifier, index_grace=5.0, bundle_timeout=0.0
+        )
+
+        guard.watch_bundle(sig, _acks())
+        await guard.poll_once()
+
+        assert guard.is_watching(sig.condition_id), (
+            "released a bundle whose orders were still being indexed"
+        )
+        assert breaker.released == 0, "handed back the slot for live orders"
+        assert client.cancelled == [], "cancelled orders that were still resting"
+
+    @pytest.mark.asyncio
+    async def test_after_the_grace_window_it_resolves_normally(self):
+        from execution.negrisk_guard import NegRiskBundleGuard
+
+        sig = _signal()
+        client = _StubClient({"o0": None, "o1": None, "o2": None})
+        client.order_fills = {}
+        breaker, notifier = _StubBreaker(), _StubNotifier()
+        # grace=0 -> judge immediately, the pre-existing behaviour
+        guard = NegRiskBundleGuard(client, breaker, notifier, index_grace=0.0)
+
+        guard.watch_bundle(sig, _acks())
+        await guard.poll_once()
+
+        assert not guard.is_watching(sig.condition_id)
+        assert breaker.released == 1
+
+    @pytest.mark.asyncio
+    async def test_grace_does_not_delay_a_leg_we_cancelled(self):
+        """An order we asked to cancel is ours to judge immediately."""
+        from execution.negrisk_guard import NegRiskBundleGuard
+
+        sig = _signal()
+        client = _StubClient({"o0": None, "o1": None, "o2": None})
+        client.order_fills = {}
+        breaker, notifier = _StubBreaker(), _StubNotifier()
+        guard = NegRiskBundleGuard(client, breaker, notifier, index_grace=999.0)
+
+        guard.watch_bundle(sig, _acks())
+        for b in guard._bundles.values():
+            for leg in b.legs:
+                leg.cancel_requested = True
+        await guard.poll_once()
+
+        assert not guard.is_watching(sig.condition_id)

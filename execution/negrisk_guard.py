@@ -92,6 +92,19 @@ NEGRISK_GROUP_COOLDOWN_S: float = float(
     os.environ.get("NEGRISK_GROUP_COOLDOWN_S", 60.0)
 )
 
+# Grace period before an order the CLOB does not know about is judged.
+#
+# The CLOB returns a null body for an order it "no longer tracks" — but it
+# returns the same null body for an order it does NOT YET track. A limit order
+# is not queryable for a moment after it is accepted. Judging it inside that
+# window declares a live resting order dead: on 2026-09-05 the guard released
+# eight bundles ~200 ms after placing them, every leg logged "cancelled, not
+# filled", and 6 of those 24 abandoned legs went on to fill unmanaged — 30.42
+# shares and 29 pUSD of naked directional position that no guard was watching.
+NEGRISK_ORDER_INDEX_GRACE_S: float = float(
+    os.environ.get("NEGRISK_ORDER_INDEX_GRACE_S", 5.0)
+)
+
 # Shares are quoted to 2 d.p.; anything below half an increment is noise.
 _SHARE_EPS: float = 0.005
 
@@ -110,6 +123,9 @@ class _BundleLegState:
     matched:          float = 0.0
     open:             bool  = True
     cancel_requested: bool  = False
+    # monotonic clock at submission — an order cannot be judged before the
+    # exchange has had time to index it.
+    placed_at:        float = field(default_factory=time.monotonic)
 
     @property
     def fully_matched(self) -> bool:
@@ -162,6 +178,7 @@ class NegRiskBundleGuard:
         bundle_timeout: float = NEGRISK_BUNDLE_TIMEOUT_S,
         order_ttl:      float = NEGRISK_ORDER_TTL_S,
         group_cooldown: float = NEGRISK_GROUP_COOLDOWN_S,
+        index_grace:    float = NEGRISK_ORDER_INDEX_GRACE_S,
     ) -> None:
         self._client   = client
         self._breaker  = breaker
@@ -170,6 +187,7 @@ class NegRiskBundleGuard:
         self._timeout  = max(0.0, bundle_timeout)
         self._ttl      = max(0.0, order_ttl)
         self._cooldown = max(0.0, group_cooldown)
+        self._grace    = max(0.0, index_grace)
         self._bundles: dict[str, _WatchedBundle] = {}
         # condition_id -> monotonic deadline before which the group is off limits
         self._cooling: dict[str, float] = {}
@@ -326,9 +344,24 @@ class NegRiskBundleGuard:
             return
 
         if order is None:
-            # Untracked by the CLOB. That covers BOTH fully filled and
-            # cancelled and the response cannot distinguish them, so ask the
-            # chain rather than guess. Guessing "filled" fabricates P&L and
+            # A null body means the CLOB is not tracking this order — which
+            # covers "filled", "cancelled" AND "accepted a moment ago and not
+            # indexed yet". Judging the third case as one of the first two
+            # abandons a live resting order, so wait out the grace period and
+            # let the next poll decide.
+            if (
+                not leg.cancel_requested
+                and time.monotonic() - leg.placed_at < self._grace
+            ):
+                logger.debug(
+                    "NegRiskGuard | order %s not indexed yet — still watching",
+                    leg.order_id[:12],
+                )
+                return
+
+            # Past the grace window it really is filled or cancelled, and the
+            # response cannot distinguish them, so ask the trade feed rather
+            # than guess. Guessing "filled" fabricates P&L and
             # triggers unwinds of shares that do not exist; guessing
             # "cancelled" leaves a filled leg naked. Both were observed live
             # on 2026-09-04.

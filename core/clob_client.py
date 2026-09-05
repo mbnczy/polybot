@@ -596,14 +596,42 @@ def _is_duplicate_order(exc: Exception) -> bool:
     """
     True when the CLOB rejected an order because it has already seen it.
 
-    The message is "order 0x… is invalid. Duplicated." and it carries no HTTP
-    status, so the generic taxonomy filed it under "HTTP-unknown" and retried it
-    five times with backoff — ~8 seconds of guaranteed-futile requests before
-    failing the leg anyway. An order hash the exchange already holds will never
-    become acceptable by asking again; this is terminal, not transient.
+    The message is "order 0x… is invalid. Duplicated." An order hash the
+    exchange already holds will never become acceptable by asking again.
     """
     text = str(exc).lower()
     return "duplicated" in text and "invalid" in text
+
+
+def _is_insufficient_balance(exc: Exception) -> bool:
+    """
+    True when the order was rejected for want of collateral or allowance.
+
+    "not enough balance / allowance: the balance is not enough -> balance:
+    4885275, order amount: 4997830". Nothing about the wallet changes while we
+    back off, so every retry re-sends an order the exchange has already priced
+    against the same balance.
+    """
+    text = str(exc).lower()
+    return "not enough balance" in text or "balance is not enough" in text
+
+
+def _terminal_order_error(exc: Exception) -> "str | None":
+    """
+    Name the reason an order rejection can never succeed on retry, else None.
+
+    These carry NO HTTP status, so the taxonomy filed them under "HTTP-unknown"
+    and retried five times with backoff — ~8 seconds of certain-to-fail requests
+    per order, and on 2026-09-05 that ran once a minute against the same NegRisk
+    group. Retries exist for transport faults and rate limits; a rejection the
+    exchange derived from state that our waiting cannot change is an answer, not
+    a failure to get one.
+    """
+    if _is_duplicate_order(exc):
+        return "duplicate order"
+    if _is_insufficient_balance(exc):
+        return "insufficient balance/allowance"
+    return None
 
 
 def _is_untracked_order(exc: Exception) -> bool:
@@ -1050,11 +1078,12 @@ class PolyClient:
             except Exception as exc:
                 status = _classify_sdk_error(exc) or _extract_http_status(exc)
 
-                # ── Duplicate order — terminal, and cheap to detect ──────────
-                if _is_duplicate_order(exc):
+                # ── Rejections retrying cannot fix — terminal ───────────────
+                _terminal = _terminal_order_error(exc)
+                if _terminal is not None:
                     logger.warning(
-                        "CLOB duplicate order (non-retryable) | fn=%s err=%s",
-                        getattr(fn, "__name__", fn), exc,
+                        "CLOB %s (non-retryable) | fn=%s err=%s",
+                        _terminal, getattr(fn, "__name__", fn), exc,
                     )
                     raise ClobApiError(400, str(exc)) from exc
 
