@@ -168,6 +168,9 @@ _cfg = BotConfig.from_env()
 
 STARTING_BALANCE:    float = _cfg.starting_balance
 _started_monotonic: float = time.monotonic()
+# Condition IDs with a NegRisk bundle mid-submission (see the race note
+# at the is_watching check). Single event loop, so a plain set is enough.
+_negrisk_inflight: set[str] = set()
 HEARTBEAT_INTERVAL:  float = 60.0
 # Telegram health-ping cadence (seconds); 0 disables the Telegram heartbeat
 # entirely.  Metrics/journal heartbeats stay on the 60-s cadence regardless.
@@ -478,7 +481,20 @@ async def strategy_loop(
 
                 # One live bundle per group: a second entry while the first is
                 # still resting would pyramid unhedged multi-leg exposure.
-                if negrisk_guard is not None and negrisk_guard.is_watching(condition_id):
+                #
+                # is_watching() alone is not enough: the guard only registers in
+                # watch_bundle(), AFTER the submission await below. Two ticks for
+                # the same group arriving inside that window both passed the
+                # check and submitted identical bundles — the CLOB rejected the
+                # second with "order is invalid. Duplicated." (seen 2026-09-05).
+                # _negrisk_inflight closes that window; it is added to and tested
+                # with no await in between, so the check-and-set is atomic for
+                # this single-threaded event loop.
+                if (
+                    condition_id in _negrisk_inflight
+                    or (negrisk_guard is not None
+                        and negrisk_guard.is_watching(condition_id))
+                ):
                     logger.debug(
                         "NegRisk signal on busy group %s — skipping",
                         condition_id[:16],
@@ -512,17 +528,24 @@ async def strategy_loop(
                     # so the guard owns the breaker reservation from here and
                     # unwinds anything that fills without the rest of the bundle.
                     breaker.on_arb_open()
+                    _negrisk_inflight.add(condition_id)
                     try:
                         responses = await client.execute_negrisk_clob_bundle(
                             bundle_legs
                         )
                     except CircuitBreakerTripped:
+                        _negrisk_inflight.discard(condition_id)
                         raise
                     except Exception as exc:  # noqa: BLE001
+                        _negrisk_inflight.discard(condition_id)
                         breaker.release_open()
                         logger.error("NegRisk CLOB bundle submission failed: %s", exc)
                         await notifier.notify(f"NEG RISK SUBMIT ERROR: {exc}")
                         continue
+                    finally:
+                        # Once the guard is watching (or we bailed) the group is
+                        # protected by is_watching; drop the short-lived hold.
+                        _negrisk_inflight.discard(condition_id)
 
                     if negrisk_guard is not None:
                         negrisk_guard.watch_bundle(nr_signal, responses)
