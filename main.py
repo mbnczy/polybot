@@ -548,6 +548,15 @@ async def strategy_loop(
                         _negrisk_inflight.discard(condition_id)
 
                     if negrisk_guard is not None:
+                        # A leg the exchange refused (duplicate order hash, say)
+                        # will be refused again on the next signal, so back the
+                        # whole group off rather than re-submitting in ~50 s.
+                        if any(
+                            str((r or {}).get("status", "")).lower()
+                            in ("error", "failed")
+                            for r in responses
+                        ):
+                            negrisk_guard.cool_down(condition_id)
                         negrisk_guard.watch_bundle(nr_signal, responses)
                     else:
                         # No guard wired — nothing can resolve resting legs, so

@@ -592,6 +592,20 @@ def _backoff_secs(attempt: int) -> float:
 # PolyClient
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _is_duplicate_order(exc: Exception) -> bool:
+    """
+    True when the CLOB rejected an order because it has already seen it.
+
+    The message is "order 0x… is invalid. Duplicated." and it carries no HTTP
+    status, so the generic taxonomy filed it under "HTTP-unknown" and retried it
+    five times with backoff — ~8 seconds of guaranteed-futile requests before
+    failing the leg anyway. An order hash the exchange already holds will never
+    become acceptable by asking again; this is terminal, not transient.
+    """
+    text = str(exc).lower()
+    return "duplicated" in text and "invalid" in text
+
+
 def _is_untracked_order(exc: Exception) -> bool:
     """
     True when the SDK raised purely because the CLOB returned a null body.
@@ -1035,6 +1049,14 @@ class PolyClient:
 
             except Exception as exc:
                 status = _classify_sdk_error(exc) or _extract_http_status(exc)
+
+                # ── Duplicate order — terminal, and cheap to detect ──────────
+                if _is_duplicate_order(exc):
+                    logger.warning(
+                        "CLOB duplicate order (non-retryable) | fn=%s err=%s",
+                        getattr(fn, "__name__", fn), exc,
+                    )
+                    raise ClobApiError(400, str(exc)) from exc
 
                 # ── 400: Bad Request — never retryable ───────────────────────
                 if status == 400:

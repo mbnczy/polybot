@@ -153,3 +153,65 @@ async def test_registry_respects_max_feeds_across_shards(monkeypatch):
     assert results == [True, True, True, False, False]   # capped at 3 markets
     assert reg.active_count == 3
     await reg.stop_all()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Book ordering — the exchange returns both sides WORST-first
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBookOrdering:
+    """
+    Regression for 2026-09-05. The CLOB returns asks descending from 0.999 and
+    bids ascending from 0.001, so index 0 is the WORST level on either side.
+    Three call sites read asks[0] as the best ask, which priced markets ~3 cents
+    too high on a real token (asks[0]=0.999 vs a true best ask of 0.969) —
+    hiding real arbitrage and resting synthetic maker bids nowhere near the
+    touch. Verified against the REST book and the websocket book event.
+    """
+
+    def test_best_ask_is_the_minimum_not_the_first(self):
+        from core.ws_feed import _best_ask_level
+        # exactly the shape the exchange sends: worst offer first
+        asks = [{"price": "0.999", "size": "399.1"},
+                {"price": "0.998", "size": "5091.8"},
+                {"price": "0.969", "size": "12.0"}]
+        price, size = _best_ask_level(asks)
+        assert price == pytest.approx(0.969)
+        assert size == pytest.approx(12.0)
+
+    def test_size_comes_from_the_best_level_not_the_first(self):
+        from core.ws_feed import _best_ask_level
+        asks = [{"price": "0.90", "size": "1.0"}, {"price": "0.10", "size": "7.0"}]
+        assert _best_ask_level(asks) == (pytest.approx(0.10), pytest.approx(7.0))
+
+    def test_already_best_first_still_works(self):
+        """Must not depend on the ordering in either direction."""
+        from core.ws_feed import _best_ask_level
+        asks = [{"price": "0.20", "size": "3.0"}, {"price": "0.80", "size": "9.0"}]
+        assert _best_ask_level(asks)[0] == pytest.approx(0.20)
+
+    @pytest.mark.parametrize("asks", [None, [], [{"price": "0", "size": "5"}],
+                                      [{"price": "abc", "size": "5"}]])
+    def test_unusable_asks_yield_nothing(self, asks):
+        from core.ws_feed import _best_ask_level
+        assert _best_ask_level(asks) is None
+
+    def test_zero_and_junk_levels_are_skipped_not_fatal(self):
+        from core.ws_feed import _best_ask_level
+        asks = [{"price": "0.99", "size": "1"}, {"price": "0", "size": "1"},
+                {"price": "bad", "size": "1"}, {"price": "0.42", "size": "2"}]
+        assert _best_ask_level(asks)[0] == pytest.approx(0.42)
+
+    def test_book_event_uses_the_true_best_ask(self):
+        """End to end through the state object, with a real-shaped book event."""
+        from core.ws_feed import _MarketState
+        st = _MarketState("0xcond", "tok", "tok_no")
+        event = {
+            "asks": [{"price": "0.999", "size": "10"},
+                     {"price": "0.969", "size": "4"}],
+            "bids": [{"price": "0.001", "size": "10"},
+                     {"price": "0.960", "size": "4"}],
+        }
+        st._handle_book("tok", event)
+        assert st._best_ask["tok"] == pytest.approx(0.969), "took the worst offer"
+        assert st._best_bid["tok"] == pytest.approx(0.960)

@@ -1153,3 +1153,62 @@ class TestLivePriceChangeFrames:
             "price": "0.28", "side": "SELL", "size": "50",
         }))
         assert len(events) == 1 and events[0]["asset_id"] == "A"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Duplicate-order rejection is terminal, not transient
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDuplicateOrderIsTerminal:
+    """
+    Regression for 2026-09-05 23:34-23:37. "order 0x… is invalid. Duplicated."
+    carries no HTTP status, so the retry taxonomy filed it under HTTP-unknown
+    and retried five times with backoff — ~8 s of certain-to-fail requests
+    before failing the leg anyway, repeating roughly once a minute on the same
+    NegRisk group.
+    """
+
+    def test_duplicate_message_is_recognised(self):
+        from core.clob_client import _is_duplicate_order
+        exc = RuntimeError(
+            "order 0xad8e501bc907b39339fbddf99be3baf44f895a8402ebab19ed12a382"
+            "f98828c1 is invalid. Duplicated."
+        )
+        assert _is_duplicate_order(exc) is True
+
+    @pytest.mark.parametrize("msg", [
+        "429 Too Many Requests",
+        "connection reset by peer",
+        "order is invalid. Insufficient balance.",
+        "",
+    ])
+    def test_other_failures_stay_retryable(self, msg):
+        """Only the duplicate case is terminal; do not swallow real retries."""
+        from core.clob_client import _is_duplicate_order
+        assert _is_duplicate_order(RuntimeError(msg)) is False
+
+
+class TestGroupCooldownOnSubmissionFailure:
+    """
+    A leg the exchange refuses keeps being refused, so the group must back off
+    rather than re-signal ~50 s later and reproduce the same rejection.
+    """
+
+    def test_cool_down_marks_the_group_busy(self):
+        from execution.negrisk_guard import NegRiskBundleGuard
+        client = _StubClient({})
+        guard = NegRiskBundleGuard(
+            client, _StubBreaker(), _StubNotifier(), group_cooldown=60.0
+        )
+        assert not guard.is_busy("0xgroup")
+        guard.cool_down("0xgroup")
+        assert guard.is_busy("0xgroup")
+
+    def test_cool_down_respects_a_disabled_cooldown(self):
+        from execution.negrisk_guard import NegRiskBundleGuard
+        client = _StubClient({})
+        guard = NegRiskBundleGuard(
+            client, _StubBreaker(), _StubNotifier(), group_cooldown=0.0
+        )
+        guard.cool_down("0xgroup")
+        assert not guard.is_busy("0xgroup")

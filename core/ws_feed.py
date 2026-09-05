@@ -29,7 +29,9 @@ Polymarket's market WebSocket sends two primary event shapes:
       "size": "50" }
 
 The feed updates the best-ask from:
-  1. Full "book" events → asks[0].price  (lowest ask, most authoritative)
+  1. Full "book" events → min(asks).price (most authoritative). NOT asks[0]:
+     the exchange returns both sides WORST-first, so asks[0] is the dearest
+     offer on the book. See _best_ask_level().
   2. "price_change" with side="SELL" →
        if price < current_best_ask  : update (new cheaper ask appeared)
        if size == "0"               : invalidate (level removed, trigger REST
@@ -89,6 +91,42 @@ _WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 _INITIAL_BACKOFF = 1.0    # seconds
 _MAX_BACKOFF     = 30.0   # seconds
 _STABLE_AFTER    = 10.0   # reset back-off after this many seconds connected
+
+
+def _best_ask_level(asks: "list | None") -> "tuple[float, float] | None":
+    """
+    Lowest ask price and the size resting at it, or None if there is no usable
+    offer.
+
+    The CLOB returns BOTH book sides worst-first: asks descend from 0.999 and
+    bids ascend from 0.001, so `asks[0]` is the WORST offer on the book rather
+    than the best. Verified live on 2026-09-05 against the REST book and the
+    websocket `book` event for the same token in the same second:
+
+        asks[0] = 0.999      true best ask = 0.969
+        bids[0] = 0.001      true best bid = 0.960
+
+    Reading asks[0] therefore priced every market ~3 cents too high, which both
+    hides real arbitrage and produces synthetic maker bids that rest far from
+    the touch and never fill. Scan for the minimum instead, and never assume an
+    ordering the exchange has not promised.
+    """
+    best_p: float | None = None
+    best_s: float = 0.0
+    for lvl in asks or []:
+        try:
+            if isinstance(lvl, dict):
+                price = float(lvl["price"])
+                size  = float(lvl.get("size", 0.0) or 0.0)
+            else:
+                price, size = float(lvl), 0.0
+        except (KeyError, TypeError, ValueError):
+            continue
+        if price <= 0.0:
+            continue
+        if best_p is None or price < best_p:
+            best_p, best_s = price, size
+    return None if best_p is None else (best_p, best_s)
 
 
 class _MarketState:
@@ -175,19 +213,13 @@ class _MarketState:
             except (KeyError, TypeError, ValueError):
                 pass
 
-        asks = event.get("asks", [])
-        if not asks:
+        best = _best_ask_level(event.get("asks", []))
+        if best is None:
             return False
-        try:
-            entry = asks[0]
-            price = float(entry["price"] if isinstance(entry, dict) else entry)
-            if price <= 0.0:
-                return False
-            changed = self._best_ask[asset_id] != price
-            self._best_ask[asset_id] = price
-            return changed
-        except (KeyError, IndexError, TypeError, ValueError):
-            return False
+        price = best[0]
+        changed = self._best_ask[asset_id] != price
+        self._best_ask[asset_id] = price
+        return changed
 
     def _handle_price_change(self, asset_id: str, event: dict) -> bool:
         # Prefer the best_ask the exchange states outright: it is correct on
@@ -232,17 +264,12 @@ class _MarketState:
         return False
 
     def _handle_generic(self, asset_id: str, event: dict) -> bool:
-        asks = event.get("asks", [])
-        if asks:
-            try:
-                entry = asks[0]
-                price = float(entry["price"] if isinstance(entry, dict) else entry)
-                if price > 0.0:
-                    changed = self._best_ask[asset_id] != price
-                    self._best_ask[asset_id] = price
-                    return changed
-            except (KeyError, IndexError, TypeError, ValueError):
-                pass
+        best = _best_ask_level(event.get("asks", []))
+        if best is not None:
+            price = best[0]
+            changed = self._best_ask[asset_id] != price
+            self._best_ask[asset_id] = price
+            return changed
         side = event.get("side", "").upper()
         if side in ("SELL", "ASK"):
             try:
@@ -365,27 +392,17 @@ class _NegRiskGroupState:
             except (TypeError, ValueError):
                 pass
 
-        asks = event.get("asks", [])
-        if not asks:
+        best = _best_ask_level(event.get("asks", []))
+        if best is None:
             return False
-        try:
-            entry = asks[0]
-            if isinstance(entry, dict):
-                price = float(entry["price"])
-                size  = float(entry.get("size", 0.0) or 0.0)
-            else:
-                price, size = float(entry), 0.0
-            if price <= 0.0:
-                return False
-            changed = (
-                self._best_ask[asset_id] != price
-                or self._ask_size[asset_id] != size
-            )
-            self._best_ask[asset_id] = price
-            self._ask_size[asset_id] = size
-            return changed
-        except (KeyError, IndexError, TypeError, ValueError):
-            return False
+        price, size = best
+        changed = (
+            self._best_ask[asset_id] != price
+            or self._ask_size[asset_id] != size
+        )
+        self._best_ask[asset_id] = price
+        self._ask_size[asset_id] = size
+        return changed
 
     def _handle_price_change(self, asset_id: str, event: dict) -> bool:
         # Authoritative top-of-book from the exchange (see _explicit_best_ask).

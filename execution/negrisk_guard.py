@@ -230,6 +230,17 @@ class NegRiskBundleGuard:
         """True while any bundle on this group is still unresolved."""
         return any(b.condition_id == condition_id for b in self._bundles.values())
 
+    def cool_down(self, condition_id: str) -> None:
+        """
+        Put a group off limits for the cooldown window without a bundle having
+        been watched — used when submission itself failed. A leg the exchange
+        rejected as a duplicate will be rejected again for as long as it holds
+        that order hash, so re-signalling the same group 50 seconds later just
+        reproduces the rejection.
+        """
+        if self._cooldown > 0.0:
+            self._cooling[condition_id] = time.monotonic() + self._cooldown
+
     def is_busy(self, condition_id: str) -> bool:
         """
         True when a new bundle on this group must NOT be submitted — either one
