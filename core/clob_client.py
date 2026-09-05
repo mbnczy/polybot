@@ -293,6 +293,8 @@ _PAPER_TRADE: bool = (
 # A leg counts as filled when its order response status is one of these. FOK
 # orders either match in full or are killed; "paper" is the simulated fill.
 _FILLED_STATUSES: frozenset[str] = frozenset({"matched", "filled", "paper"})
+# How many progressively smaller slices to try when a FOK unwind is killed.
+_UNWIND_MAX_SLICES: int = int(os.environ.get("UNWIND_MAX_SLICES", 12))
 
 
 def _resp_filled(resp: dict | None) -> bool:
@@ -1383,15 +1385,98 @@ class PolyClient:
         if sell_size < 0.01:
             logger.warning("UNWIND skipped | size %.4f below minimum", size)
             return {"status": "error", "error": "size below minimum"}
-        signed = await self._run_with_retry(
-            self._create_market,
-            token_id=token_id, side="SELL", shares=sell_size,
-            price=price if price > 0 else None,
-        )
-        # Single-shot post: a retried market SELL duplicates or double-sells.
-        resp = await self._post_once(signed)
-        logger.warning("UNWIND submitted | SELL %s of %s | resp=%s", sell_size, token_id[:16], resp)
-        return resp
+        # A market order here is FOK: fully filled or KILLED. Dumping the whole
+        # naked leg into a thin book therefore sells NOTHING and leaves the
+        # shares stranded — observed live 2026-09-05, four consecutive failures
+        # ("order couldn't be fully filled") that stranded ~35 pUSD.
+        #
+        # So: cap the first slice to the visible bid depth, and on a kill, halve
+        # and retry. Selling SOME of the naked leg always beats selling none.
+        try:
+            book  = await self.get_orderbook(token_id)
+            depth = 0.0
+            for lvl in book.get("bids", []):
+                try:
+                    depth += float(lvl["size"] if isinstance(lvl, dict) else lvl)
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if depth > 0:
+                capped = math.floor(min(sell_size, depth) * 100) / 100.0
+                if capped < sell_size:
+                    logger.warning(
+                        "UNWIND | book depth %.2f < naked size %.2f — slicing",
+                        depth, sell_size,
+                    )
+                sell_size = max(0.01, capped)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("UNWIND | depth probe failed (%s) — using full size", exc)
+
+        # `outstanding` is what still needs selling; `slice_size` is how much we
+        # dare offer in one FOK. A kill halves the slice; a fill keeps it (that
+        # size demonstrably clears) and we go round again for the remainder.
+        outstanding = sell_size
+        slice_size  = sell_size
+        sold_total  = 0.0
+        proceeds    = 0.0
+        last_resp: dict = {}
+        for _ in range(_UNWIND_MAX_SLICES):
+            if outstanding < 0.01 or slice_size < 0.01:
+                break
+            attempt = math.floor(min(slice_size, outstanding) * 100) / 100.0
+            if attempt < 0.01:
+                break
+            try:
+                signed = await self._run_with_retry(
+                    self._create_market,
+                    token_id=token_id, side="SELL", shares=attempt,
+                    price=price if price > 0 else None,
+                )
+                # Single-shot post: a retried market SELL duplicates or double-sells.
+                resp = last_resp = await self._post_once(signed)
+            except Exception as exc:  # noqa: BLE001
+                if "fully filled" in str(exc).lower() or "killed" in str(exc).lower():
+                    slice_size = math.floor(attempt * 50) / 100.0   # halve, 2 d.p.
+                    logger.warning(
+                        "UNWIND | FOK killed at %.2f — retrying with %.2f shares",
+                        attempt, slice_size,
+                    )
+                    continue
+                raise
+            if str(resp.get("status", "")).strip().lower() in _FILLED_STATUSES:
+                got = float(resp.get("making_amount") or attempt)
+                proceeds    += float(resp.get("taking_amount") or 0.0)
+                sold_total  += got
+                outstanding  = math.floor((outstanding - got) * 100) / 100.0
+                logger.warning(
+                    "UNWIND submitted | SELL %.2f of %s (%.2f left) | resp=%s",
+                    got, token_id[:16], outstanding, resp,
+                )
+            else:
+                slice_size = math.floor(attempt * 50) / 100.0
+                logger.warning(
+                    "UNWIND | not filled (%s) — retrying with %.2f shares",
+                    resp.get("status"), slice_size,
+                )
+
+        if sold_total <= 0.0:
+            logger.error(
+                "UNWIND FAILED | could not sell any of %.2f shares of %s",
+                size, token_id[:16],
+            )
+            return last_resp or {"status": "error", "error": "unwind sold nothing"}
+
+        if sold_total + 0.005 < size:
+            logger.warning(
+                "UNWIND PARTIAL | sold %.2f of %.2f shares — %.2f still naked",
+                sold_total, size, size - sold_total,
+            )
+        return {
+            "status":        "matched",
+            "order_id":      last_resp.get("order_id", ""),
+            "making_amount": sold_total,
+            "taking_amount": proceeds,
+            "partial":       sold_total + 0.005 < size,
+        }
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public async API — dual-leg maker arbitrage (GTC limit, synthetic post-only)
