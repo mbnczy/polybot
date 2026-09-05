@@ -644,6 +644,14 @@ async def strategy_loop(
                 rebate = rebate_engine.peek_maker_rebate(condition_id)
                 if rebate is None:
                     rebate = await rebate_engine.get_maker_rebate(condition_id)
+                # Exit liquidity = the THINNER leg's visible bid depth. Either
+                # leg can fill alone, so the pair must be small enough that the
+                # worse-supported side is still sellable.
+                _yd = tick.get("yes_bid_depth")
+                _nd = tick.get("no_bid_depth")
+                _exit_depth = (
+                    min(_yd, _nd) if (_yd is not None and _nd is not None) else None
+                )
                 arb_signal = dutch_pricer.evaluate_maker(
                     condition_id=condition_id,
                     yes_token_id=yes_token_id,
@@ -653,6 +661,7 @@ async def strategy_loop(
                     max_position_usdc=MAX_ARB_PAIR_USDC,
                     maker_rebate=rebate,
                     tick_size=tick.get("tick_size"),
+                    exit_depth=_exit_depth,
                 )
 
                 # ── Book position: do we get queue priority? ──────────────────

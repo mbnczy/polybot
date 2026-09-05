@@ -119,6 +119,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -186,6 +187,14 @@ EXTREME_PRICE_HI: float = 0.95   # skip if yes_ask or no_ask > this (≈ resolve
 # rebate-funded entries where combined asks may exceed $1).  Set > 0 (e.g.
 # 0.002 = 20 bps) to require a genuine sub-$1 combined cost so the rebate is
 # upside, not the sole justification.
+# Never post a pair larger than this fraction of the thinner leg's visible exit
+# (bid) depth. A maker pair can half-fill, and the naked leg must then be sold
+# back into that book; on 2026-09-05 a leg larger than the book could absorb
+# stranded ~35 pUSD. 0.0 disables the cap.
+MAKER_MAX_EXIT_FRACTION: float = float(
+    os.environ.get("MAKER_MAX_EXIT_FRACTION", 0.25)
+)
+
 MIN_REAL_EDGE: float = 0.0
 
 # ── NegRisk selection heuristics ─────────────────────────────────────────────
@@ -548,6 +557,7 @@ class DutchBookPricer:
         max_position_usdc: float = 50.0,
         maker_rebate:      float | None = None,
         tick_size:         float | None = None,   # market tick (0.01 / 0.001)
+        exit_depth:        float | None = None,   # min visible BID depth of the two legs
     ) -> Optional[ArbSignal]:
         """
         Evaluate a Dutch Book opportunity using synthetic post-only maker bids.
@@ -631,6 +641,20 @@ class DutchBookPricer:
             return None
 
         raw_shares = max_position_usdc / combined_bid
+
+        # Cap to what we could actually SELL BACK. The pair is not atomic: either
+        # leg can fill alone, and the guard then has to unwind it into the bid
+        # book. Sizing past that depth is how a naked leg becomes unsellable.
+        if exit_depth is not None and exit_depth > 0.0 and MAKER_MAX_EXIT_FRACTION > 0.0:
+            exit_cap = exit_depth * MAKER_MAX_EXIT_FRACTION
+            if exit_cap < raw_shares:
+                logger.info(
+                    "DutchBookPricer | exit-depth cap: %.2f -> %.2f shares "
+                    "(%.0f visible bid depth x %.0f%%)",
+                    raw_shares, exit_cap, exit_depth, MAKER_MAX_EXIT_FRACTION * 100,
+                )
+                raw_shares = exit_cap
+
         n_shares   = math.floor(raw_shares * 100) / 100.0   # floor to 2 d.p.
 
         if n_shares < 0.01:
