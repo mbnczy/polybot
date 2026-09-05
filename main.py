@@ -196,6 +196,12 @@ _negrisk_enabled           = _cfg.negrisk_enabled
 _negrisk_min_outcome_prob  = _cfg.negrisk_min_outcome_prob
 _negrisk_max_legs          = _cfg.negrisk_max_legs
 _negrisk_min_relative_edge = _cfg.negrisk_min_relative_edge
+# Only place a maker pair when BOTH legs would improve on the current best bid.
+# Default off: it materially reduces how many pairs are placed, so it is an
+# explicit opt-in rather than a silent behaviour change.
+_MAKER_REQUIRE_BOOK_IMPROVEMENT: bool = os.environ.get(
+    "MAKER_REQUIRE_BOOK_IMPROVEMENT", "false"
+).strip().lower() in ("1", "true", "yes", "on")
 # Maker (Dutch Book) arb path toggle. Default on. Set MAKER_ARB_ENABLED=false
 # to disable resting-bid maker orders (one-leg risk) and trade taker-only.
 _maker_arb_enabled = os.environ.get("MAKER_ARB_ENABLED", "true").strip().lower() != "false"
@@ -625,6 +631,37 @@ async def strategy_loop(
                     maker_rebate=rebate,
                     tick_size=tick.get("tick_size"),
                 )
+
+                # ── Book position: do we get queue priority? ──────────────────
+                # Our maker quote is synthetic: ask - TICK. Polymarket's median
+                # spread is ONE tick, so that price usually equals the existing
+                # best bid and we join the BACK of that queue rather than
+                # improving the book. Trades arrive every ~30s, but they fill the
+                # size ahead of us, so the pair expires unfilled at TTL. Log the
+                # real bid so this is measurable, and optionally skip quotes that
+                # would have no queue priority at all.
+                if arb_signal is not None and arb_signal.is_maker_signal:
+                    _ybb = tick.get("yes_best_bid")
+                    _nbb = tick.get("no_best_bid")
+                    _yq, _nq = arb_signal.yes_bid, arb_signal.no_bid
+                    _y_imp = (_ybb is None) or (_yq > _ybb + 1e-9)
+                    _n_imp = (_nbb is None) or (_nq > _nbb + 1e-9)
+                    logger.info(
+                        "BOOK POSITION | %s | YES quote=%.3f best_bid=%s -> %s "
+                        "| NO quote=%.3f best_bid=%s -> %s",
+                        market_titles.label(condition_id),
+                        _yq, f"{_ybb:.3f}" if _ybb is not None else "?",
+                        "TOP" if _y_imp else "QUEUED",
+                        _nq, f"{_nbb:.3f}" if _nbb is not None else "?",
+                        "TOP" if _n_imp else "QUEUED",
+                    )
+                    if _MAKER_REQUIRE_BOOK_IMPROVEMENT and not (_y_imp and _n_imp):
+                        logger.info(
+                            "BOOK POSITION | skipping %s — no queue priority "
+                            "(MAKER_REQUIRE_BOOK_IMPROVEMENT=true)",
+                            condition_id[:16],
+                        )
+                        arb_signal = None
 
             # Record dequeue→decision latency (covers both taker + maker paths).
             EVAL_LATENCY.observe(time.monotonic() - _eval_t0)

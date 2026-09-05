@@ -114,6 +114,15 @@ class _MarketState:
         self._best_ask: dict[str, Optional[float]] = {
             yes_token_id: None, no_token_id: None,
         }
+        # The bid side was parsed and thrown away. Without it the detector
+        # cannot tell whether its synthetic (ask - TICK) quote IMPROVES the book
+        # or merely JOINS the existing best bid at the back of the queue. Median
+        # spread on Polymarket is one tick, so ask - TICK usually lands exactly
+        # on the best bid — which is why maker quotes rest for their full TTL and
+        # expire unfilled while trades happen every ~30s.
+        self._best_bid: dict[str, Optional[float]] = {
+            yes_token_id: None, no_token_id: None,
+        }
         self._tick_size: dict[str, Optional[float]] = {
             yes_token_id: None, no_token_id: None,
         }
@@ -125,6 +134,7 @@ class _MarketState:
     def reset(self) -> None:
         """Invalidate best-asks (called on reconnect → await fresh snapshot)."""
         self._best_ask = {self.yes_token_id: None, self.no_token_id: None}
+        self._best_bid = {self.yes_token_id: None, self.no_token_id: None}
         self._last_pushed = (None, None)
 
     def idle_seconds(self, now: Optional[float] = None) -> float:
@@ -153,6 +163,18 @@ class _MarketState:
             except (TypeError, ValueError):
                 pass
 
+        # Best bid from the snapshot. Explicit max rather than bids[0] so it is
+        # correct whichever way the exchange orders the array.
+        bids = event.get("bids", [])
+        if bids:
+            try:
+                _p = [float(e["price"] if isinstance(e, dict) else e) for e in bids]
+                _p = [x for x in _p if x > 0.0]
+                if _p:
+                    self._best_bid[asset_id] = max(_p)
+            except (KeyError, TypeError, ValueError):
+                pass
+
         asks = event.get("asks", [])
         if not asks:
             return False
@@ -171,6 +193,15 @@ class _MarketState:
         # Prefer the best_ask the exchange states outright: it is correct on
         # every kind of book move, including the best level being consumed
         # (where a level delta alone would only tell us it disappeared).
+        # Record the stated best bid when present. Observational only — it
+        # never gates the ask logic below.
+        _bb = event.get("best_bid")
+        if _bb is not None:
+            try:
+                self._best_bid[asset_id] = float(_bb)
+            except (TypeError, ValueError):
+                pass
+
         explicit = _explicit_best_ask(event)
         if explicit is not None:
             changed = self._best_ask[asset_id] != explicit
@@ -250,6 +281,8 @@ class _MarketState:
             "no_token_id":  self.no_token_id,
             "yes_ask":      yes_ask,
             "no_ask":       no_ask,
+            "yes_best_bid": self._best_bid.get(self.yes_token_id),
+            "no_best_bid":  self._best_bid.get(self.no_token_id),
             "tick_size":    max(_ticks) if _ticks else None,
             "ts":           now,
         }
