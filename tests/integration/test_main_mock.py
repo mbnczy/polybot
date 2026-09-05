@@ -701,6 +701,9 @@ async def test_main_mock_negrisk_clob_mode_submits_and_hands_to_guard(
         def is_watching(self, _cid):
             return bool(self.watched)
 
+        def is_busy(self, cid):
+            return self.is_watching(cid)
+
         def watch_bundle(self, signal, responses):
             self.watched.append((signal, responses))
 
@@ -763,6 +766,9 @@ async def test_main_mock_negrisk_clob_release_on_submit_failure(monkeypatch, tmp
 
     class _Guard:
         def is_watching(self, _cid):
+            return False
+
+        def is_busy(self, _cid):
             return False
 
         def watch_bundle(self, *_a):

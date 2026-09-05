@@ -296,6 +296,11 @@ _FILLED_STATUSES: frozenset[str] = frozenset({"matched", "filled", "paper"})
 # How many progressively smaller slices to try when a FOK unwind is killed.
 _UNWIND_MAX_SLICES: int = int(os.environ.get("UNWIND_MAX_SLICES", 12))
 
+# How many recent account trades to scan when attributing a fill to an order id.
+# Fills are looked up seconds after submission, so the answer is always near the
+# head of the feed; the cap stops a lookup walking the entire trade history.
+_TRADE_SCAN_LIMIT: int = int(os.environ.get("TRADE_SCAN_LIMIT", 200))
+
 
 def _resp_filled(resp: dict | None) -> bool:
     """True if an order response indicates the leg was fully filled."""
@@ -746,6 +751,64 @@ class PolyClient:
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Share balance query failed for %s: %s", str(token_id)[:16], exc
+            )
+            return None
+
+    async def order_filled_size(
+        self, order_id: str, token_id: "str | None" = None
+    ) -> "float | None":
+        """
+        How much of ONE order actually filled, attributed by order id.
+
+        This is the correct answer to "did my order fill", and `share_balance`
+        is not. A wallet balance is a WALLET-WIDE quantity: it includes shares
+        bought by earlier trades, shares from other strategies, and — the case
+        that broke us — fills belonging to other bundles resting on the same
+        token at the same moment. Every guard reading it credited itself with
+        every other guard's fills plus whatever inventory already existed, then
+        "unwound" positions it never opened.
+
+        The CLOB trade feed carries the attribution instead. For each trade the
+        account took part in, our order id appears either as `taker_order_id`
+        (we crossed) or inside `maker_orders` with the exact `matched_amount`
+        that order contributed (we were rested). Summing those is exact,
+        immune to pre-existing inventory, and immune to concurrency.
+
+        Returns None if the feed cannot be read, so callers keep whatever
+        conservative fallback they had rather than treating "unknown" as zero.
+        """
+        if _PAPER_TRADE:
+            return None
+
+        oid = str(order_id or "").strip().lower()
+        if not oid:
+            return None
+
+        def _read() -> float:
+            total = 0.0
+            kwargs = {"token_id": str(token_id)} if token_id else {}
+            pages  = self._client.list_account_trades(**kwargs)
+            seen   = 0
+            for page in pages:
+                for tr in page.items:
+                    seen += 1
+                    # A trade the exchange failed to settle transfers nothing.
+                    if str(getattr(tr, "status", "")).upper() == "FAILED":
+                        continue
+                    if str(getattr(tr, "taker_order_id", "")).lower() == oid:
+                        total += float(tr.size)
+                    for mo in getattr(tr, "maker_orders", ()) or ():
+                        if str(getattr(mo, "order_id", "")).lower() == oid:
+                            total += float(mo.matched_amount)
+                if seen >= _TRADE_SCAN_LIMIT:
+                    break
+            return total
+
+        try:
+            return await asyncio.get_running_loop().run_in_executor(_executor, _read)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Trade lookup failed for order %s: %s", oid[:12], exc
             )
             return None
 

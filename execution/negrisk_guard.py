@@ -83,6 +83,14 @@ logger = logging.getLogger(__name__)
 NEGRISK_GUARD_POLL_S:     float = float(os.environ.get("NEGRISK_GUARD_POLL_S", 1.0))
 NEGRISK_BUNDLE_TIMEOUT_S: float = float(os.environ.get("NEGRISK_BUNDLE_TIMEOUT_S", 10.0))
 NEGRISK_ORDER_TTL_S:      float = float(os.environ.get("NEGRISK_ORDER_TTL_S", 45.0))
+# After a bundle has to be flattened, how long to leave that NegRisk group alone.
+# Without this the loop re-entered the SAME group within 200 ms of unwinding it:
+# 9 bundles on one group in 4 minutes on 2026-09-05, each paying the spread
+# twice. A group that just failed to fill cleanly is evidence about the book,
+# not an invitation to retry immediately.
+NEGRISK_GROUP_COOLDOWN_S: float = float(
+    os.environ.get("NEGRISK_GROUP_COOLDOWN_S", 60.0)
+)
 
 # Shares are quoted to 2 d.p.; anything below half an increment is noise.
 _SHARE_EPS: float = 0.005
@@ -153,6 +161,7 @@ class NegRiskBundleGuard:
         poll_interval:  float = NEGRISK_GUARD_POLL_S,
         bundle_timeout: float = NEGRISK_BUNDLE_TIMEOUT_S,
         order_ttl:      float = NEGRISK_ORDER_TTL_S,
+        group_cooldown: float = NEGRISK_GROUP_COOLDOWN_S,
     ) -> None:
         self._client   = client
         self._breaker  = breaker
@@ -160,7 +169,10 @@ class NegRiskBundleGuard:
         self._poll     = max(0.1, poll_interval)
         self._timeout  = max(0.0, bundle_timeout)
         self._ttl      = max(0.0, order_ttl)
+        self._cooldown = max(0.0, group_cooldown)
         self._bundles: dict[str, _WatchedBundle] = {}
+        # condition_id -> monotonic deadline before which the group is off limits
+        self._cooling: dict[str, float] = {}
 
     # ──────────────────────────────────────────────────────────────────────────
     # Registration
@@ -217,6 +229,21 @@ class NegRiskBundleGuard:
     def is_watching(self, condition_id: str) -> bool:
         """True while any bundle on this group is still unresolved."""
         return any(b.condition_id == condition_id for b in self._bundles.values())
+
+    def is_busy(self, condition_id: str) -> bool:
+        """
+        True when a new bundle on this group must NOT be submitted — either one
+        is already in flight, or the group is cooling off after a flatten.
+        """
+        if self.is_watching(condition_id):
+            return True
+        until = self._cooling.get(condition_id)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            del self._cooling[condition_id]
+            return False
+        return True
 
     # ──────────────────────────────────────────────────────────────────────────
     # Poll loop
@@ -296,30 +323,32 @@ class NegRiskBundleGuard:
             # on 2026-09-04.
             leg.open = False
             if not leg.cancel_requested:
-                held = await self._client.share_balance(leg.token_id)
-                if held is None:
-                    # Chain unreachable: fall back to the conservative
-                    # assumption (filled) so we unwind rather than sit on a
-                    # naked leg — but make the uncertainty loud.
+                filled = await self._client.order_filled_size(
+                    leg.order_id, leg.token_id
+                )
+                if filled is None:
+                    # Trade feed unreachable. Assume filled so we flatten rather
+                    # than sit on a possibly-naked leg, and make it loud — this
+                    # is the one branch that can still be wrong.
                     logger.error(
-                        "NegRiskGuard | order %s untracked and share balance "
+                        "NegRiskGuard | order %s untracked and the trade feed is "
                         "unavailable — assuming filled (%.2f shares); verify "
                         "the wallet manually",
                         leg.order_id[:12], leg.size,
                     )
                     leg.matched = leg.size
                 else:
-                    verified = min(leg.size, held)
+                    verified = min(leg.size, filled)
                     if verified > leg.matched + _SHARE_EPS:
                         logger.warning(
-                            "NegRiskGuard | order %s untracked — chain confirms "
-                            "%.2f share(s) held, treating as filled",
+                            "NegRiskGuard | order %s untracked — trade feed attributes "
+                            "%.2f share(s) to it, treating as filled",
                             leg.order_id[:12], verified,
                         )
                     elif verified < _SHARE_EPS:
                         logger.info(
-                            "NegRiskGuard | order %s untracked and wallet holds no "
-                            "shares — cancelled, not filled",
+                            "NegRiskGuard | order %s untracked with no attributed "
+                            "fills — cancelled, not filled",
                             leg.order_id[:12],
                         )
                     leg.matched = max(leg.matched, verified)
@@ -410,6 +439,8 @@ class NegRiskBundleGuard:
         # Incomplete with exposure: flatten every filled leg.  See the module
         # docstring for why a partial bundle cannot simply be held.
         ARB_HALF_FILLS.inc()
+        if self._cooldown > 0.0:
+            self._cooling[bundle.condition_id] = time.monotonic() + self._cooldown
         realised, failures = await self._unwind_all(bundle, naked)
 
         self._breaker.on_fill(pnl=round(realised, 6))

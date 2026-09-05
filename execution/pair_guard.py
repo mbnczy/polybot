@@ -345,27 +345,32 @@ class MakerPairGuard:
             # that do not exist; guessing "cancelled" leaves a filled leg naked.
             leg.open = False
             if not leg.cancel_requested:
-                held = await self._client.share_balance(leg.token_id)
-                if held is None:
+                filled = await self._client.order_filled_size(
+                    leg.order_id, leg.token_id
+                )
+                if filled is None:
+                    # Trade feed unreachable. Assume filled so we flatten rather
+                    # than sit on a possibly-naked leg, and make it loud — this
+                    # is the one branch that can still be wrong.
                     logger.error(
-                        "PairGuard | order %s untracked and share balance "
+                        "PairGuard | order %s untracked and the trade feed is "
                         "unavailable — assuming filled (%.2f shares); verify "
                         "the wallet manually",
                         leg.order_id[:12], leg.size,
                     )
                     leg.matched = leg.size
                 else:
-                    verified = min(leg.size, held)
+                    verified = min(leg.size, filled)
                     if verified > leg.matched + _SHARE_EPS:
                         logger.warning(
-                            "PairGuard | order %s untracked — chain confirms "
-                            "%.2f share(s) held, treating as filled",
+                            "PairGuard | order %s untracked — trade feed attributes "
+                            "%.2f share(s) to it, treating as filled",
                             leg.order_id[:12], verified,
                         )
                     elif verified < _SHARE_EPS:
                         logger.info(
-                            "PairGuard | order %s untracked and wallet holds "
-                            "no shares — cancelled, not filled",
+                            "PairGuard | order %s untracked with no attributed "
+                            "fills — cancelled, not filled",
                             leg.order_id[:12],
                         )
                     leg.matched = max(leg.matched, verified)

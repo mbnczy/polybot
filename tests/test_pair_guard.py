@@ -37,8 +37,13 @@ class FakeGuardClient:
         self.unwound: list[tuple[str, float]] = []
         self.taker_buys: list[tuple[str, float, float]] = []
         self.best_asks: dict[str, float] = {}
-        # token_id -> on-chain share balance; the guard consults this to
-        # tell a FILLED untracked order from a CANCELLED one.
+        # order_id -> shares the TRADE FEED attributes to that order. This is
+        # per-order, unlike a wallet balance, which is exactly the distinction
+        # the guard depends on.
+        self.order_fills: dict[str, float] = {}
+        # token_id -> wallet balance. Deliberately still here and deliberately
+        # NOT consulted for fill decisions: the incident was caused by reading
+        # this number as if it were a per-order fill.
         self.share_balances: dict[str, float] = {}
         self.taker_fill_status: str = "matched"
         # Price the naked leg sells at on unwind (proceeds = size × this).
@@ -46,6 +51,9 @@ class FakeGuardClient:
 
     async def share_balance(self, token_id: str):
         return self.share_balances.get(token_id, 0.0)
+
+    async def order_filled_size(self, order_id: str, token_id=None):
+        return self.order_fills.get(order_id, 0.0)
 
     async def get_order_status(self, order_id: str):
         return self.orders.get(order_id)
@@ -257,12 +265,12 @@ async def test_no_fills_ttl_cancels_both_and_releases():
 
 
 @pytest.mark.asyncio
-async def test_vanished_order_filled_when_chain_holds_shares():
-    """Untracked order + shares on-chain => genuinely filled, P&L booked."""
+async def test_vanished_order_filled_when_trade_feed_attributes_shares():
+    """Untracked order + attributed fills => genuinely filled, P&L booked."""
     client = FakeGuardClient()
     client.orders["oy"] = None    # vanished, we never cancelled it
     client.orders["on"] = {"status": "matched", "size_matched": 10.0}
-    client.share_balances["tok-yes"] = 10.0   # the chain confirms the fill
+    client.order_fills["oy"] = 10.0           # the trade feed confirms the fill
     inventory = FakeInventory()
     guard, breaker, _ = _build_guard(client, inventory)
 
@@ -288,7 +296,7 @@ async def test_vanished_order_not_filled_when_wallet_is_empty():
     client = FakeGuardClient()
     client.orders["oy"] = None
     client.orders["on"] = {"status": "matched", "size_matched": 10.0}
-    client.share_balances = {}                # wallet holds nothing
+    client.order_fills = {}                   # no fills attributed to it
     inventory = FakeInventory()
     guard, breaker, _ = _build_guard(client, inventory)
 

@@ -493,7 +493,7 @@ async def strategy_loop(
                 if (
                     condition_id in _negrisk_inflight
                     or (negrisk_guard is not None
-                        and negrisk_guard.is_watching(condition_id))
+                        and negrisk_guard.is_busy(condition_id))
                 ):
                     logger.debug(
                         "NegRisk signal on busy group %s — skipping",

@@ -664,12 +664,18 @@ class _StubClient:
         self.cancelled: list[str] = []
         self.unwound:   list[tuple[str, float]] = []
         self.unwind_fails = False
-        # token_id -> on-chain share balance. The guard consults this to tell a
-        # FILLED untracked order from a CANCELLED one instead of guessing.
+        # order_id -> shares the TRADE FEED attributes to that order. Per-order,
+        # unlike a wallet balance — the distinction the guard depends on.
+        self.order_fills: dict[str, float] = {}
+        # token_id -> wallet balance. Still here, deliberately NOT consulted for
+        # fill decisions: reading it as a per-order fill caused the incident.
         self.share_balances: dict[str, float] = {}
 
     async def share_balance(self, token_id: str):
         return self.share_balances.get(token_id, 0.0)
+
+    async def order_filled_size(self, order_id: str, token_id=None):
+        return self.order_fills.get(order_id, 0.0)
 
     async def get_order_status(self, order_id: str) -> dict | None:
         return self._statuses.get(order_id)
@@ -798,14 +804,14 @@ class TestNegRiskBundleGuard:
         assert breaker.released == 0
 
     @pytest.mark.asyncio
-    async def test_vanished_order_filled_when_chain_holds_shares(self):
-        """Untracked order + shares on-chain => genuinely filled."""
+    async def test_vanished_order_filled_when_trade_feed_attributes_shares(self):
+        """Untracked order + attributed fills => genuinely filled."""
         from execution.negrisk_guard import NegRiskBundleGuard
 
         sig = _signal()
         client = _StubClient({"o0": None, "o1": None, "o2": None})
-        # The chain is the arbiter: all three legs really did fill.
-        client.share_balances = {"T0": 10.0, "T1": 10.0, "T2": 10.0}
+        # The trade feed is the arbiter: all three legs really did fill.
+        client.order_fills = {"o0": 10.0, "o1": 10.0, "o2": 10.0}
         breaker, notifier = _StubBreaker(), _StubNotifier()
         guard = NegRiskBundleGuard(client, breaker, notifier)
 
@@ -827,7 +833,7 @@ class TestNegRiskBundleGuard:
 
         sig = _signal()
         client = _StubClient({"o0": None, "o1": None, "o2": None})
-        client.share_balances = {}          # wallet holds nothing
+        client.order_fills = {}             # no fills attributed to any leg
         breaker, notifier = _StubBreaker(), _StubNotifier()
         guard = NegRiskBundleGuard(client, breaker, notifier)
 
@@ -837,6 +843,123 @@ class TestNegRiskBundleGuard:
         # No phantom fill, so no fabricated P&L and no bogus unwind.
         assert breaker.filled == []
         assert client.unwound == []
+
+    @pytest.mark.asyncio
+    async def test_preexisting_inventory_is_not_mistaken_for_a_fill(self):
+        """
+        Regression for 2026-09-05 23:12 UTC, live money.
+
+        The guard resolved an untracked order by reading the WALLET balance of
+        the leg's token. A wallet balance is not a per-order quantity: it also
+        contains earlier positions and the fills of other bundles resting on the
+        same token at the same time. Three bundles were in flight on NegRisk
+        group 0x905a88afbd9a5f simultaneously, so each guard credited itself
+        with the others' fills plus inventory that was already there.
+
+        Concretely: orders 0xdcb4af46f1 and 0x15fc573dd4 filled 0.00, but the
+        wallet held 5.07 and 4.00 of their tokens from earlier trades, so both
+        were logged "chain confirms N share(s) held, treating as filled". The
+        bundle was then declared incomplete and "unwound" — selling a 4.00
+        Stefany Shaheen position and 15.21 of a Maura Sullivan position that
+        those bundles had never opened, and rebooking the proceeds into 15.21
+        more shares of a single outcome. A market-neutral bundle strategy turned
+        47% of the account into one directional position.
+
+        The wallet may hold any amount of the token. Only fills the trade feed
+        attributes to THIS order id may count.
+        """
+        from execution.negrisk_guard import NegRiskBundleGuard
+
+        sig = _signal()
+        client = _StubClient({"o0": None, "o1": None, "o2": None})
+        # Inventory from earlier, unrelated trades — the exact trap.
+        client.share_balances = {"T0": 5.07, "T1": 5.07, "T2": 4.00}
+        client.order_fills    = {}          # none of it belongs to these orders
+        breaker, notifier = _StubBreaker(), _StubNotifier()
+        # bundle_timeout=0 so a flatten decision is reachable on this pass —
+        # without it the test would pass merely because the imbalance clock had
+        # not expired, which is not what it is meant to prove.
+        guard = NegRiskBundleGuard(client, breaker, notifier, bundle_timeout=0.0)
+
+        guard.watch_bundle(sig, _acks())
+        await guard.poll_once()
+
+        # Nothing filled -> nothing booked, and above all nothing sold.
+        assert breaker.filled == []
+        assert client.unwound == [], (
+            "unwound positions that this bundle never opened"
+        )
+
+    @pytest.mark.asyncio
+    async def test_only_this_orders_fill_counts_when_wallet_holds_more(self):
+        """
+        The partial-credit case: the order really did fill, but the wallet holds
+        far more than it bought. The leg must be credited with its own fill
+        only, never the surrounding inventory.
+        """
+        from execution.negrisk_guard import NegRiskBundleGuard
+
+        sig = _signal()
+        client = _StubClient({"o0": None, "o1": None, "o2": None})
+        client.share_balances = {"T0": 99.0, "T1": 99.0, "T2": 99.0}
+        client.order_fills    = {"o0": 10.0, "o1": 10.0, "o2": 4.0}
+        breaker, notifier = _StubBreaker(), _StubNotifier()
+        # bundle_timeout=0: tolerate no imbalance, so the flatten happens on the
+        # same pass that detects it.
+        guard = NegRiskBundleGuard(client, breaker, notifier, bundle_timeout=0.0)
+
+        guard.watch_bundle(sig, _acks())
+        await guard.poll_once()
+
+        # o2 is short of its 10.0 size, so the bundle is incomplete and the two
+        # legs that DID fill are flattened — at their own sizes, not the
+        # wallet's 99.0.
+        assert client.unwound, "an incomplete bundle must be flattened"
+        for _tok, size in client.unwound:
+            assert size <= 10.0 + 1e-9, f"unwound {size}, more than this bundle bought"
+
+    @pytest.mark.asyncio
+    async def test_group_is_off_limits_after_a_flatten(self):
+        """
+        A group that just had to be flattened must not be re-entered instantly.
+
+        On 2026-09-05 the loop placed a new bundle on the same NegRisk group
+        ~200 ms after unwinding the last one, 9 times in 4 minutes, paying the
+        spread on every round trip.
+        """
+        from execution.negrisk_guard import NegRiskBundleGuard
+
+        sig = _signal()
+        client = _StubClient({"o0": None, "o1": None, "o2": None})
+        client.order_fills = {"o0": 10.0, "o1": 10.0}     # o2 never filled
+        breaker, notifier = _StubBreaker(), _StubNotifier()
+        guard = NegRiskBundleGuard(
+            client, breaker, notifier, bundle_timeout=0.0, group_cooldown=60.0
+        )
+
+        guard.watch_bundle(sig, _acks())
+        await guard.poll_once()
+
+        assert not guard.is_watching(sig.condition_id), "bundle should be resolved"
+        assert guard.is_busy(sig.condition_id), "group must be cooling off"
+
+    @pytest.mark.asyncio
+    async def test_cooldown_expires(self):
+        from execution.negrisk_guard import NegRiskBundleGuard
+
+        sig = _signal()
+        client = _StubClient({"o0": None, "o1": None, "o2": None})
+        client.order_fills = {"o0": 10.0, "o1": 10.0}
+        breaker, notifier = _StubBreaker(), _StubNotifier()
+        guard = NegRiskBundleGuard(
+            client, breaker, notifier, bundle_timeout=0.0, group_cooldown=0.0
+        )
+
+        guard.watch_bundle(sig, _acks())
+        await guard.poll_once()
+
+        # A zero cooldown must not latch the group off permanently.
+        assert not guard.is_busy(sig.condition_id)
 
     @pytest.mark.asyncio
     async def test_failed_submission_leg_is_not_polled(self):
