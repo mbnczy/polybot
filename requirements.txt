@@ -29,3 +29,8 @@ pandas>=2.1.0
 # Fast JSON parsing for the WebSocket hot path (optional; ws_feed falls back
 # to stdlib json if unavailable).
 orjson>=3.9
+
+# ── Cross-market implication mapping (strategy/implication_mapper.py) ────────
+# Offline discovery only — the trading hot path never calls Claude. Optional:
+# the module imports it lazily so the bot runs without it installed.
+anthropic>=0.40
