@@ -58,6 +58,8 @@ import aiohttp
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+from core import market_titles     # dependency-free registry
+
 logger = logging.getLogger(__name__)
 
 _API_BASE = "https://api.telegram.org"
@@ -83,6 +85,20 @@ def _scrub(text: object) -> str:
 def _h(value: object) -> str:
     """HTML-escape a value for safe insertion into a Telegram HTML message."""
     return html.escape(str(value))
+
+
+def _market(condition_id: str) -> str:
+    """
+    Human name for a market, HTML-escaped, falling back to the truncated ID.
+
+    Alerts previously identified markets only by a hex condition ID, which is
+    unreadable when reviewing what the bot actually traded. The scanner already
+    knows every question text (core.market_titles), so use it.
+    """
+    title = market_titles.title(condition_id)
+    if title:
+        return f"{_h(title)}\n<code>{_h(condition_id[:16])}…</code>"
+    return f"<code>{_h(condition_id[:24])}…</code>"
 
 
 class TelegramNotifier:
@@ -380,7 +396,7 @@ class TelegramNotifier:
 
         text = (
             f"<b>ARB EXECUTED</b>\n"
-            f"<b>Market:</b>     <code>{_h(condition_id[:24])}…</code>\n"
+            f"<b>Market:</b> {_market(condition_id)}\n"
             f"<b>YES token:</b>  <code>{_h(yes_token_id[:16])}…</code>\n"
             f"<b>NO token:</b>   <code>{_h(no_token_id[:16])}…</code>\n"
             f"<b>YES price:</b>  <code>{yes_ask:.4f} USDC</code>\n"
@@ -444,7 +460,7 @@ class TelegramNotifier:
         path = "MAKER" if is_maker else "TAKER"
         lines = [
             f"<b>ARB DETECTED</b> ({path})",
-            f"<b>Market:</b>   <code>{_h(condition_id[:24])}…</code>",
+            f"<b>Market:</b> {_market(condition_id)}",
         ]
         if category:
             lines.append(f"<b>Category:</b> <code>{_h(category)}</code>")
@@ -477,7 +493,7 @@ class TelegramNotifier:
         title = "ARB WINDOW OPEN AT SHUTDOWN" if still_open else "ARB WINDOW CLOSED"
         text = (
             f"<b>{title}</b> ({path})\n"
-            f"<b>Market:</b>    <code>{_h(condition_id[:24])}…</code>\n"
+            f"<b>Market:</b> {_market(condition_id)}\n"
             f"<b>Duration:</b>  <code>{duration_s:.2f} s</code>\n"
             f"<b>Peak edge:</b> <code>{peak_edge_bps:.1f} bps</code>\n"
             f"<b>Ticks:</b>     <code>{ticks}</code>"
