@@ -138,3 +138,27 @@ def patched_aiohttp_ws(monkeypatch, fake_ws):
         return FakeAiohttpSession(fake_ws)
     monkeypatch.setattr("core.ws_feed.aiohttp.ClientSession", _factory, raising=True)
     return fake_ws
+
+
+import os as _os
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True)
+def _isolate_daily_state(tmp_path, monkeypatch):
+    """
+    Never let a test write the live daily_state.json.
+
+    CircuitBreaker.on_fill() persists to disk, so a test that constructs a
+    breaker and books a fixture fill silently edits production risk state. On
+    2026-09-06 that left the running bot believing it was +1.70 on the day with
+    nothing traded — extra daily-loss budget it had not earned.
+    """
+    import risk.circuit_breaker as cb
+    monkeypatch.setenv("DAILY_STATE_PATH", str(tmp_path / "daily_state.json"))
+    # Patch the resolved constant in place — reloading the module would give
+    # tests that imported CircuitBreaker at module scope a different class.
+    monkeypatch.setattr(
+        cb, "_DAILY_STATE_PATH", str(tmp_path / "daily_state.json"), raising=False
+    )
+    yield

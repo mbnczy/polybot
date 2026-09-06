@@ -100,8 +100,14 @@ def _pair_cap_from_env() -> float:
 
 MAX_ARB_PAIR_USDC:  float = _pair_cap_from_env()
 
-# Path to persisted daily state — resolves to <project_root>/daily_state.json
-_DAILY_STATE_PATH: str = os.path.normpath(
+# Path to persisted daily state — resolves to <project_root>/daily_state.json.
+#
+# DAILY_STATE_PATH overrides it. Tests must set it: on 2026-09-06 a test that
+# merely constructed a CircuitBreaker and called on_fill() wrote its fixture
+# P&L straight into the live file, leaving the running bot believing it was
+# +1.70 on the day when nothing had traded. A phantom profit is the dangerous
+# direction — it hands the daily loss limit budget it has not earned.
+_DAILY_STATE_PATH: str = os.environ.get("DAILY_STATE_PATH") or os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "daily_state.json")
 )
 
