@@ -995,11 +995,10 @@ async def main() -> None:
 
     breaker        = CircuitBreaker(starting_balance=STARTING_BALANCE)
     notifier       = TelegramNotifier(on_status=breaker.status_dict)
-    # Polymarket charges rate x min(p, 1-p) on takers, not a flat percentage,
-    # so the cost depends on where a leg is priced: 2% at p=0.50, 0.16% at
-    # p=0.96. DEFAULT_TAKER_FEE=0.02 is that formula's worst case, which makes
-    # it the right fall-back and the wrong thing to charge every leg. See
-    # strategy.arbitrage.effective_taker_fee.
+    # Polymarket charges takers rate x (1-p) of notional and makers nothing, so
+    # the cost depends on where a leg is priced and is heaviest on CHEAP assets:
+    # 0.2% at p=0.96 but 4.1% at p=0.18. A flat DEFAULT_TAKER_FEE gets both ends
+    # wrong. See strategy.arbitrage.effective_taker_fee.
     #
     # Do NOT calibrate from ClobTrade.fee_rate_bps: it reads 0 on settled trades
     # that were demonstrably charged, so measuring it says "free" and is wrong.
@@ -1018,9 +1017,11 @@ async def main() -> None:
         )
     else:
         logger.info(
-            "Fee | schedule model: %.3f x min(p,1-p), taker only; "
-            "worst case %.4f at p=0.50 (per-trade stamp reads zero, as expected)",
-            _FEE_SCHEDULE_RATE, _default_fee,
+            "Fee | taker = %.3f x (1-p) of notional, maker = 0 (measured over "
+            "175 maker fills); at p=0.96 that is %.3f%%, at p=0.18 %.3f%%",
+            _FEE_SCHEDULE_RATE,
+            _FEE_SCHEDULE_RATE * 0.04 * 100,
+            _FEE_SCHEDULE_RATE * 0.82 * 100,
         )
 
     fee_engine     = FeeEngine(default_fee=_fee_rate)
