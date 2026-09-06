@@ -224,3 +224,70 @@ class TestRealisticCompletionFilter:
         # realistic = 0.84 + 0.59 + 0.56 = 1.99 -> +0.01, still clears
         sig = self._call(det, asks, bids, ticks)
         assert sig is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# The taker fee, solved rather than assumed
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestTakerFeeModel:
+    """
+    Solved from 68 settled taker fills against data-api `usdcSize` (net of
+    fees). The answer is exactly bimodal — 0.04 or 0.05, no scatter — and the
+    two sets are disjoint in time:
+
+        0.05   51 fills   2026-07-19 .. 2026-09-04
+        0.04   17 fills   2026-09-05 .. 2026-09-06
+
+    So the rate was cut; it does not vary by market. It only looked per-market
+    because each market happened to be traded on one side of the cut.
+    """
+
+    def test_formula_reproduces_real_charges(self):
+        from strategy.arbitrage import effective_taker_fee as f
+        # (size, price, gross, net) straight from settled fills at rate 0.04
+        for size, px, gross, net in ((5.07, 0.9580, 4.85706, 4.84891),
+                                     (5.07, 0.1800, 0.91260, 0.88267),
+                                     (4.00, 0.8300, 3.32000, 3.29743),
+                                     (65.91, 0.9566, 63.04996, 62.94053)):
+            charged = (gross - net) / gross
+            assert f(px, rate=0.04) == pytest.approx(charged, abs=2e-5)
+
+    def test_fee_rises_as_price_falls(self):
+        from strategy.arbitrage import effective_taker_fee as f
+        pcts = [f(p, rate=0.04) for p in (0.96, 0.83, 0.50, 0.18, 0.04)]
+        assert pcts == sorted(pcts), "fee must increase as the asset gets cheaper"
+
+    def test_dollar_fee_peaks_in_the_middle(self):
+        """
+        The shape that made this confusing: as a FRACTION the fee grows as price
+        falls, but in DOLLARS it is symmetric and peaks at p = 0.50.
+        """
+        from strategy.arbitrage import effective_taker_fee as f
+        dollars = {p: f(p, rate=0.04) * (100 * p) for p in (0.04, 0.5, 0.96)}
+        assert dollars[0.5] > dollars[0.04]
+        assert dollars[0.04] == pytest.approx(dollars[0.96], abs=1e-9)
+
+    def test_makers_pay_nothing(self):
+        from strategy.arbitrage import maker_fee
+        assert all(maker_fee(p) == 0.0 for p in (0.02, 0.5, 0.98))
+
+    def test_rate_can_be_recalibrated_at_runtime(self):
+        """
+        The constant is a seed, not a truth. The exchange cut the rate once
+        already; hard-coding either value would be wrong the next time.
+        """
+        import strategy.arbitrage as a
+        prev = a._LIVE_TAKER_RATE
+        try:
+            a.set_taker_rate(0.05)
+            assert a.effective_taker_fee(0.50) == pytest.approx(0.025)
+            a.set_taker_rate(0.04)
+            assert a.effective_taker_fee(0.50) == pytest.approx(0.020)
+        finally:
+            a.set_taker_rate(prev)
+
+    @pytest.mark.parametrize("bad", [0.0, 1.0, -0.5, 1.5])
+    def test_impossible_prices_carry_no_fee(self, bad):
+        from strategy.arbitrage import effective_taker_fee
+        assert effective_taker_fee(bad) == 0.0

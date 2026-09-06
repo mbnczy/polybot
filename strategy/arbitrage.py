@@ -838,8 +838,7 @@ class FeeEngine:
             rate = float(sched.get("rate", _FEE_SCHEDULE_RATE))
             if not (0.0 <= rate <= 1.0):
                 return None
-            # Never trust Gamma's rate below what we have actually been charged.
-            return (max(rate, _FEE_SCHEDULE_RATE), 1.0)
+            return (rate, 1.0)
         except Exception as exc:  # noqa: BLE001
             logger.debug(
                 "FeeEngine | schedule lookup failed for %s: %s",
@@ -915,17 +914,40 @@ class FeeEngine:
 # Makers are charged nothing: 175 of our maker fills show exactly 0.0000%,
 # matching the schedule's takerOnly flag.
 #
-# THE RATE IS NOT 0.04 EVERYWHERE. Gamma reports 0.04 on every market we hold,
-# but the rate implied by settled trades is 0.04 on some and exactly 0.05 on
-# others (Spain WC, Fed rate hike). Gamma's number is therefore not reliable on
-# its own, so the default here is the WORST observed, not the advertised one:
-# under-stating a cost invents edge and over-stating it only skips trades.
-_FEE_SCHEDULE_RATE: float = 0.05
+# THE RATE CHANGES. Solved over 68 settled taker fills the answer is exactly
+# bimodal — 0.04 or 0.05, no scatter — and the two sets are disjoint in time:
+#
+#     0.05   51 fills   2026-07-19 .. 2026-09-04
+#     0.04   17 fills   2026-09-05 .. 2026-09-06
+#
+# so the rate was CUT, it does not vary by market. It first looked per-market
+# only because each market happened to be traded on one side of the cut.
+#
+# 0.04 is therefore today's rate and Gamma reports it correctly. This constant
+# is only the seed: PolyClient.observed_taker_rate() re-solves it from recent
+# fills at startup, so a future change is picked up without anyone editing this
+# line. A rise is tracked immediately, a cut within a few fills.
+_FEE_SCHEDULE_RATE: float = 0.04
+
+
+_LIVE_TAKER_RATE: float = _FEE_SCHEDULE_RATE
+
+
+def set_taker_rate(rate: float) -> None:
+    """Adopt a rate solved from settled fills, overriding the seed constant."""
+    global _LIVE_TAKER_RATE
+    prev = _LIVE_TAKER_RATE
+    _LIVE_TAKER_RATE = max(0.0, min(float(rate), 0.5))
+    if abs(_LIVE_TAKER_RATE - prev) > 1e-6:
+        logger.warning(
+            "Taker fee rate %.4f -> %.4f, solved from recent settled fills",
+            prev, _LIVE_TAKER_RATE,
+        )
 
 
 def effective_taker_fee(
     price: float,
-    rate:  float = _FEE_SCHEDULE_RATE,
+    rate:  float | None = None,
 ) -> float:
     """
     Taker fee as a fraction of notional at `price`: rate x (1 - price).
@@ -934,7 +956,7 @@ def effective_taker_fee(
     """
     if not (0.0 < price < 1.0):
         return 0.0
-    return rate * (1.0 - price)
+    return (_LIVE_TAKER_RATE if rate is None else rate) * (1.0 - price)
 
 
 def maker_fee(price: float) -> float:

@@ -304,6 +304,11 @@ _TRADE_SCAN_LIMIT: int = int(os.environ.get("TRADE_SCAN_LIMIT", 200))
 # Settled trades to inspect when calibrating the real fee rate at startup.
 _FEE_CALIBRATION_TRADES: int = int(os.environ.get("FEE_CALIBRATION_TRADES", 200))
 
+# How many of the most recent taker fills decide the current fee rate. Small
+# enough to follow a rate change quickly, large enough that one odd fill cannot
+# move it on its own.
+_FEE_RATE_WINDOW: int = int(os.environ.get("FEE_RATE_WINDOW", 12))
+
 # How far below the best bid still counts as real liquidity when sizing an
 # unwind slice. 0.10 = accept the top 10% price band. Dust orders parked at
 # 0.001 on a 0.96 book are not depth; counting them made the probe useless.
@@ -913,6 +918,92 @@ class PolyClient:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Fee calibration failed: %s", exc)
             return None
+
+    async def observed_taker_rate(self) -> "float | None":
+        """
+        The taker fee RATE actually being charged, solved from settled trades.
+
+        Polymarket charges takers
+
+            fee = rate x p x (1-p) x size          (makers pay nothing)
+
+        so the rate falls straight out of any fill whose gross and net are both
+        known. The net is `usdcSize` on data-api /activity; the CLOB trade
+        record does not carry it, and its fee_rate_bps reads 0 even on charged
+        trades, which is what made this look free.
+
+        Solved over 68 settled taker fills the answer is exactly bimodal, 0.04
+        or 0.05, with no scatter at all — and the two sets are disjoint in time:
+
+            0.05   51 fills   2026-07-19 .. 2026-09-04
+            0.04   17 fills   2026-09-05 .. 2026-09-06
+
+        i.e. the rate was cut, not varied per market. Gamma reports 0.04 today
+        and is right. Hard-coding either number would be wrong the next time it
+        moves, so read it back from what we were last charged and let a stale
+        constant be overridden rather than trusted.
+
+        Returns the highest rate among the most RECENT fills, or None. Recency
+        matters: the rate is a present-tense property, and a window wide enough
+        to still contain pre-cut fills reports 0.05 for a market now charging
+        0.04. Taking the max over the recent slice tracks a rise immediately and
+        a cut within a few fills, which is the right asymmetry.
+        """
+        if _PAPER_TRADE:
+            return None
+
+        import httpx  # noqa: PLC0415
+
+        def _sides() -> dict:
+            out = {}
+            seen = 0
+            for page in self._client.list_account_trades():
+                for tr in page.items:
+                    if str(getattr(tr, "status", "")).upper() == "FAILED":
+                        continue
+                    out[str(tr.transaction_hash).lower()] = str(tr.trader_side).upper()
+                    seen += 1
+                if seen >= _FEE_CALIBRATION_TRADES:
+                    break
+            return out
+
+        try:
+            sides = await asyncio.get_running_loop().run_in_executor(_executor, _sides)
+            async with httpx.AsyncClient(timeout=20.0) as http:
+                resp = await http.get(
+                    "https://data-api.polymarket.com/activity",
+                    params={"user": self.trading_wallet, "limit": 100},
+                )
+            if resp.status_code != 200:
+                return None
+            rows = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Taker rate calibration failed: %s", exc)
+            return None
+
+        solved: list[tuple[int, float]] = []
+        for row in rows if isinstance(rows, list) else []:
+            if row.get("type") != "TRADE":
+                continue
+            if sides.get(str(row.get("transactionHash", "")).lower()) != "TAKER":
+                continue
+            try:
+                size = float(row["size"]); px = float(row["price"])
+                net  = float(row.get("usdcSize") or 0.0)
+                ts   = int(row.get("timestamp") or 0)
+            except (KeyError, TypeError, ValueError):
+                continue
+            denom = px * (1.0 - px) * size
+            if denom <= 0.0 or net <= 0.0 or not (0.0 < px < 1.0):
+                continue
+            rate = abs(size * px - net) / denom
+            if 0.0 <= rate <= 0.5:
+                solved.append((ts, rate))
+        if not solved:
+            return None
+        solved.sort(key=lambda t: -t[0])
+        recent = solved[:_FEE_RATE_WINDOW]
+        return max(r for _, r in recent)
 
     async def open_positions_detail(self) -> "list[dict] | None":
         """

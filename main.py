@@ -117,6 +117,7 @@ from risk.circuit_breaker import (                                 # noqa: E402
 from core.clob_client import BundleLeg                             # noqa: E402
 from strategy.arbitrage import (                                   # noqa: E402
     _FEE_SCHEDULE_RATE,
+    set_taker_rate,
     ArbDetector,
     ArbSignal,
     DutchBookPricer,
@@ -1004,24 +1005,24 @@ async def main() -> None:
     # that were demonstrably charged, so measuring it says "free" and is wrong.
     _fee_rate = _default_fee
     try:
-        _stamped = await client.observed_fee_rates()
+        _solved = await client.observed_taker_rate()
     except Exception as exc:  # noqa: BLE001
-        _stamped = None
-        logger.debug("Per-trade fee stamp unreadable: %s", exc)
-    if _stamped and max(_stamped.values()) > 0.0:
-        # A per-trade rate has appeared; the schedule model may be incomplete.
-        _fee_rate = max(_fee_rate, max(_stamped.values()))
-        logger.warning(
-            "Fee | per-trade stamp is NONZERO (%s) — schedule model may be "
-            "incomplete; using %.4f", _stamped, _fee_rate,
+        _solved = None
+        logger.warning("Taker rate calibration unavailable: %s", exc)
+    if _solved is not None:
+        set_taker_rate(_solved)
+        _fee_rate = _solved
+        logger.info(
+            "Fee | taker = %.4f x (1-p) of notional (solved from recent "
+            "settled fills), maker = 0; at p=0.96 that is %.3f%%, "
+            "at p=0.18 %.3f%%",
+            _solved, _solved * 0.04 * 100, _solved * 0.82 * 100,
         )
     else:
-        logger.info(
-            "Fee | taker = %.3f x (1-p) of notional, maker = 0 (measured over "
-            "175 maker fills); at p=0.96 that is %.3f%%, at p=0.18 %.3f%%",
+        logger.warning(
+            "Fee | could not solve the taker rate from fills; using the seed "
+            "%.4f x (1-p). If the exchange has changed it, this is stale.",
             _FEE_SCHEDULE_RATE,
-            _FEE_SCHEDULE_RATE * 0.04 * 100,
-            _FEE_SCHEDULE_RATE * 0.82 * 100,
         )
 
     fee_engine     = FeeEngine(default_fee=_fee_rate)
