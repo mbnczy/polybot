@@ -1253,48 +1253,6 @@ class NegRiskArbDetector:
             snap_post_only_bid(ask, t) for ask, t in zip(sel_asks, sel_ticks)
         ]
 
-        # ── 5b. Realistic-completion filter ───────────────────────────────────
-        # An all-maker price is an assumption, not a plan. A leg whose spread IS
-        # one tick cannot be improved post-only, so our quote joins the back of
-        # a queue and usually does not fill — which means the bundle finishes as
-        # a taker on that leg or not at all. Scoring the bundle at the all-maker
-        # price therefore prices an outcome that does not happen.
-        #
-        # So score it at what we will realistically PAY: maker where our quote
-        # leads the book, the ask where it cannot. If the bundle only clears
-        # under the all-maker fantasy, entering it just buys the legs that fill
-        # easily and then pays the spread to undo them.
-        #
-        # Measured over 43 live groups: 7 had an all-maker arb, 1 survived
-        # crossing a leg, and 0 became an arb only by crossing — so this filter
-        # removes signals rather than adding them, which is the point. The six
-        # it removes are the ones that half-fill.
-        if self._require_completable:
-            realistic = 0.0
-            for ask, tick, bid in zip(sel_asks, sel_ticks, sel_bids):
-                quote = snap_post_only_bid(ask, tick)
-                # Our quote leads only when it sits strictly above the best bid.
-                leads = bid is None or quote > bid + 1e-12
-                realistic += quote if leads else ask
-            realistic_edge = float(m - 1) - realistic
-            self.completable_checks += 1
-            if realistic_edge < self._min_completable_edge:
-                self.completable_rejects += 1
-                # INFO, not DEBUG: how often entry is refused because the
-                # bundle only clears under the all-maker assumption is an
-                # operational fact worth seeing, not a debugging detail. It is
-                # the difference between "no opportunities" and "opportunities
-                # we cannot actually complete".
-                logger.info(
-                    "NegRiskArbDetector | condition=%s clears all-maker "
-                    "(%.4f) but not at completion prices (%.4f < %.4f) — skip "
-                    "| bids_known=%d/%d",
-                    condition_id[:16], float(m - 1) - sum(no_bids),
-                    realistic_edge, self._min_completable_edge,
-                    sum(1 for b in sel_bids if b is not None), m,
-                )
-                return None
-
         # ── 6. Resolve maker rebate ───────────────────────────────────────────
         rebate = (
             max(0.0, min(maker_rebate, MAX_MAKER_REBATE))
@@ -1328,6 +1286,41 @@ class NegRiskArbDetector:
                 condition_id[:16], relative_edge, self._min_rel_edge,
             )
             return None
+
+        # ── 7b. Realistic-completion filter ───────────────────────────────────
+        # Runs AFTER the edge gates, so it only ever refuses a bundle that would
+        # otherwise have been a signal. Placed before them it fired 214 times in
+        # two minutes on bundles whose all-maker edge was already negative —
+        # pure noise, and it made the counters meaningless.
+        #
+        # An all-maker price is an assumption, not a plan. A leg whose spread IS
+        # one tick cannot be quoted above the touch post-only, so that order
+        # joins a queue and usually does not fill; the bundle then finishes as a
+        # taker on that leg or not at all. Scoring the all-maker outcome prices
+        # something that does not happen — which is how bundles cleared on entry
+        # all night and lost money on resolution.
+        #
+        # So score it at what we will realistically PAY: maker where our quote
+        # leads the book, the ask where it cannot.
+        if self._require_completable:
+            realistic = 0.0
+            for ask, tick, bid in zip(sel_asks, sel_ticks, sel_bids):
+                quote = snap_post_only_bid(ask, tick)
+                leads = bid is None or quote > bid + 1e-12
+                realistic += quote if leads else ask
+            realistic_edge = float(m - 1) - realistic
+            self.completable_checks += 1
+            if realistic_edge < self._min_completable_edge:
+                self.completable_rejects += 1
+                logger.info(
+                    "NegRiskArbDetector | condition=%s clears all-maker "
+                    "(%.4f) but not at completion prices (%.4f < %.4f) — skip "
+                    "| bids_known=%d/%d",
+                    condition_id[:16], net_edge, realistic_edge,
+                    self._min_completable_edge,
+                    sum(1 for b in sel_bids if b is not None), m,
+                )
+                return None
 
         # ── 8. Size: capital ceiling ∧ shallowest leg (paper §6.2) ────────────
         if combined_bid <= 0.0:
