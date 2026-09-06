@@ -1088,6 +1088,9 @@ class NegRiskArbDetector:
         self._max_legs         = max_legs
         self._require_completable  = NEGRISK_REQUIRE_COMPLETABLE
         self._min_completable_edge = NEGRISK_MIN_COMPLETABLE_EDGE
+        # Counters so the filter's effect is measurable rather than assumed.
+        self.completable_checks  = 0
+        self.completable_rejects = 0
         self._min_rel_edge     = min_relative_edge
         self._min_leg_shares   = min_leg_shares
         self._extreme_hi       = extreme_hi
@@ -1274,11 +1277,21 @@ class NegRiskArbDetector:
                 leads = bid is None or quote > bid + 1e-12
                 realistic += quote if leads else ask
             realistic_edge = float(m - 1) - realistic
+            self.completable_checks += 1
             if realistic_edge < self._min_completable_edge:
-                logger.debug(
-                    "NegRiskArbDetector | condition=%s clears all-maker but not "
-                    "at completion prices (%.4f < %.4f) — skip",
-                    condition_id[:16], realistic_edge, self._min_completable_edge,
+                self.completable_rejects += 1
+                # INFO, not DEBUG: how often entry is refused because the
+                # bundle only clears under the all-maker assumption is an
+                # operational fact worth seeing, not a debugging detail. It is
+                # the difference between "no opportunities" and "opportunities
+                # we cannot actually complete".
+                logger.info(
+                    "NegRiskArbDetector | condition=%s clears all-maker "
+                    "(%.4f) but not at completion prices (%.4f < %.4f) — skip "
+                    "| bids_known=%d/%d",
+                    condition_id[:16], float(m - 1) - sum(no_bids),
+                    realistic_edge, self._min_completable_edge,
+                    sum(1 for b in sel_bids if b is not None), m,
                 )
                 return None
 
