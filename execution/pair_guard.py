@@ -452,6 +452,28 @@ class MakerPairGuard:
             if leg.open:
                 await self._cancel_leg(pair, leg)
 
+        # `matched` is only as good as the status polls behind it, and those
+        # can fail for a leg's whole life — Cloudflare began blocking
+        # /data/order with a 400 on 2026-09-06. Believing a blind zero releases
+        # the slot and abandons a leg that actually filled, which is the naked
+        # position this guard exists to prevent. One trade-feed lookup per leg,
+        # and only when we think there is nothing to book.
+        if yes.matched <= _SHARE_EPS and no.matched <= _SHARE_EPS:
+            for leg in pair.legs:
+                if not leg.order_id:
+                    continue
+                filled = await self._client.order_filled_size(
+                    leg.order_id, leg.token_id
+                )
+                if filled is None or filled <= _SHARE_EPS:
+                    continue
+                leg.matched = max(leg.matched, min(leg.size, filled))
+                logger.warning(
+                    "PairGuard | leg %s filled %.2f share(s) that polling never "
+                    "saw — handling instead of releasing",
+                    leg.order_id[:12], leg.matched,
+                )
+
         paired  = pair.paired
         rich    = yes if yes.matched > no.matched else no
         deficit = no  if rich is yes else yes

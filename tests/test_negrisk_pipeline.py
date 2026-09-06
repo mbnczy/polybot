@@ -1314,3 +1314,65 @@ class TestFreshOrdersAreNotJudged:
         await guard.poll_once()
 
         assert not guard.is_watching(sig.condition_id)
+
+
+class TestBlindPollingDoesNotLeakAFill:
+    """
+    Regression for the residual hole found on 2026-09-06.
+
+    `matched` is only as good as the status polls that produced it. Cloudflare
+    started returning 400 on /data/order, and get_order_status failures leave a
+    leg's matched at 0 by design (the conservative choice — do not guess). But
+    if that lasts a leg's whole life, _finalize sees matched == 0 everywhere,
+    concludes "expired unfilled", releases the slot and walks away from a leg
+    that DID fill — the same naked position that cost 29 pUSD earlier that
+    night, reached by a different route.
+
+    So the "nothing filled" conclusion must be confirmed against the trade feed
+    before the slot is released.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_fill_polling_never_saw_is_still_handled(self):
+        from execution.negrisk_guard import NegRiskBundleGuard
+
+        sig = _signal()
+        # Every status poll fails, exactly as a Cloudflare block behaves.
+        class _BlindClient(_StubClient):
+            async def get_order_status(self, order_id):
+                raise RuntimeError("blocked by Cloudflare with status 400")
+
+        client = _BlindClient({"o0": None, "o1": None, "o2": None})
+        # ...but one leg really did fill.
+        client.order_fills = {"o1": 10.0}
+        breaker, notifier = _StubBreaker(), _StubNotifier()
+        guard = NegRiskBundleGuard(
+            client, breaker, notifier, order_ttl=0.0, index_grace=0.0
+        )
+
+        guard.watch_bundle(sig, _acks())
+        await guard.poll_once()
+
+        assert breaker.released == 0, (
+            "released the slot while a filled leg was still held"
+        )
+        assert client.unwound, "abandoned a filled leg instead of flattening it"
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_empty_bundle_still_releases(self):
+        """The recheck must not turn every dissolved bundle into a flatten."""
+        from execution.negrisk_guard import NegRiskBundleGuard
+
+        sig = _signal()
+        client = _StubClient({"o0": None, "o1": None, "o2": None})
+        client.order_fills = {}
+        breaker, notifier = _StubBreaker(), _StubNotifier()
+        guard = NegRiskBundleGuard(
+            client, breaker, notifier, order_ttl=0.0, index_grace=0.0
+        )
+
+        guard.watch_bundle(sig, _acks())
+        await guard.poll_once()
+
+        assert breaker.released == 1
+        assert client.unwound == []

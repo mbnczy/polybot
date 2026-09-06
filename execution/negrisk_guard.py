@@ -438,6 +438,36 @@ class NegRiskBundleGuard:
     # Finalisation
     # ──────────────────────────────────────────────────────────────────────────
 
+    async def _recheck_fills(
+        self, bundle: _WatchedBundle
+    ) -> list[_BundleLegState]:
+        """
+        Final authoritative check for fills the status polls may have missed.
+
+        Runs only on the path where the guard believes nothing filled, so it
+        costs one trade-feed lookup per leg per dissolved bundle and nothing at
+        all on the common paths. Updates `matched` in place and returns the legs
+        that carry exposure.
+        """
+        exposed: list[_BundleLegState] = []
+        for leg in bundle.legs:
+            if not leg.order_id:
+                continue
+            filled = await self._client.order_filled_size(
+                leg.order_id, leg.token_id
+            )
+            if filled is None or filled <= _SHARE_EPS:
+                continue
+            leg.matched = max(leg.matched, min(leg.size, filled))
+            if leg.matched > _SHARE_EPS:
+                logger.warning(
+                    "NegRiskGuard | leg %s filled %.2f share(s) that polling "
+                    "never saw — flattening instead of releasing",
+                    leg.order_id[:12], leg.matched,
+                )
+                exposed.append(leg)
+        return exposed
+
     async def _finalize(self, bundle: _WatchedBundle, *, complete: bool) -> None:
         """
         Terminal reconciliation.  Exactly one of on_fill / release_open runs so
@@ -471,6 +501,16 @@ class NegRiskBundleGuard:
             return
 
         naked = [leg for leg in bundle.legs if leg.matched > _SHARE_EPS]
+        if not naked:
+            # `matched` is only ever as good as the status polls that produced
+            # it, and those can fail for a leg's whole life — Cloudflare began
+            # blocking /data/order with a 400 on 2026-09-06. A blind guard sees
+            # matched == 0 and reads it as "nothing filled", which releases the
+            # slot and walks away from a leg that DID fill: the same naked
+            # position this guard exists to prevent, reached by a different
+            # route. Ask the trade feed once before believing the quiet.
+            naked = await self._recheck_fills(bundle)
+
         if not naked:
             # Bundle dissolved with no exposure — pure release, nothing booked.
             logger.info(
