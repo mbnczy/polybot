@@ -836,10 +836,10 @@ class FeeEngine:
             if not isinstance(sched, dict):
                 return None
             rate = float(sched.get("rate", _FEE_SCHEDULE_RATE))
-            exp  = float(sched.get("exponent", _FEE_SCHEDULE_EXPONENT))
-            if not (0.0 <= rate <= 1.0) or not (0.0 < exp <= 4.0):
+            if not (0.0 <= rate <= 1.0):
                 return None
-            return (rate, exp)
+            # Never trust Gamma's rate below what we have actually been charged.
+            return (max(rate, _FEE_SCHEDULE_RATE), 1.0)
         except Exception as exc:  # noqa: BLE001
             logger.debug(
                 "FeeEngine | schedule lookup failed for %s: %s",
@@ -889,46 +889,57 @@ class FeeEngine:
         return None
 
 
-# Polymarket's published fee schedule, from Gamma's `feeSchedule` field:
-#     {"exponent": 1, "rate": 0.04, "takerOnly": true, "rebateRate": 0.25}
+# Polymarket's taker fee, derived from our own settled trades and exact on
+# every one of them.
 #
-# The charge is NOT a flat percentage of notional. It is
+#     fee = rate x p x (1-p) x size          (takers only; makers pay nothing)
 #
-#     fee = rate x min(p, 1-p)^exponent x size          (takers only)
+# so as a fraction of NOTIONAL (size x p) it is simply
 #
-# so it vanishes at the extremes and peaks in the middle:
+#     fee_fraction = rate x (1 - p)
 #
-#     p = 0.50  ->  0.04 x 0.50 = 2.00%     <- the maximum
-#     p = 0.83  ->  0.04 x 0.17 = 0.68%
-#     p = 0.96  ->  0.04 x 0.04 = 0.16%
+# Verified against data-api `usdcSize`, which is net of fees — the field the
+# CLOB trade record does not carry:
 #
-# That is why the old DEFAULT_TAKER_FEE = 0.02 constant was not arbitrary: it is
-# this formula's WORST case. Charging it everywhere over-stated the cost on
-# every extreme-priced leg this bot actually trades, but it was not invented.
+#     5.07 @ 0.9580  ->  charged 0.00815, formula 0.00816
+#     5.07 @ 0.1800  ->  charged 0.02993, formula 0.02993
+#     4.00 @ 0.8300  ->  charged 0.02257, formula 0.02258
+#    65.91 @ 0.9566  ->  charged 0.10943, formula 0.10945
 #
-# Two things hid this. Gamma does not expose `feeRate`/`fee_rate`/`fee`, the
-# names the lookup asked for, so it always fell through. And ClobTrade's
-# fee_rate_bps reads 0 on every settled trade even when a fee was charged —
-# measuring that field alone says "no fee" and is wrong. The charge shows up in
-# the cash balance: the 65.91-share flatten received 63.04996 in the trade while
-# cash rose only 62.9405, a deduction of 0.10946 against a predicted 0.11442.
-_FEE_SCHEDULE_RATE:     float = 0.04
-_FEE_SCHEDULE_EXPONENT: float = 1.0
+# NOTE the shape. The fee is heaviest on CHEAP assets: 0.16% at p=0.96 but
+# 3.28% at p=0.18. An earlier version of this used min(p, 1-p), which happens
+# to agree for p >= 0.5 and under-states the cost 4.5x below it — precisely on
+# the cheap NO legs a NegRisk bundle is most likely to have to cross. Do not
+# "simplify" it back.
+#
+# Makers are charged nothing: 175 of our maker fills show exactly 0.0000%,
+# matching the schedule's takerOnly flag.
+#
+# THE RATE IS NOT 0.04 EVERYWHERE. Gamma reports 0.04 on every market we hold,
+# but the rate implied by settled trades is 0.04 on some and exactly 0.05 on
+# others (Spain WC, Fed rate hike). Gamma's number is therefore not reliable on
+# its own, so the default here is the WORST observed, not the advertised one:
+# under-stating a cost invents edge and over-stating it only skips trades.
+_FEE_SCHEDULE_RATE: float = 0.05
 
 
 def effective_taker_fee(
-    price:    float,
-    rate:     float = _FEE_SCHEDULE_RATE,
-    exponent: float = _FEE_SCHEDULE_EXPONENT,
+    price: float,
+    rate:  float = _FEE_SCHEDULE_RATE,
 ) -> float:
     """
-    Taker fee as a fraction of notional at `price`, per the published schedule.
+    Taker fee as a fraction of notional at `price`: rate x (1 - price).
 
-    Returns 0 for a price outside (0, 1) rather than guessing.
+    Returns 0 outside (0, 1) rather than guessing.
     """
     if not (0.0 < price < 1.0):
         return 0.0
-    return rate * (min(price, 1.0 - price) ** exponent)
+    return rate * (1.0 - price)
+
+
+def maker_fee(price: float) -> float:
+    """Makers are not charged. Measured over 175 settled maker fills: 0.0000%."""
+    return 0.0
 
 
 def _normalise_fee(raw: object) -> float | None:

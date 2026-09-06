@@ -1525,44 +1525,62 @@ class TestTakerCompletion:
     @pytest.mark.asyncio
     async def test_the_fee_model_decides_the_outcome(self):
         """
-        The completion verdict is decided by the fee, so the fee model has to be
-        right. A flat 2% and the real schedule disagree at exactly the prices
-        this strategy trades.
+        The completion verdict is decided by the fee, so the model has to be
+        right. At ask 0.67 the schedule charges 0.05 x 0.33 = 1.65%, a flat 2%
+        charges more, and that gap is the difference between taking this
+        completion and refusing it.
         """
         from execution.negrisk_guard import NegRiskBundleGuard
         outcomes = {}
-        for label, kw in (("flat 2%",  dict(taker_fee=0.02)),
-                          ("schedule", dict(taker_fee=0.02))):
+        for label in ("flat 2%", "schedule"):
             sig = _tight_signal()
-            client = self._client_with_book({"o0": None, "o1": None, "o2": None}, ask=0.67)
+            client = self._client_with_book({"o0": None, "o1": None, "o2": None}, ask=0.663)
             client.order_fills = {"o0": 10.0, "o1": 10.0}
             breaker, notifier = _StubBreaker(), _StubNotifier()
             guard = NegRiskBundleGuard(
                 client, breaker, notifier, bundle_timeout=0.0, index_grace=0.0,
-                min_complete_profit=0.01, **kw
+                taker_fee=0.02, min_complete_profit=0.05,
             )
             guard._fee_schedule = (label == "schedule")
             guard.watch_bundle(sig, _acks())
             await guard.poll_once()
             outcomes[label] = bool(client.posted)
-        # at ask 0.67 the schedule charges 0.04 x 0.33 = 1.32%, not 2%, which is
-        # the difference between refusing and taking this completion
         assert outcomes["schedule"] and not outcomes["flat 2%"], outcomes
 
-    @pytest.mark.asyncio
-    async def test_schedule_charges_less_at_the_extremes(self):
+    def test_fee_is_heaviest_on_cheap_assets(self):
         """
-        rate x min(p, 1-p): a leg at 0.96 costs 0.16% to cross, one at 0.50
-        costs 2%. A flat rate gets both wrong in opposite directions.
+        fee = rate x (1 - p) of notional, NOT rate x min(p, 1-p).
+
+        The two agree for p >= 0.5 and diverge badly below it: at p = 0.18 the
+        min() form predicts 0.72% where the real charge is 3.28%. Cheap NO legs
+        are exactly what a NegRisk bundle has to cross, so that error ran 4.5x
+        the wrong way on the decision that matters.
         """
-        from strategy.arbitrage import effective_taker_fee
-        assert effective_taker_fee(0.50) == pytest.approx(0.02)
-        assert effective_taker_fee(0.96) == pytest.approx(0.0016)
-        assert effective_taker_fee(0.04) == pytest.approx(0.0016)
-        assert effective_taker_fee(0.83) == pytest.approx(0.0068)
-        # the old constant is exactly the worst case, not an arbitrary guess
-        assert max(effective_taker_fee(p / 100) for p in range(1, 100)) == \
-            pytest.approx(0.02)
+        from strategy.arbitrage import effective_taker_fee as f
+        assert f(0.96) < f(0.50) < f(0.18), "fee must rise as price falls"
+        # ratio between two prices is fixed by the (1-p) shape
+        assert f(0.18) / f(0.96) == pytest.approx((1 - 0.18) / (1 - 0.96))
+
+    def test_charges_match_settled_trades(self):
+        """
+        Pinned to real fills, verified against data-api usdcSize (net of fees).
+        Rate floored at 0.05, the worst observed, so the estimate is never under
+        the charge.
+        """
+        from strategy.arbitrage import effective_taker_fee as f
+        for size, px, gross, net in ((5.07, 0.9580, 4.85706, 4.84891),
+                                     (5.07, 0.1800, 0.91260, 0.88267),
+                                     (4.00, 0.8300, 3.32000, 3.29743)):
+            charged = (gross - net) / gross
+            assert f(px) >= charged - 1e-9, (
+                f"estimate {f(px):.5f} under the real charge {charged:.5f}"
+            )
+
+    def test_makers_are_never_charged(self):
+        """175 settled maker fills, all exactly 0.0000%."""
+        from strategy.arbitrage import maker_fee
+        for p in (0.05, 0.5, 0.95):
+            assert maker_fee(p) == 0.0
 
     @pytest.mark.parametrize("bad", [0.0, 1.0, -0.5, 1.5])
     def test_impossible_prices_carry_no_fee(self, bad):
