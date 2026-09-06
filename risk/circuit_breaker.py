@@ -50,6 +50,7 @@ import json
 import logging
 import math
 import os
+import time
 import threading
 from dataclasses import dataclass
 from typing import Optional
@@ -185,6 +186,7 @@ class CircuitBreaker:
             os.environ.get("MAX_SESSION_DRAWDOWN_PCT", 15.0)
         )
         self._state  = _State(starting_balance=starting_balance)
+        self._fill_times: list[float] = []
         self._lock   = threading.Lock()
         self._daily  = self._load_daily_state()
         logger.info(
@@ -406,6 +408,13 @@ class CircuitBreaker:
         """
         self._state.session_pnl  += pnl
         self._state.open_positions = max(0, self._state.open_positions - 1)
+        # Timestamps of realised fills. The auto-tuner needs to know whether
+        # signals are being CONVERTED, not merely counted: a margin loosened on
+        # the strength of signals that never fill just lowers the quality bar
+        # on trades that were already failing to execute.
+        self._fill_times.append(time.time())
+        if len(self._fill_times) > 512:
+            del self._fill_times[:-512]
 
         with self._lock:
             self._maybe_roll_window()
@@ -442,6 +451,10 @@ class CircuitBreaker:
         """True when the session drawdown limit has been reached."""
         s = self._state
         return s.session_pnl <= -(self._max_drawdown_pct / 100.0) * s.starting_balance
+
+    def fills_since(self, ts: float) -> int:
+        """Realised fills at or after `ts` (unix seconds)."""
+        return sum(1 for t in self._fill_times if t >= ts)
 
     def status_dict(self) -> dict:
         with self._lock:

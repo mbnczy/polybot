@@ -51,7 +51,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING
 
 import aiosqlite
 
@@ -123,6 +123,7 @@ async def tuner_loop(
     detector:  "ArbDetector",
     db_path:   str = _DB_PATH,
     interval:  float = TUNE_INTERVAL,
+    fills_since: "Callable[[float], int] | None" = None,
 ) -> None:
     """
     Long-running asyncio coroutine — start as a named Task.
@@ -148,7 +149,18 @@ async def tuner_loop(
             count, mean_edge  = await _query_last_hour(db_path, since)
             current           = detector._net_margin
 
-            if count == 0:
+            fills = fills_since(since) if fills_since is not None else None
+
+            if count > 0 and fills == 0:
+                # Signals without fills. The binding constraint is EXECUTION,
+                # not the filter: lowering the margin here just admits thinner
+                # arbs into a pipeline that is already failing to convert, and
+                # a thinner arb half-fills into a bigger loss. Observed live —
+                # the margin ratcheted 0.015 -> 0.005 across quiet hours while
+                # not one bundle completed.
+                new_margin = current
+                action     = "hold (signals but no fills — execution-bound)"
+            elif count == 0:
                 # Zero flow — we are being out-competed; relax the filter
                 new_margin = max(current - STEP_DOWN, MIN_ABSOLUTE_MARGIN)
                 action     = "decrease"
@@ -164,14 +176,16 @@ async def tuner_loop(
                 detector._net_margin = new_margin
                 logger.info(
                     "tuner | %s margin %.4f → %.4f "
-                    "(signals=%d mean_edge=%.4f)",
-                    action, current, new_margin, count, mean_edge,
+                    "(signals=%d fills=%s mean_edge=%.4f)",
+                    action, current, new_margin, count,
+                    "n/a" if fills is None else fills, mean_edge,
                 )
             else:
                 logger.debug(
                     "tuner | %s margin=%.4f "
-                    "(signals=%d mean_edge=%.4f)",
-                    action, current, count, mean_edge,
+                    "(signals=%d fills=%s mean_edge=%.4f)",
+                    action, current, count,
+                    "n/a" if fills is None else fills, mean_edge,
                 )
 
     except asyncio.CancelledError:

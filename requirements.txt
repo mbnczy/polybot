@@ -3,7 +3,12 @@
 #   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # Polymarket unified V2 SDK (order signing, REST, settlement routing)
-polymarket-client>=0.1.0b19  # V2 unified SDK (pUSD-era order version)
+polymarket-client==0.7.1  # V2 unified SDK (pUSD-era order version).
+# PINNED 2026-09-06. The floor was >=0.1.0b19 while 0.7.1 was installed, so a
+# reinstall could silently pull a different SDK under a live trading bot. This
+# is also the version the suite is green against; the 3 standing failures in
+# test_sdk_compat / test_latency_optimization are drift between that floor and
+# what is actually running. Bump deliberately, with the suite, never by accident.
 
 # Async HTTP client + WebSocket transport (ws_feed + telegram notifier)
 aiohttp>=3.9.0

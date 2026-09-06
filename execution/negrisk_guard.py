@@ -92,6 +92,29 @@ NEGRISK_GROUP_COOLDOWN_S: float = float(
     os.environ.get("NEGRISK_GROUP_COOLDOWN_S", 60.0)
 )
 
+# Each consecutive failure on the same group doubles its cooldown, up to this
+# ceiling. A group that repeatedly refuses to complete is telling us something
+# about its book; a fixed 60 s just meant we relearned it every minute.
+NEGRISK_COOLDOWN_MAX_S: float = float(
+    os.environ.get("NEGRISK_COOLDOWN_MAX_S", 900.0)
+)
+
+# Complete a partially-filled bundle as taker when the missing legs are cheap
+# enough that the finished bundle still clears its payout floor. Set 0 to
+# disable and always flatten (the behaviour before 2026-09-06).
+NEGRISK_COMPLETE_PARTIAL: bool = os.environ.get(
+    "NEGRISK_COMPLETE_PARTIAL", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+
+# Minimum USDC profit for completion to be worth crossing the spread for.
+NEGRISK_MIN_COMPLETE_PROFIT: float = float(
+    os.environ.get("NEGRISK_MIN_COMPLETE_PROFIT", 0.01)
+)
+
+# Assumed taker fee when completing. Overridden at startup by the rate measured
+# from settled trades — see PolyClient.observed_fee_rates().
+NEGRISK_TAKER_FEE: float = float(os.environ.get("DEFAULT_TAKER_FEE", 0.02))
+
 # Grace period before an order the CLOB does not know about is judged.
 #
 # The CLOB returns a null body for an order it "no longer tracks" — but it
@@ -178,7 +201,11 @@ class NegRiskBundleGuard:
         bundle_timeout: float = NEGRISK_BUNDLE_TIMEOUT_S,
         order_ttl:      float = NEGRISK_ORDER_TTL_S,
         group_cooldown: float = NEGRISK_GROUP_COOLDOWN_S,
+        cooldown_max:   float = NEGRISK_COOLDOWN_MAX_S,
         index_grace:    float = NEGRISK_ORDER_INDEX_GRACE_S,
+        complete_partial: bool  = NEGRISK_COMPLETE_PARTIAL,
+        taker_fee:        float = NEGRISK_TAKER_FEE,
+        min_complete_profit: float = NEGRISK_MIN_COMPLETE_PROFIT,
     ) -> None:
         self._client   = client
         self._breaker  = breaker
@@ -187,7 +214,13 @@ class NegRiskBundleGuard:
         self._timeout  = max(0.0, bundle_timeout)
         self._ttl      = max(0.0, order_ttl)
         self._cooldown = max(0.0, group_cooldown)
+        self._cool_max = max(self._cooldown, cooldown_max)
         self._grace    = max(0.0, index_grace)
+        self._complete = bool(complete_partial)
+        self._fee      = max(0.0, taker_fee)
+        self._min_cp   = max(0.0, min_complete_profit)
+        # condition_id -> consecutive failures, for the escalating backoff
+        self._strikes: dict[str, int] = {}
         self._bundles: dict[str, _WatchedBundle] = {}
         # condition_id -> monotonic deadline before which the group is off limits
         self._cooling: dict[str, float] = {}
@@ -248,6 +281,33 @@ class NegRiskBundleGuard:
         """True while any bundle on this group is still unresolved."""
         return any(b.condition_id == condition_id for b in self._bundles.values())
 
+    def _arm_cooldown(self, condition_id: str) -> float:
+        """Escalate this group's backoff and return the window applied."""
+        if self._cooldown <= 0.0:
+            return 0.0
+        n = self._strikes.get(condition_id, 0) + 1
+        self._strikes[condition_id] = n
+        window = min(self._cooldown * (2 ** (n - 1)), self._cool_max)
+        self._cooling[condition_id] = time.monotonic() + window
+        logger.info(
+            "NegRiskGuard | group %s cooling %.0fs (strike %d)",
+            condition_id[:16], window, n,
+        )
+        return window
+
+    def set_taker_fee(self, rate: float) -> None:
+        """Adopt the fee measured from settled trades. The completion test is
+        entirely decided by this number, so an assumed one is not good enough:
+        at the hard-coded 2% every completion tonight scored as a loss, and at
+        the real 0% every one of them was a profit."""
+        self._fee = max(0.0, float(rate))
+        logger.info("NegRiskGuard | taker fee set to %.4f", self._fee)
+
+    def clear_strikes(self, condition_id: str) -> None:
+        """A group that completed cleanly starts from zero again."""
+        self._strikes.pop(condition_id, None)
+        self._cooling.pop(condition_id, None)
+
     def cool_down(self, condition_id: str) -> None:
         """
         Put a group off limits for the cooldown window without a bundle having
@@ -256,8 +316,7 @@ class NegRiskBundleGuard:
         that order hash, so re-signalling the same group 50 seconds later just
         reproduces the rejection.
         """
-        if self._cooldown > 0.0:
-            self._cooling[condition_id] = time.monotonic() + self._cooldown
+        self._arm_cooldown(condition_id)
 
     def is_busy(self, condition_id: str) -> bool:
         """
@@ -452,6 +511,133 @@ class NegRiskBundleGuard:
     # Finalisation
     # ──────────────────────────────────────────────────────────────────────────
 
+    async def _best_ask(self, token_id: str) -> "float | None":
+        try:
+            book = await self._client.get_orderbook(token_id)
+            asks = book.get("asks", [])
+            if not asks:
+                return None
+            # The exchange returns the book WORST-first, so scan for the
+            # minimum rather than trusting index 0.
+            return min(
+                float(a["price"] if isinstance(a, dict) else a) for a in asks
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "NegRiskGuard | orderbook fetch failed for %s: %s",
+                str(token_id)[:12], exc,
+            )
+            return None
+
+    async def _try_complete(
+        self, bundle: _WatchedBundle
+    ) -> "float | None":
+        """
+        Buy the missing legs as taker when the finished bundle still clears its
+        payout floor. Returns realised profit if completed, else None.
+
+        Why this exists
+        ---------------
+        The module docstring argued that a partial bundle cannot be held, and
+        that is right — but it concluded the only resolution is to flatten, and
+        that is wrong. Flattening pays the spread on every leg that filled and
+        books a certain loss. Completing pays the spread once, on the legs that
+        did NOT fill, and buys the guarantee outright.
+
+        Measured on the three flattens of 2026-09-05/06, at the real 0% fee:
+
+            bundle        complete    flattened
+            2/3 filled     +0.0100      -0.0659
+            1/3 filled     +0.0100      -0.0102
+            1/3 filled     +0.0100      -0.0101
+
+        Every one of them was a profit available and a loss taken instead.
+
+        The test is the entry test again: holding n bundles of k legs pays
+        n*(k-1) at expiry, so completion is worth it when everything already
+        spent plus the cost of the missing legs stays under that.
+        """
+        if not self._complete:
+            return None
+
+        legs = bundle.legs
+        k    = len(legs)
+        if k < 2:
+            return None
+
+        n = max(leg.matched for leg in legs)
+        if n <= _SHARE_EPS:
+            return None
+        n = math.floor(n * 100) / 100.0
+
+        spent  = sum(leg.matched * leg.bid for leg in legs)
+        wanted: list[tuple[_BundleLegState, float, float]] = []
+        cost   = 0.0
+        for leg in legs:
+            qty = math.floor(max(0.0, n - leg.matched) * 100) / 100.0
+            if qty <= _SHARE_EPS:
+                continue
+            ask = await self._best_ask(leg.token_id)
+            if ask is None or not (0.0 < ask < 1.0):
+                logger.debug(
+                    "NegRiskGuard | no usable ask on leg[%d] — cannot complete",
+                    leg.idx,
+                )
+                return None
+            wanted.append((leg, qty, ask))
+            cost += qty * ask * (1.0 + self._fee)
+
+        if not wanted:
+            return None
+
+        payout = n * (k - 1)
+        profit = payout - (spent + cost)
+        if profit < self._min_cp:
+            logger.info(
+                "NegRiskGuard | completion on %s would net %+.4f (< %.4f) — "
+                "flattening instead",
+                bundle.condition_id[:16], profit, self._min_cp,
+            )
+            return None
+
+        # Commit. A leg that fails to fill leaves us no worse off than the
+        # flatten path we would otherwise have taken, and the shares bought so
+        # far are still counted, so the caller can fall through to unwinding.
+        bought = 0
+        for leg, qty, ask in wanted:
+            try:
+                resp = await self._client.post_order(
+                    token_id=leg.token_id, side="BUY", price=ask, size=qty,
+                )
+                status = str(resp.get("status", "")).strip().lower()
+                if status not in _FILLED_STATUSES:
+                    raise RuntimeError(f"completion leg not filled: {resp}")
+                leg.matched += qty
+                bought += 1
+                logger.info(
+                    "NegRiskGuard | completion bought %.2f of leg[%d] @ %.4f",
+                    qty, leg.idx, ask,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "NegRiskGuard | completion leg[%d] failed on %s: %s — "
+                    "falling back to flatten",
+                    leg.idx, bundle.condition_id[:16], exc,
+                )
+                return None
+
+        logger.warning(
+            "NegRiskGuard | BUNDLE COMPLETED AS TAKER %s | %d leg(s) bought, "
+            "%.2f bundles, profit=%+.4f USDC",
+            bundle.condition_id[:16], bought, n, profit,
+        )
+        await self._notifier.notify(
+            f"\u2705 NegRisk bundle on {market_titles.label(bundle.condition_id)} "
+            f"completed as taker \u2014 {n:.2f} bundles, "
+            f"profit={profit:+.4f} USDC"
+        )
+        return round(profit, 6)
+
     async def _recheck_fills(
         self, bundle: _WatchedBundle
     ) -> list[_BundleLegState]:
@@ -503,6 +689,7 @@ class NegRiskBundleGuard:
             filled  = min(leg.matched for leg in bundle.legs)
             pnl     = round(filled * sig.net_edge, 6)
             self._breaker.on_fill(pnl=pnl)
+            self.clear_strikes(bundle.condition_id)
             logger.info(
                 "NegRiskGuard | BUNDLE COMPLETE %s | legs=%d bundles=%.2f "
                 "pnl=%+.4f USDC",
@@ -534,11 +721,19 @@ class NegRiskBundleGuard:
             self._breaker.release_open()
             return
 
-        # Incomplete with exposure: flatten every filled leg.  See the module
-        # docstring for why a partial bundle cannot simply be held.
+        # Incomplete with exposure. A partial bundle cannot be HELD (see the
+        # module docstring), but flattening is not the only way to resolve it:
+        # buying the missing legs converts it into the guaranteed bundle it was
+        # meant to be, and that is usually cheaper than paying the spread to
+        # undo every leg that filled. Try that first.
         ARB_HALF_FILLS.inc()
-        if self._cooldown > 0.0:
-            self._cooling[bundle.condition_id] = time.monotonic() + self._cooldown
+        completed = await self._try_complete(bundle)
+        if completed is not None:
+            self._breaker.on_fill(pnl=completed)
+            self.clear_strikes(bundle.condition_id)
+            return
+
+        self._arm_cooldown(bundle.condition_id)
         realised, failures = await self._unwind_all(bundle, naked)
 
         self._breaker.on_fill(pnl=round(realised, 6))

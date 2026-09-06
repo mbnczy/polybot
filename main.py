@@ -106,6 +106,7 @@ from core.scanner import FeedRegistry, MarketScanner               # noqa: E402
 from execution.auto_redeem import AutoRedeemer                     # noqa: E402
 from execution.inventory_manager import InventoryManager           # noqa: E402
 from execution.negrisk_guard import NegRiskBundleGuard             # noqa: E402
+from execution.reconciler import WalletReconciler                 # noqa: E402
 from execution.pair_guard import MakerPairGuard                    # noqa: E402
 from risk.circuit_breaker import (                                 # noqa: E402
     ArbOrderIntent,
@@ -448,6 +449,8 @@ async def strategy_loop(
                     maker_rebate=rebate,
                     tick_size=tick.get("tick_size"),
                     no_ask_sizes=tick.get("no_ask_sizes"),
+                    no_best_bids=tick.get("no_best_bids"),
+                    leg_tick_sizes=tick.get("leg_tick_sizes"),
                 )
                 if nr_signal is None:
                     continue
@@ -991,11 +994,35 @@ async def main() -> None:
 
     breaker        = CircuitBreaker(starting_balance=STARTING_BALANCE)
     notifier       = TelegramNotifier(on_status=breaker.status_dict)
-    fee_engine     = FeeEngine(default_fee=_default_fee)
+    # Learn the fee we are actually charged BEFORE anything is scored with it.
+    # No market these strategies touch exposes a usable fee field, so every
+    # lookup silently fell through to the assumed DEFAULT_TAKER_FEE — on a ~3%
+    # edge, assuming an uncharged 2% disables most of the strategy.
+    _fee_rate = _default_fee
+    try:
+        _fees = await client.observed_fee_rates()
+    except Exception as exc:  # noqa: BLE001
+        _fees = None
+        logger.warning("Fee calibration unavailable: %s", exc)
+    if _fees and "TAKER" in _fees:
+        _fee_rate = _fees["TAKER"]
+        logger.info(
+            "Fee | measured from settled trades: maker=%.4f taker=%.4f "
+            "(assumed default was %.4f)",
+            _fees.get("MAKER", 0.0), _fee_rate, _default_fee,
+        )
+    else:
+        logger.warning(
+            "Fee | could not measure real fees; using assumed %.4f", _default_fee
+        )
+
+    fee_engine     = FeeEngine(default_fee=_fee_rate)
+    if _fees and "TAKER" in _fees:
+        fee_engine.calibrate(_fee_rate)
     rebate_engine  = MakerRebateEngine()
     detector       = ArbDetector(
                          desired_net_margin=_desired_margin,
-                         default_fee_rate=_default_fee,
+                         default_fee_rate=_fee_rate,
                          extreme_lo=_extreme_lo,
                          extreme_hi=_extreme_hi,
                      )
@@ -1095,11 +1122,18 @@ async def main() -> None:
     # ── negrisk bundle guard: partial-fill protection for the N-leg CLOB path.
     #    N limit orders are not atomic, and a partly-filled NegRisk bundle is a
     #    directional bet rather than a smaller arb, so the guard cancels the
-    #    stragglers and unwinds whatever filled. Only needed when executing.
+    #    stragglers and then either COMPLETES the bundle as taker (when the
+    #    missing legs still leave it under its payout floor) or flattens what
+    #    filled. Only needed when executing.
     negrisk_guard = (
-        NegRiskBundleGuard(client, breaker, notifier)
+        NegRiskBundleGuard(client, breaker, notifier, taker_fee=_fee_rate)
         if _negrisk_exec_mode == "clob" else None
     )
+
+    # ── wallet reconciler: the only check that does not trust the bot's own
+    #    account of events. Every serious fault on 2026-09-05/06 was invisible
+    #    in the logs and plain in the wallet, so compare against the chain.
+    reconciler = WalletReconciler(client, breaker, notifier)
 
     await notifier.notify(
         f"Polymarket ARB Bot v7 online\n"
@@ -1157,6 +1191,7 @@ async def main() -> None:
         ),
         asyncio.create_task(auto_redeem_loop(redeemer),                        name="auto_redeem"),
         asyncio.create_task(inventory.run(),                                   name="inventory"),
+        asyncio.create_task(reconciler.run(),                                  name="reconciler"),
         asyncio.create_task(pair_guard.run(),                                  name="pair_guard"),
         *([asyncio.create_task(negrisk_guard.run(), name="negrisk_guard")]
           if negrisk_guard is not None else []),
@@ -1164,7 +1199,8 @@ async def main() -> None:
         asyncio.create_task(telegram_loop(notifier),                           name="telegram"),
         asyncio.create_task(sig_logger.run(),                                  name="sig_logger"),
         asyncio.create_task(metrics_server(),                                  name="metrics"),
-        asyncio.create_task(tuner_loop(detector),                              name="tuner"),
+        asyncio.create_task(tuner_loop(detector, fills_since=breaker.fills_since),
+                            name="tuner"),
     ]
     # Populate halt-tasks so /halt can cancel this exact gather group.
     _halt_tasks.extend(tasks)

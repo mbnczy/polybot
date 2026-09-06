@@ -712,6 +712,30 @@ def _signal(n_legs: int = 3, size: float = 10.0):
     )
 
 
+def _tight_signal(bid: float = 0.66, n_legs: int = 3, size: float = 10.0):
+    """
+    A signal with a REAL edge rather than the toy 0.30 legs.
+
+    Three legs at 0.66 sum to 1.98 against a payout floor of 2.00 — one cent of
+    edge per bundle, which is the shape the live NH-01 bundles actually had
+    (0.960 + 0.180 + 0.830 = 1.970 vs 2.000). With legs bought at 0.30 the
+    completion test can never fail, so it proves nothing.
+    """
+    from strategy.arbitrage import ArbLeg, NegRiskSignal
+    legs = tuple(
+        ArbLeg(token_id=f"T{i}", no_ask=bid + 0.01, no_bid=bid, size=size)
+        for i in range(n_legs)
+    )
+    combined = bid * n_legs
+    payout   = float(n_legs - 1)
+    return NegRiskSignal(
+        condition_id="0xgroup", n_outcomes=n_legs, legs=legs,
+        combined_bid=combined, payout=payout, maker_rebate=0.0,
+        effective_cost=combined, net_edge=payout - combined,
+        relative_edge=(payout - combined) / payout, n_bundles=size,
+    )
+
+
 def _acks(n_legs: int = 3) -> list[dict]:
     return [{"status": "live", "order_id": f"o{i}"} for i in range(n_legs)]
 
@@ -1430,3 +1454,149 @@ class TestPresumedGoneOrdersAreActuallyCancelled:
 
         assert client.cancelled == []
         assert breaker.filled, "a complete bundle must be booked"
+
+
+class TestTakerCompletion:
+    """
+    2. A partial bundle should be COMPLETED when that clears the payout floor,
+    not reflexively flattened.
+
+    Holding n bundles of k legs pays n*(k-1) at expiry, so buying the missing
+    legs is worth it whenever everything already spent plus their cost stays
+    under that. Measured on the three flattens of 2026-09-05/06 at the real 0%
+    fee, completion was +0.0100 each where flattening booked -0.0659, -0.0102
+    and -0.0101. Every one was a profit available and a loss taken instead.
+    """
+
+    def _client_with_book(self, statuses, ask):
+        c = _StubClient(statuses)
+        c.book_ask = ask
+        async def _get_orderbook(token_id):
+            # worst-first, as the exchange really sends it
+            return {"asks": [{"price": 0.99, "size": 10},
+                             {"price": c.book_ask, "size": 500}],
+                    "bids": [{"price": 0.01, "size": 10}]}
+        c.get_orderbook = _get_orderbook
+        c.posted = []
+        async def _post_order(token_id, side, price, size):
+            c.posted.append((token_id, side, price, size))
+            return {"status": "matched", "size": size, "price": price}
+        c.post_order = _post_order
+        return c
+
+    @pytest.mark.asyncio
+    async def test_cheap_missing_leg_is_bought_instead_of_flattening(self):
+        from execution.negrisk_guard import NegRiskBundleGuard
+        sig = _signal()
+        client = self._client_with_book({"o0": None, "o1": None, "o2": None}, ask=0.10)
+        client.order_fills = {"o0": 10.0, "o1": 10.0}     # o2 short
+        breaker, notifier = _StubBreaker(), _StubNotifier()
+        guard = NegRiskBundleGuard(
+            client, breaker, notifier, bundle_timeout=0.0, index_grace=0.0,
+            taker_fee=0.0, min_complete_profit=0.001,
+        )
+        guard.watch_bundle(sig, _acks())
+        await guard.poll_once()
+
+        assert client.posted, "did not buy the missing leg"
+        assert client.unwound == [], "flattened despite completion being viable"
+        assert breaker.filled and breaker.filled[0] > 0, "no profit booked"
+
+    @pytest.mark.asyncio
+    async def test_expensive_missing_leg_falls_back_to_flattening(self):
+        """Completion must not be taken at any price."""
+        from execution.negrisk_guard import NegRiskBundleGuard
+        # legs at 0.66 -> two filled cost 13.20, floor is 20.00, so the missing
+        # leg is only worth buying under 0.68. At 0.85 it is not.
+        sig = _tight_signal()
+        client = self._client_with_book({"o0": None, "o1": None, "o2": None}, ask=0.85)
+        client.order_fills = {"o0": 10.0, "o1": 10.0}
+        breaker, notifier = _StubBreaker(), _StubNotifier()
+        guard = NegRiskBundleGuard(
+            client, breaker, notifier, bundle_timeout=0.0, index_grace=0.0,
+            taker_fee=0.0, min_complete_profit=0.01,
+        )
+        guard.watch_bundle(sig, _acks())
+        await guard.poll_once()
+
+        assert client.posted == [], "crossed the spread on an unprofitable completion"
+        assert client.unwound, "neither completed nor flattened"
+
+    @pytest.mark.asyncio
+    async def test_the_fee_assumption_decides_the_outcome(self):
+        """
+        The whole decision hinges on the fee. At the hard-coded 2% every
+        completion tonight scored as a loss; at the measured 0% every one was a
+        profit. Same book, same fills, opposite action.
+        """
+        from execution.negrisk_guard import NegRiskBundleGuard
+        outcomes = {}
+        for fee in (0.0, 0.02):
+            # priced so the 2% assumption alone flips the verdict:
+            #   fee 0.00 -> 20.00 - (13.20 + 6.70) = +0.10  complete
+            #   fee 0.02 -> 20.00 - (13.20 + 6.83) = -0.03  flatten
+            sig = _tight_signal()
+            client = self._client_with_book({"o0": None, "o1": None, "o2": None}, ask=0.67)
+            client.order_fills = {"o0": 10.0, "o1": 10.0}
+            breaker, notifier = _StubBreaker(), _StubNotifier()
+            guard = NegRiskBundleGuard(
+                client, breaker, notifier, bundle_timeout=0.0, index_grace=0.0,
+                taker_fee=fee, min_complete_profit=0.01,
+            )
+            guard.watch_bundle(sig, _acks())
+            await guard.poll_once()
+            outcomes[fee] = bool(client.posted)
+        assert outcomes[0.0] is not outcomes[0.02], (
+            "the fee should change the completion decision at this price"
+        )
+
+    @pytest.mark.asyncio
+    async def test_disabled_completion_always_flattens(self):
+        from execution.negrisk_guard import NegRiskBundleGuard
+        sig = _signal()
+        client = self._client_with_book({"o0": None, "o1": None, "o2": None}, ask=0.10)
+        client.order_fills = {"o0": 10.0, "o1": 10.0}
+        breaker, notifier = _StubBreaker(), _StubNotifier()
+        guard = NegRiskBundleGuard(
+            client, breaker, notifier, bundle_timeout=0.0, index_grace=0.0,
+            complete_partial=False,
+        )
+        guard.watch_bundle(sig, _acks())
+        await guard.poll_once()
+        assert client.posted == []
+        assert client.unwound
+
+
+class TestEscalatingCooldown:
+    """6. A group that keeps failing should be left alone for longer."""
+
+    def _guard(self, **kw):
+        from execution.negrisk_guard import NegRiskBundleGuard
+        return NegRiskBundleGuard(
+            _StubClient({}), _StubBreaker(), _StubNotifier(),
+            group_cooldown=10.0, cooldown_max=40.0, **kw
+        )
+
+    def test_backoff_doubles_per_strike(self):
+        g = self._guard()
+        assert g._arm_cooldown("0xg") == pytest.approx(10.0)
+        assert g._arm_cooldown("0xg") == pytest.approx(20.0)
+        assert g._arm_cooldown("0xg") == pytest.approx(40.0)
+
+    def test_backoff_is_capped(self):
+        g = self._guard()
+        for _ in range(10):
+            w = g._arm_cooldown("0xg")
+        assert w == pytest.approx(40.0)
+
+    def test_groups_escalate_independently(self):
+        g = self._guard()
+        g._arm_cooldown("0xa"); g._arm_cooldown("0xa")
+        assert g._arm_cooldown("0xb") == pytest.approx(10.0)
+
+    def test_a_clean_completion_resets_the_record(self):
+        g = self._guard()
+        g._arm_cooldown("0xg"); g._arm_cooldown("0xg")
+        g.clear_strikes("0xg")
+        assert not g.is_busy("0xg")
+        assert g._arm_cooldown("0xg") == pytest.approx(10.0)

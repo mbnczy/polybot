@@ -129,6 +129,26 @@ def _best_ask_level(asks: "list | None") -> "tuple[float, float] | None":
     return None if best_p is None else (best_p, best_s)
 
 
+def _best_bid_price(bids: "list | None") -> "float | None":
+    """
+    Highest bid on the book, or None.
+
+    Same trap as the ask side: the exchange sends bids ascending from 0.001, so
+    bids[0] is the WORST bid. Scan for the maximum.
+    """
+    best: float | None = None
+    for lvl in bids or []:
+        try:
+            price = float(lvl["price"] if isinstance(lvl, dict) else lvl)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if price <= 0.0:
+            continue
+        if best is None or price > best:
+            best = price
+    return best
+
+
 class _MarketState:
     """
     Per-market best-ask state and event handling for ONE binary market.
@@ -356,6 +376,11 @@ class _NegRiskGroupState:
         self._best_ask:  dict[str, Optional[float]] = {t: None for t in no_token_ids}
         self._ask_size:  dict[str, Optional[float]] = {t: None for t in no_token_ids}
         self._tick_size: dict[str, Optional[float]] = {t: None for t in no_token_ids}
+        # The bid side was never tracked here, so the detector could not tell
+        # whether its synthetic quote would IMPROVE a leg's book or just join
+        # the back of an existing queue. On a penny-tick book those are the
+        # difference between filling and never filling.
+        self._best_bid:  dict[str, Optional[float]] = {t: None for t in no_token_ids}
         self._last_pushed: tuple = ()
 
     def owns(self, asset_id: str) -> bool:
@@ -391,6 +416,10 @@ class _NegRiskGroupState:
                 self._tick_size[asset_id] = float(_ts)
             except (TypeError, ValueError):
                 pass
+
+        bid = _best_bid_price(event.get("bids", []))
+        if bid is not None:
+            self._best_bid[asset_id] = bid
 
         best = _best_ask_level(event.get("asks", []))
         if best is None:
@@ -459,6 +488,8 @@ class _NegRiskGroupState:
         token_ids: list[str]   = []
         asks:      list[float] = []
         sizes:     list[float | None] = []
+        bids:      list[float | None] = []
+        leg_ticks: list[float | None] = []
         for t in self.no_token_ids:
             ask = self._best_ask.get(t)
             if ask is None:
@@ -467,11 +498,13 @@ class _NegRiskGroupState:
             asks.append(ask)
             # None propagates as "depth unknown" — see _handle_price_change.
             sizes.append(self._ask_size.get(t))
+            bids.append(self._best_bid.get(t))
+            leg_ticks.append(self._tick_size.get(t))
 
         if len(token_ids) < self.MIN_QUOTED_LEGS:
             return None
 
-        fingerprint = (tuple(token_ids), tuple(asks), tuple(sizes))
+        fingerprint = (tuple(token_ids), tuple(asks), tuple(sizes), tuple(bids))
         if fingerprint == self._last_pushed:
             return None
         self._last_pushed = fingerprint
@@ -485,6 +518,11 @@ class _NegRiskGroupState:
             "outcome_token_ids": token_ids,
             "no_asks":           asks,
             "no_ask_sizes":      sizes,
+            # Per-leg best bids and tick grids. The single coarse tick below is
+            # kept for order validity, but the detector needs the real per-leg
+            # grid to know what improving a book actually costs.
+            "no_best_bids":      bids,
+            "leg_tick_sizes":    leg_ticks,
             # Coarsest observed grid — valid on every member market.
             "tick_size":         max(_ticks) if _ticks else None,
             "n_group_outcomes":  len(self.no_token_ids),

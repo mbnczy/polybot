@@ -301,6 +301,14 @@ _UNWIND_MAX_SLICES: int = int(os.environ.get("UNWIND_MAX_SLICES", 12))
 # head of the feed; the cap stops a lookup walking the entire trade history.
 _TRADE_SCAN_LIMIT: int = int(os.environ.get("TRADE_SCAN_LIMIT", 200))
 
+# Settled trades to inspect when calibrating the real fee rate at startup.
+_FEE_CALIBRATION_TRADES: int = int(os.environ.get("FEE_CALIBRATION_TRADES", 200))
+
+# How far below the best bid still counts as real liquidity when sizing an
+# unwind slice. 0.10 = accept the top 10% price band. Dust orders parked at
+# 0.001 on a 0.96 book are not depth; counting them made the probe useless.
+_UNWIND_DEPTH_BAND: float = float(os.environ.get("UNWIND_DEPTH_BAND", 0.10))
+
 
 def _resp_filled(resp: dict | None) -> bool:
     """True if an order response indicates the leg was fully filled."""
@@ -852,6 +860,56 @@ class PolyClient:
             logger.warning(
                 "Trade lookup failed for order %s: %s", oid[:12], exc
             )
+            return None
+
+    async def observed_fee_rates(self) -> "dict[str, float] | None":
+        """
+        The fee actually charged on our own settled trades, by trader side.
+
+        Ground truth beats metadata here. The Gamma and CLOB market records
+        carry no usable fee field — Gamma returns takerBaseFee=1000, which
+        normalises to 10% and is rejected as implausible — so FeeEngine fell
+        through to a hard-coded 2% on every market. Meanwhile every one of our
+        215 settled trades was charged 0 bps, confirmed by arithmetic: 65.91
+        shares sold at 0.9566 credited 63.04996, exactly size x price.
+
+        Assuming a 2% cost that is not charged is not conservative on this
+        strategy, it is disabling: the whole edge is ~3%, so most of it gets
+        imagined away, real arbitrage is rejected, and completing a half-filled
+        bundle as taker looks like a loss when it is a profit.
+
+        Returns {"MAKER": rate, "TAKER": rate} as fractions, or None if the
+        trade feed cannot be read or we have no history to learn from.
+        """
+        if _PAPER_TRADE:
+            return None
+
+        def _read() -> "dict[str, float] | None":
+            seen: dict[str, float] = {}
+            count = 0
+            for page in self._client.list_account_trades():
+                for tr in page.items:
+                    if str(getattr(tr, "status", "")).upper() == "FAILED":
+                        continue
+                    side = str(getattr(tr, "trader_side", "")).upper()
+                    if side not in ("MAKER", "TAKER"):
+                        continue
+                    try:
+                        bps = float(tr.fee_rate_bps)
+                    except (TypeError, ValueError):
+                        continue
+                    # Take the WORST fee seen per side, never the average — a
+                    # calibration that under-states cost would manufacture edge.
+                    seen[side] = max(seen.get(side, 0.0), bps / 10_000.0)
+                    count += 1
+                if count >= _FEE_CALIBRATION_TRADES:
+                    break
+            return seen or None
+
+        try:
+            return await asyncio.get_running_loop().run_in_executor(_executor, _read)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Fee calibration failed: %s", exc)
             return None
 
     async def open_positions_detail(self) -> "list[dict] | None":
@@ -1508,12 +1566,31 @@ class PolyClient:
         # and retry. Selling SOME of the naked leg always beats selling none.
         try:
             book  = await self.get_orderbook(token_id)
-            depth = 0.0
+            levels = []
             for lvl in book.get("bids", []):
                 try:
-                    depth += float(lvl["size"] if isinstance(lvl, dict) else lvl)
+                    levels.append((
+                        float(lvl["price"] if isinstance(lvl, dict) else 0.0),
+                        float(lvl["size"]  if isinstance(lvl, dict) else lvl),
+                    ))
                 except (KeyError, TypeError, ValueError):
                     continue
+            # Only liquidity we would actually accept counts as depth. These
+            # books carry thousands of shares of dust at 0.001-0.003 — summing
+            # the whole side reports effectively infinite depth, so the probe
+            # never slices, and the FOK is then priced against a book that
+            # cannot fill it. Count only bids within _UNWIND_DEPTH_BAND of the
+            # best; anything below is a price we would refuse anyway.
+            best = max((p for p, _ in levels), default=0.0)
+            floor = best * (1.0 - _UNWIND_DEPTH_BAND)
+            depth = sum(sz for p, sz in levels if p >= floor)
+            if best > 0.0 and depth > 0:
+                logger.debug(
+                    "UNWIND | usable depth %.2f at >= %.4f (best %.4f); "
+                    "ignored %.2f of dust",
+                    depth, floor, best,
+                    sum(sz for p, sz in levels if p < floor),
+                )
             if depth > 0:
                 capped = math.floor(min(sell_size, depth) * 100) / 100.0
                 if capped < sell_size:

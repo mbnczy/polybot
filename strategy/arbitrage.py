@@ -696,6 +696,8 @@ class FeeEngine:
 
     def __init__(self, default_fee: float = DEFAULT_TAKER_FEE) -> None:
         self._default = default_fee
+        self._calibrated = False
+        self._fallbacks = 0
         self._cache: dict[str, tuple[float, float]] = {}
         # Persistent keep-alive session — reused across cold-miss fee fetches.
         self._session: "aiohttp.ClientSession | None" = None
@@ -709,6 +711,37 @@ class FeeEngine:
         """Close the keep-alive session (call on shutdown)."""
         if self._session is not None and not getattr(self._session, "closed", False):
             await self._session.close()
+
+    def calibrate(self, observed: float) -> None:
+        """
+        Replace the assumed fee with one measured from our own settled trades.
+
+        Neither Gamma nor the CLOB market record exposes a usable fee for these
+        markets, so every lookup fell through to the hard-coded default and no
+        log above DEBUG said so. Measuring what we are actually charged is the
+        only honest source. Clamped to the sane band, and the cache is dropped
+        so nothing keeps serving the old assumption.
+        """
+        rate = max(0.0, min(float(observed), MAX_TAKER_FEE))
+        if rate != self._default:
+            logger.warning(
+                "FeeEngine | calibrated taker fee %.4f -> %.4f (%.2f%%) from "
+                "settled trades; the assumed default was never charged",
+                self._default, rate, rate * 100,
+            )
+        self._default = rate
+        self._calibrated = True
+        self._cache.clear()
+
+    @property
+    def calibrated(self) -> bool:
+        return self._calibrated
+
+    @property
+    def fallback_count(self) -> int:
+        """How many markets fell through to the default. Nonzero is expected;
+        growing without a calibration behind it means we are guessing."""
+        return self._fallbacks
 
     async def get_taker_fee(self, condition_id: str) -> float:
         """Return the taker fee rate as a fraction (0.02 = 2.0 %)."""
@@ -752,10 +785,19 @@ class FeeEngine:
                 condition_id[:16], fee, fee * 100,
             )
             return fee
-        logger.debug(
-            "FeeEngine | using default %.4f for %s",
-            self._default, condition_id[:16],
-        )
+        self._fallbacks += 1
+        if self._fallbacks == 1 and not self._calibrated:
+            logger.warning(
+                "FeeEngine | no market exposes a fee field; falling back to the "
+                "assumed %.4f (%.2f%%) and it is UNVERIFIED. Calibrate against "
+                "settled trades or this number silently gates every signal.",
+                self._default, self._default * 100,
+            )
+        else:
+            logger.debug(
+                "FeeEngine | using default %.4f for %s",
+                self._default, condition_id[:16],
+            )
         return self._default
 
     async def _try_gamma(self, condition_id: str) -> float | None:
@@ -1043,6 +1085,8 @@ class NegRiskArbDetector:
         maker_rebate:       float | None = None,
         tick_size:          float | None = None,
         no_ask_sizes:       list[float] | None = None,
+        no_best_bids:       list[float | None] | None = None,
+        leg_tick_sizes:     list[float | None] | None = None,
     ) -> Optional[NegRiskSignal]:
         """
         Evaluate whether buying NO on a subset of the group's outcomes pays.
@@ -1108,7 +1152,8 @@ class NegRiskArbDetector:
         # ── 2. Candidate legs — drop unusable quotes ──────────────────────────
         # A malformed/absent quote only costs us that outcome's contribution to
         # the edge (subset lemma), so drop the leg instead of the whole group.
-        candidates: list[tuple[str, float, float, float]] = []   # id, ask, prob, depth
+        # id, ask, implied prob, ask depth, best bid, tick
+        candidates: list[tuple[str, float, float, float, "float|None", "float|None"]] = []
         for i, (token_id, ask) in enumerate(zip(outcome_token_ids, no_asks)):
             if not (0.01 <= ask <= 0.99):
                 logger.debug(
@@ -1130,7 +1175,9 @@ class NegRiskArbDetector:
                         i,
                     )
                     continue
-            candidates.append((token_id, ask, 1.0 - ask, depth))
+            leg_bid  = no_best_bids[i] if no_best_bids else None
+            leg_tick = leg_tick_sizes[i] if leg_tick_sizes else None
+            candidates.append((token_id, ask, 1.0 - ask, depth, leg_bid, leg_tick))
 
         if len(candidates) < 2:
             return None
@@ -1168,9 +1215,24 @@ class NegRiskArbDetector:
         sel_ids   = [c[0] for c in selected]
         sel_asks  = [c[1] for c in selected]
         sel_depth = [c[3] for c in selected]
+        sel_bids  = [c[4] for c in selected]
+        sel_ticks = [c[5] if c[5] is not None else tick_size for c in selected]
 
         # ── 5. Synthetic post-only NO bids ────────────────────────────────────
-        no_bids = [snap_post_only_bid(ask, tick_size) for ask in sel_asks]
+        # One tick under each leg's OWN ask. Previously every leg was snapped to
+        # the group's coarsest grid (max of the member ticks), so a leg whose
+        # real tick is 0.001 was quoted a full cent below the touch — invisible
+        # to the book while the coarse legs quoted normally.
+        #
+        # Note what is NOT here: there is no way to out-bid the touch post-only.
+        # naive = ask - tick and best_bid = ask - spread, so the quote only sits
+        # at or under the best bid when the spread IS one tick, and then the
+        # next price up is the ask itself. On a one-tick book the maker path can
+        # only ever join a queue; the lever that actually fills is crossing, and
+        # that lives in NegRiskBundleGuard._try_complete.
+        no_bids = [
+            snap_post_only_bid(ask, t) for ask, t in zip(sel_asks, sel_ticks)
+        ]
 
         # ── 6. Resolve maker rebate ───────────────────────────────────────────
         rebate = (
