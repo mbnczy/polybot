@@ -171,6 +171,40 @@ NEGRISK_MIN_COMPLETABLE_EDGE: float = float(
 )
 
 
+def lead_book_bid(
+    ask:  float,
+    bid:  "float | None",
+    tick: "float | None",
+    lead_ticks: int = 1,
+) -> float:
+    """
+    Cheapest post-only price that still leads the book.
+
+    Queue priority is by price then time, so ANY price above the resting best
+    bid puts us first — the extra ticks between that and `ask - tick` buy no
+    position, only cost. The detector always quoted `ask - tick`, which on a
+    five-tick spread pays three ticks for nothing:
+
+        ask 0.90, best bid 0.85   ->  quoted 0.89, needed 0.86
+
+    Measured across 102 live NegRisk legs: 25 were over-quoted for a total of
+    0.408, median 0.004 per bundle against a typical bundle edge of 0.02-0.03.
+
+    Falls back to `ask - tick` when the bid is unknown, and never returns a
+    price at or above the ask. Note the trade-off this accepts: a resting seller
+    priced between the two would have hit the higher quote and will not hit this
+    one. That flow is worth less than the spread it costs, because a bundle also
+    needs its one-tick legs to fill and no post-only price helps those.
+    """
+    t = tick if (tick and tick > 0) else DEFAULT_TICK_SIZE
+    ceiling = snap_post_only_bid(ask, t)
+    if bid is None or bid <= 0.0:
+        return ceiling
+    decimals = 2 if t >= 0.01 else 3
+    lead = round(bid + lead_ticks * t, decimals)
+    return min(ceiling, max(lead, t))
+
+
 def snap_post_only_bid(ask: float, tick: float | None) -> float:
     """
     One market-tick below `ask`, snapped to the market's tick grid.
@@ -1358,7 +1392,8 @@ class NegRiskArbDetector:
         # only ever join a queue; the lever that actually fills is crossing, and
         # that lives in NegRiskBundleGuard._try_complete.
         no_bids = [
-            snap_post_only_bid(ask, t) for ask, t in zip(sel_asks, sel_ticks)
+            lead_book_bid(ask, bid, t)
+            for ask, bid, t in zip(sel_asks, sel_bids, sel_ticks)
         ]
 
         # ── 6. Resolve maker rebate ───────────────────────────────────────────
@@ -1413,7 +1448,7 @@ class NegRiskArbDetector:
         if self._require_completable:
             realistic = 0.0
             for ask, tick, bid in zip(sel_asks, sel_ticks, sel_bids):
-                quote = snap_post_only_bid(ask, tick)
+                quote = lead_book_bid(ask, bid, tick)
                 leads = bid is None or quote > bid + 1e-12
                 if leads:
                     # Resting maker order: no fee, Polymarket charges takers only.

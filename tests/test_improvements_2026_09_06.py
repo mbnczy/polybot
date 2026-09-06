@@ -325,3 +325,50 @@ class TestTakerFeeModel:
         # and the fee must actually be charged: without it the cost would be
         # 0.85 flat, a materially different number
         assert crossed > 0.85
+
+
+class TestLeadBookBid:
+    """
+    Quote the cheapest price that still leads the book, not `ask - tick`.
+
+    Queue priority is price-then-time, so any price above the resting best bid
+    is first in line. On a five-tick spread `ask - tick` pays three ticks for a
+    position `best_bid + tick` already has. Measured across 102 live NegRisk
+    legs: 25 over-quoted, 0.408 in total, median 0.004 per bundle against a
+    typical bundle edge of 0.02-0.03.
+    """
+
+    def test_wide_spread_quotes_just_above_the_touch(self):
+        from strategy.arbitrage import lead_book_bid
+        assert lead_book_bid(0.90, 0.85, 0.01) == pytest.approx(0.86)
+
+    def test_one_tick_spread_is_unchanged(self):
+        """Nothing to save when ask - tick already IS the best bid."""
+        from strategy.arbitrage import lead_book_bid, snap_post_only_bid
+        assert lead_book_bid(0.85, 0.84, 0.01) == pytest.approx(
+            snap_post_only_bid(0.85, 0.01)
+        )
+
+    def test_never_crosses_the_ask(self):
+        from strategy.arbitrage import lead_book_bid
+        # a bid already at the ask must still produce a non-crossing quote
+        assert lead_book_bid(0.50, 0.60, 0.01) < 0.50
+
+    def test_fine_tick_grid_is_respected(self):
+        from strategy.arbitrage import lead_book_bid
+        q = lead_book_bid(0.982, 0.966, 0.001)
+        assert q == pytest.approx(0.967)
+        assert round(q, 3) == q, "must sit on the market's grid"
+
+    def test_unknown_bid_falls_back_to_ask_minus_tick(self):
+        from strategy.arbitrage import lead_book_bid, snap_post_only_bid
+        assert lead_book_bid(0.90, None, 0.01) == pytest.approx(
+            snap_post_only_bid(0.90, 0.01)
+        )
+
+    def test_quote_still_leads_the_book(self):
+        """The saving must not cost queue position — that is the whole point."""
+        from strategy.arbitrage import lead_book_bid
+        for ask, bid, tick in ((0.90, 0.85, 0.01), (0.58, 0.53, 0.01),
+                               (0.982, 0.966, 0.001)):
+            assert lead_book_bid(ask, bid, tick) > bid
