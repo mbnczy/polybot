@@ -218,10 +218,12 @@ class TestRealisticCompletionFilter:
         spread. Only that leg should be charged at the ask.
         """
         det = self._det()
-        asks  = [0.85, 0.60, 0.56]
-        bids  = [0.70, 0.45, 0.55]     # leg 2 is the stuck one
+        asks  = [0.85, 0.60, 0.55]
+        bids  = [0.70, 0.45, 0.54]     # leg 2 is the stuck one
         ticks = [0.01, 0.01, 0.01]
-        # realistic = 0.84 + 0.59 + 0.56 = 1.99 -> +0.01, still clears
+        # realistic = 0.84 + 0.59 + 0.55*(1+fee) = 1.9899 -> +0.0101, clears.
+        # Note the fee IS charged on the crossed leg: without it this fixture
+        # reads 1.98, and entry would be more optimistic than completion.
         sig = self._call(det, asks, bids, ticks)
         assert sig is not None
 
