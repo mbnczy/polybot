@@ -133,3 +133,94 @@ class TestBreakerFillTracking:
         for _ in range(700):
             b.on_arb_open(); b.on_fill(pnl=0.0)
         assert len(b._fill_times) <= 512
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Realistic-completion filter — score the bundle at the price we will pay
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestRealisticCompletionFilter:
+    """
+    An all-maker price is an assumption, not a plan.
+
+    A leg whose spread IS one tick cannot be quoted above the touch post-only,
+    so our order joins a queue and usually does not fill; the bundle then either
+    finishes as a taker on that leg or not at all. Scoring at the all-maker
+    price prices an outcome that does not happen, which is how a full night of
+    bundles "cleared" on entry and lost money on resolution.
+
+    Measured over 43 live NegRisk groups: 7 cleared all-maker, 1 still cleared
+    after crossing a leg, and 0 became an arb only by crossing. The filter
+    removes signals; that is the point, and the six it removes are the ones
+    that half-fill.
+    """
+
+    def _det(self, **kw):
+        from strategy.arbitrage import NegRiskArbDetector
+        return NegRiskArbDetector(
+            desired_net_margin=0.001, min_outcome_prob=0.02, max_legs=4,
+            default_rebate_rate=0.0, min_relative_edge=0.001, **kw
+        )
+
+    def _call(self, det, asks, bids, ticks):
+        return det.evaluate_neg_risk(
+            condition_id="0xg",
+            outcome_token_ids=[f"T{i}" for i in range(len(asks))],
+            no_asks=asks,
+            max_position_usdc=100.0,
+            tick_size=max(ticks),
+            no_ask_sizes=[500.0] * len(asks),
+            no_best_bids=bids,
+            leg_tick_sizes=ticks,
+        )
+
+    def test_bundle_that_only_clears_all_maker_is_rejected(self):
+        """
+        Three one-tick legs: each quote lands ON the touch, so realistically we
+        pay the ask on all three. All-maker says +0.03; completion says -0.00.
+        """
+        det = self._det()
+        asks  = [0.85, 0.60, 0.56]
+        bids  = [0.84, 0.59, 0.55]     # spread == tick on every leg
+        ticks = [0.01, 0.01, 0.01]
+        # all-maker cost 0.84+0.59+0.55 = 1.98 vs floor 2.00 -> +0.02
+        # realistic  cost 0.85+0.60+0.56 = 2.01 vs floor 2.00 -> -0.01
+        assert self._call(det, asks, bids, ticks) is None
+
+    def test_bundle_that_survives_completion_is_kept(self):
+        """Wide spreads: our quotes lead the book, so maker prices are real."""
+        det = self._det()
+        asks  = [0.85, 0.60, 0.56]
+        bids  = [0.70, 0.45, 0.40]     # our quotes lead comfortably
+        ticks = [0.01, 0.01, 0.01]
+        sig = self._call(det, asks, bids, ticks)
+        assert sig is not None
+        assert sig.net_edge > 0
+
+    def test_filter_can_be_disabled(self):
+        """The old all-maker scoring stays reachable for comparison."""
+        det = self._det()
+        det._require_completable = False
+        asks  = [0.85, 0.60, 0.56]
+        bids  = [0.84, 0.59, 0.55]
+        assert self._call(det, asks, bids, [0.01, 0.01, 0.01]) is not None
+
+    def test_absent_bid_data_does_not_block_a_signal(self):
+        """Unknown bids must not be treated as 'we are behind the touch'."""
+        det = self._det()
+        sig = self._call(det, [0.85, 0.60, 0.56], [None, None, None],
+                         [0.01, 0.01, 0.01])
+        assert sig is not None
+
+    def test_a_single_hard_leg_is_priced_at_its_ask(self):
+        """
+        Mixed case: two legs lead their books, one is stuck on a one-tick
+        spread. Only that leg should be charged at the ask.
+        """
+        det = self._det()
+        asks  = [0.85, 0.60, 0.56]
+        bids  = [0.70, 0.45, 0.55]     # leg 2 is the stuck one
+        ticks = [0.01, 0.01, 0.01]
+        # realistic = 0.84 + 0.59 + 0.56 = 1.99 -> +0.01, still clears
+        sig = self._call(det, asks, bids, ticks)
+        assert sig is not None

@@ -119,6 +119,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -155,6 +156,19 @@ TICK_SIZE:          float = 0.001    # legacy default price increment (0.1 cent)
 # to the COARSER 0.01 grid, which is valid on every market (a 0.01-multiple also
 # conforms to a 0.001 grid) — never produces an invalid price.
 DEFAULT_TICK_SIZE:  float = 0.01
+
+# Only enter a NegRisk bundle that still clears when the legs we cannot quote
+# competitively are paid at the ask. See the realistic-completion filter in
+# evaluate_neg_risk. Set false to score bundles at the all-maker price, which
+# is what produced a full night of half-fills.
+NEGRISK_REQUIRE_COMPLETABLE: bool = os.environ.get(
+    "NEGRISK_REQUIRE_COMPLETABLE", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+
+# Absolute USDC edge per bundle required at those completion prices.
+NEGRISK_MIN_COMPLETABLE_EDGE: float = float(
+    os.environ.get("NEGRISK_MIN_COMPLETABLE_EDGE", 0.002)
+)
 
 
 def snap_post_only_bid(ask: float, tick: float | None) -> float:
@@ -1072,6 +1086,8 @@ class NegRiskArbDetector:
         self._default_rebate   = max(0.0, min(default_rebate_rate, MAX_MAKER_REBATE))
         self._min_outcome_prob = min_outcome_prob
         self._max_legs         = max_legs
+        self._require_completable  = NEGRISK_REQUIRE_COMPLETABLE
+        self._min_completable_edge = NEGRISK_MIN_COMPLETABLE_EDGE
         self._min_rel_edge     = min_relative_edge
         self._min_leg_shares   = min_leg_shares
         self._extreme_hi       = extreme_hi
@@ -1233,6 +1249,38 @@ class NegRiskArbDetector:
         no_bids = [
             snap_post_only_bid(ask, t) for ask, t in zip(sel_asks, sel_ticks)
         ]
+
+        # ── 5b. Realistic-completion filter ───────────────────────────────────
+        # An all-maker price is an assumption, not a plan. A leg whose spread IS
+        # one tick cannot be improved post-only, so our quote joins the back of
+        # a queue and usually does not fill — which means the bundle finishes as
+        # a taker on that leg or not at all. Scoring the bundle at the all-maker
+        # price therefore prices an outcome that does not happen.
+        #
+        # So score it at what we will realistically PAY: maker where our quote
+        # leads the book, the ask where it cannot. If the bundle only clears
+        # under the all-maker fantasy, entering it just buys the legs that fill
+        # easily and then pays the spread to undo them.
+        #
+        # Measured over 43 live groups: 7 had an all-maker arb, 1 survived
+        # crossing a leg, and 0 became an arb only by crossing — so this filter
+        # removes signals rather than adding them, which is the point. The six
+        # it removes are the ones that half-fill.
+        if self._require_completable:
+            realistic = 0.0
+            for ask, tick, bid in zip(sel_asks, sel_ticks, sel_bids):
+                quote = snap_post_only_bid(ask, tick)
+                # Our quote leads only when it sits strictly above the best bid.
+                leads = bid is None or quote > bid + 1e-12
+                realistic += quote if leads else ask
+            realistic_edge = float(m - 1) - realistic
+            if realistic_edge < self._min_completable_edge:
+                logger.debug(
+                    "NegRiskArbDetector | condition=%s clears all-maker but not "
+                    "at completion prices (%.4f < %.4f) — skip",
+                    condition_id[:16], realistic_edge, self._min_completable_edge,
+                )
+                return None
 
         # ── 6. Resolve maker rebate ───────────────────────────────────────────
         rebate = (
