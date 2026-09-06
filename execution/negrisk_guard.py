@@ -67,6 +67,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from strategy.arbitrage import effective_taker_fee
 from telemetry.metrics import ARB_HALF_FILLS, ARB_UNWIND_FAILURES
 
 if TYPE_CHECKING:
@@ -114,6 +115,12 @@ NEGRISK_MIN_COMPLETE_PROFIT: float = float(
 # Assumed taker fee when completing. Overridden at startup by the rate measured
 # from settled trades — see PolyClient.observed_fee_rates().
 NEGRISK_TAKER_FEE: float = float(os.environ.get("DEFAULT_TAKER_FEE", 0.02))
+
+# Price the completion with Polymarket's published schedule (rate x min(p,1-p))
+# instead of a flat rate. Set false to fall back to NEGRISK_TAKER_FEE flat.
+NEGRISK_USE_FEE_SCHEDULE: bool = os.environ.get(
+    "NEGRISK_USE_FEE_SCHEDULE", "true"
+).strip().lower() in ("1", "true", "yes", "on")
 
 # Grace period before an order the CLOB does not know about is judged.
 #
@@ -218,6 +225,8 @@ class NegRiskBundleGuard:
         self._grace    = max(0.0, index_grace)
         self._complete = bool(complete_partial)
         self._fee      = max(0.0, taker_fee)
+        # Use the published schedule rather than a flat rate unless told not to.
+        self._fee_schedule = NEGRISK_USE_FEE_SCHEDULE
         self._min_cp   = max(0.0, min_complete_profit)
         # condition_id -> consecutive failures, for the escalating backoff
         self._strikes: dict[str, int] = {}
@@ -585,7 +594,12 @@ class NegRiskBundleGuard:
                 )
                 return None
             wanted.append((leg, qty, ask))
-            cost += qty * ask * (1.0 + self._fee)
+            # Price-dependent: Polymarket charges rate x min(p, 1-p) on takers,
+            # so a leg at 0.96 costs 0.16% to cross while one at 0.50 costs 2%.
+            # A flat rate over-charges the extremes this strategy lives on and
+            # under-charges the middle, which is where completion is marginal.
+            leg_fee = effective_taker_fee(ask) if self._fee_schedule else self._fee
+            cost += qty * ask * (1.0 + leg_fee)
 
         if not wanted:
             return None

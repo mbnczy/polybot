@@ -814,6 +814,39 @@ class FeeEngine:
             )
         return self._default
 
+    async def _try_schedule(self, condition_id: str) -> "tuple[float, float] | None":
+        """Read Gamma's feeSchedule -> (rate, exponent), or None."""
+        try:
+            session = self._get_session()
+            async with session.get(
+                f"{_GAMMA_HOST}/markets",
+                params={"conditionId": condition_id},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+            markets = data if isinstance(data, list) else data.get("data", [])
+            if not markets:
+                return None
+            market = markets[0]
+            if market.get("feesEnabled") is False:
+                return (0.0, 1.0)
+            sched = market.get("feeSchedule")
+            if not isinstance(sched, dict):
+                return None
+            rate = float(sched.get("rate", _FEE_SCHEDULE_RATE))
+            exp  = float(sched.get("exponent", _FEE_SCHEDULE_EXPONENT))
+            if not (0.0 <= rate <= 1.0) or not (0.0 < exp <= 4.0):
+                return None
+            return (rate, exp)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "FeeEngine | schedule lookup failed for %s: %s",
+                condition_id[:16], exc,
+            )
+            return None
+
     async def _try_gamma(self, condition_id: str) -> float | None:
         try:
             session = self._get_session()
@@ -854,6 +887,48 @@ class FeeEngine:
         except Exception as exc:
             logger.debug("FeeEngine | CLOB API error for %s: %s", condition_id[:16], exc)
         return None
+
+
+# Polymarket's published fee schedule, from Gamma's `feeSchedule` field:
+#     {"exponent": 1, "rate": 0.04, "takerOnly": true, "rebateRate": 0.25}
+#
+# The charge is NOT a flat percentage of notional. It is
+#
+#     fee = rate x min(p, 1-p)^exponent x size          (takers only)
+#
+# so it vanishes at the extremes and peaks in the middle:
+#
+#     p = 0.50  ->  0.04 x 0.50 = 2.00%     <- the maximum
+#     p = 0.83  ->  0.04 x 0.17 = 0.68%
+#     p = 0.96  ->  0.04 x 0.04 = 0.16%
+#
+# That is why the old DEFAULT_TAKER_FEE = 0.02 constant was not arbitrary: it is
+# this formula's WORST case. Charging it everywhere over-stated the cost on
+# every extreme-priced leg this bot actually trades, but it was not invented.
+#
+# Two things hid this. Gamma does not expose `feeRate`/`fee_rate`/`fee`, the
+# names the lookup asked for, so it always fell through. And ClobTrade's
+# fee_rate_bps reads 0 on every settled trade even when a fee was charged —
+# measuring that field alone says "no fee" and is wrong. The charge shows up in
+# the cash balance: the 65.91-share flatten received 63.04996 in the trade while
+# cash rose only 62.9405, a deduction of 0.10946 against a predicted 0.11442.
+_FEE_SCHEDULE_RATE:     float = 0.04
+_FEE_SCHEDULE_EXPONENT: float = 1.0
+
+
+def effective_taker_fee(
+    price:    float,
+    rate:     float = _FEE_SCHEDULE_RATE,
+    exponent: float = _FEE_SCHEDULE_EXPONENT,
+) -> float:
+    """
+    Taker fee as a fraction of notional at `price`, per the published schedule.
+
+    Returns 0 for a price outside (0, 1) rather than guessing.
+    """
+    if not (0.0 < price < 1.0):
+        return 0.0
+    return rate * (min(price, 1.0 - price) ** exponent)
 
 
 def _normalise_fee(raw: object) -> float | None:

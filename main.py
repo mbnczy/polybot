@@ -116,6 +116,7 @@ from risk.circuit_breaker import (                                 # noqa: E402
 )
 from core.clob_client import BundleLeg                             # noqa: E402
 from strategy.arbitrage import (                                   # noqa: E402
+    _FEE_SCHEDULE_RATE,
     ArbDetector,
     ArbSignal,
     DutchBookPricer,
@@ -994,31 +995,35 @@ async def main() -> None:
 
     breaker        = CircuitBreaker(starting_balance=STARTING_BALANCE)
     notifier       = TelegramNotifier(on_status=breaker.status_dict)
-    # Learn the fee we are actually charged BEFORE anything is scored with it.
-    # No market these strategies touch exposes a usable fee field, so every
-    # lookup silently fell through to the assumed DEFAULT_TAKER_FEE — on a ~3%
-    # edge, assuming an uncharged 2% disables most of the strategy.
+    # Polymarket charges rate x min(p, 1-p) on takers, not a flat percentage,
+    # so the cost depends on where a leg is priced: 2% at p=0.50, 0.16% at
+    # p=0.96. DEFAULT_TAKER_FEE=0.02 is that formula's worst case, which makes
+    # it the right fall-back and the wrong thing to charge every leg. See
+    # strategy.arbitrage.effective_taker_fee.
+    #
+    # Do NOT calibrate from ClobTrade.fee_rate_bps: it reads 0 on settled trades
+    # that were demonstrably charged, so measuring it says "free" and is wrong.
     _fee_rate = _default_fee
     try:
-        _fees = await client.observed_fee_rates()
+        _stamped = await client.observed_fee_rates()
     except Exception as exc:  # noqa: BLE001
-        _fees = None
-        logger.warning("Fee calibration unavailable: %s", exc)
-    if _fees and "TAKER" in _fees:
-        _fee_rate = _fees["TAKER"]
-        logger.info(
-            "Fee | measured from settled trades: maker=%.4f taker=%.4f "
-            "(assumed default was %.4f)",
-            _fees.get("MAKER", 0.0), _fee_rate, _default_fee,
+        _stamped = None
+        logger.debug("Per-trade fee stamp unreadable: %s", exc)
+    if _stamped and max(_stamped.values()) > 0.0:
+        # A per-trade rate has appeared; the schedule model may be incomplete.
+        _fee_rate = max(_fee_rate, max(_stamped.values()))
+        logger.warning(
+            "Fee | per-trade stamp is NONZERO (%s) — schedule model may be "
+            "incomplete; using %.4f", _stamped, _fee_rate,
         )
     else:
-        logger.warning(
-            "Fee | could not measure real fees; using assumed %.4f", _default_fee
+        logger.info(
+            "Fee | schedule model: %.3f x min(p,1-p), taker only; "
+            "worst case %.4f at p=0.50 (per-trade stamp reads zero, as expected)",
+            _FEE_SCHEDULE_RATE, _default_fee,
         )
 
     fee_engine     = FeeEngine(default_fee=_fee_rate)
-    if _fees and "TAKER" in _fees:
-        fee_engine.calibrate(_fee_rate)
     rebate_engine  = MakerRebateEngine()
     detector       = ArbDetector(
                          desired_net_margin=_desired_margin,

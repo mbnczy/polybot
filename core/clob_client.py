@@ -866,20 +866,22 @@ class PolyClient:
         """
         The fee actually charged on our own settled trades, by trader side.
 
-        Ground truth beats metadata here. The Gamma and CLOB market records
-        carry no usable fee field — Gamma returns takerBaseFee=1000, which
-        normalises to 10% and is rejected as implausible — so FeeEngine fell
-        through to a hard-coded 2% on every market. Meanwhile every one of our
-        215 settled trades was charged 0 bps, confirmed by arithmetic: 65.91
-        shares sold at 0.9566 credited 63.04996, exactly size x price.
+        WARNING — this is NOT the fee actually charged, and must not be used as
+        one. ClobTrade.fee_rate_bps reads 0 on every settled trade even when a
+        fee was taken: the 65.91-share flatten reported taking_amount 63.04996
+        while cash rose only 62.9405, a real deduction of 0.10946 that this
+        field does not mention.
 
-        Assuming a 2% cost that is not charged is not conservative on this
-        strategy, it is disabling: the whole edge is ~3%, so most of it gets
-        imagined away, real arbitrage is rejected, and completing a half-filled
-        bundle as taker looks like a loss when it is a profit.
+        The charge follows Gamma's published schedule instead —
+        rate x min(p, 1-p)^exponent, takers only — which is price-dependent and
+        peaks at 2% for p = 0.50. See strategy.arbitrage.effective_taker_fee.
+
+        Kept because it still answers a narrower question honestly: whether any
+        per-trade rate has ever been stamped on our fills. A nonzero value here
+        would mean the schedule model is incomplete and should be revisited.
 
         Returns {"MAKER": rate, "TAKER": rate} as fractions, or None if the
-        trade feed cannot be read or we have no history to learn from.
+        trade feed cannot be read.
         """
         if _PAPER_TRADE:
             return None

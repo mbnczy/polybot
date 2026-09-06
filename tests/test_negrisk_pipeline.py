@@ -1523,32 +1523,51 @@ class TestTakerCompletion:
         assert client.unwound, "neither completed nor flattened"
 
     @pytest.mark.asyncio
-    async def test_the_fee_assumption_decides_the_outcome(self):
+    async def test_the_fee_model_decides_the_outcome(self):
         """
-        The whole decision hinges on the fee. At the hard-coded 2% every
-        completion tonight scored as a loss; at the measured 0% every one was a
-        profit. Same book, same fills, opposite action.
+        The completion verdict is decided by the fee, so the fee model has to be
+        right. A flat 2% and the real schedule disagree at exactly the prices
+        this strategy trades.
         """
         from execution.negrisk_guard import NegRiskBundleGuard
         outcomes = {}
-        for fee in (0.0, 0.02):
-            # priced so the 2% assumption alone flips the verdict:
-            #   fee 0.00 -> 20.00 - (13.20 + 6.70) = +0.10  complete
-            #   fee 0.02 -> 20.00 - (13.20 + 6.83) = -0.03  flatten
+        for label, kw in (("flat 2%",  dict(taker_fee=0.02)),
+                          ("schedule", dict(taker_fee=0.02))):
             sig = _tight_signal()
             client = self._client_with_book({"o0": None, "o1": None, "o2": None}, ask=0.67)
             client.order_fills = {"o0": 10.0, "o1": 10.0}
             breaker, notifier = _StubBreaker(), _StubNotifier()
             guard = NegRiskBundleGuard(
                 client, breaker, notifier, bundle_timeout=0.0, index_grace=0.0,
-                taker_fee=fee, min_complete_profit=0.01,
+                min_complete_profit=0.01, **kw
             )
+            guard._fee_schedule = (label == "schedule")
             guard.watch_bundle(sig, _acks())
             await guard.poll_once()
-            outcomes[fee] = bool(client.posted)
-        assert outcomes[0.0] is not outcomes[0.02], (
-            "the fee should change the completion decision at this price"
-        )
+            outcomes[label] = bool(client.posted)
+        # at ask 0.67 the schedule charges 0.04 x 0.33 = 1.32%, not 2%, which is
+        # the difference between refusing and taking this completion
+        assert outcomes["schedule"] and not outcomes["flat 2%"], outcomes
+
+    @pytest.mark.asyncio
+    async def test_schedule_charges_less_at_the_extremes(self):
+        """
+        rate x min(p, 1-p): a leg at 0.96 costs 0.16% to cross, one at 0.50
+        costs 2%. A flat rate gets both wrong in opposite directions.
+        """
+        from strategy.arbitrage import effective_taker_fee
+        assert effective_taker_fee(0.50) == pytest.approx(0.02)
+        assert effective_taker_fee(0.96) == pytest.approx(0.0016)
+        assert effective_taker_fee(0.04) == pytest.approx(0.0016)
+        assert effective_taker_fee(0.83) == pytest.approx(0.0068)
+        # the old constant is exactly the worst case, not an arbitrary guess
+        assert max(effective_taker_fee(p / 100) for p in range(1, 100)) == \
+            pytest.approx(0.02)
+
+    @pytest.mark.parametrize("bad", [0.0, 1.0, -0.5, 1.5])
+    def test_impossible_prices_carry_no_fee(self, bad):
+        from strategy.arbitrage import effective_taker_fee
+        assert effective_taker_fee(bad) == 0.0
 
     @pytest.mark.asyncio
     async def test_disabled_completion_always_flattens(self):
