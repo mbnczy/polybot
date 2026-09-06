@@ -392,11 +392,26 @@ class MakerPairGuard:
                             leg.order_id[:12], verified,
                         )
                     elif verified < _SHARE_EPS:
+                        # NOT proof the order is gone. "Untracked" also covers
+                        # an order the CLOB has not surfaced yet, and a resting
+                        # order that has not traded looks identical. Marking it
+                        # closed here made _finalize skip it in the cancel loop,
+                        # leaving it live on the book to fill unwatched. Cancel
+                        # it for real — cancelling an order that is genuinely
+                        # gone is harmless; assuming it is gone is not.
                         logger.info(
                             "PairGuard | order %s untracked with no attributed "
-                            "fills — cancelled, not filled",
+                            "fills — cancelling to be certain",
                             leg.order_id[:12],
                         )
+                        leg.cancel_requested = True
+                        try:
+                            await self._client.cancel_order(leg.order_id)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "PairGuard | cancel %s leg %s failed (may have "
+                                "filled): %s", leg.label, leg.order_id[:12], exc,
+                            )
                     leg.matched = max(leg.matched, verified)
             return
 

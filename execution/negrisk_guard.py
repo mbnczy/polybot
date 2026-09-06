@@ -304,7 +304,7 @@ class NegRiskBundleGuard:
 
     async def _update_bundle(self, bundle: _WatchedBundle) -> None:
         await asyncio.gather(*(
-            self._refresh_leg(leg) for leg in bundle.legs if leg.open
+            self._refresh_leg(bundle, leg) for leg in bundle.legs if leg.open
         ))
 
         now = time.monotonic()
@@ -329,7 +329,9 @@ class NegRiskBundleGuard:
         if not bundle.any_open or age >= self._ttl:
             await self._finalize(bundle, complete=False)
 
-    async def _refresh_leg(self, leg: _BundleLegState) -> None:
+    async def _refresh_leg(
+        self, bundle: _WatchedBundle, leg: _BundleLegState
+    ) -> None:
         """Pull current order state from the CLOB and update the leg."""
         if not leg.order_id:
             leg.open = False
@@ -390,11 +392,23 @@ class NegRiskBundleGuard:
                             leg.order_id[:12], verified,
                         )
                     elif verified < _SHARE_EPS:
+                        # NOT proof the order is gone. "Untracked" also covers
+                        # an order the CLOB has simply not surfaced yet, and a
+                        # resting order that has not traded looks exactly like
+                        # this. Marking it closed here made _finalize skip it in
+                        # the cancel loop, so it stayed live on the book and
+                        # filled later with nobody watching: 35 bundles logged
+                        # "expired unfilled" between 23:49 and 00:31 while the
+                        # wallet quietly bought 27 pUSD of NH-01 legs.
+                        #
+                        # Cancel it for real. Cancelling an order that genuinely
+                        # is gone is harmless; assuming it is gone is not.
                         logger.info(
                             "NegRiskGuard | order %s untracked with no attributed "
-                            "fills — cancelled, not filled",
+                            "fills — cancelling to be certain",
                             leg.order_id[:12],
                         )
+                        await self._cancel_leg(bundle, leg)
                     leg.matched = max(leg.matched, verified)
             return
 

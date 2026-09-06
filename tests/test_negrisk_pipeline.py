@@ -1376,3 +1376,57 @@ class TestBlindPollingDoesNotLeakAFill:
 
         assert breaker.released == 1
         assert client.unwound == []
+
+
+class TestPresumedGoneOrdersAreActuallyCancelled:
+    """
+    Regression for 2026-09-06 00:31, the leak that survived the first two fixes.
+
+    An untracked order with no attributed fills was logged "cancelled, not
+    filled" and marked closed — but nothing ever cancelled it. _finalize only
+    cancels legs still flagged open, so it skipped them, and the orders stayed
+    live on the book.
+
+    Between 23:49 and 00:31 the guards logged 35 bundles "expired unfilled" and
+    resolved 24 untracked orders as not-filled, with only 2 status-poll
+    failures. Over the same window the wallet spent 27 pUSD acquiring 25.36
+    Beriont and 15.21 Sullivan shares. The guard was announcing that nothing
+    had happened while the orders it had walked away from were filling.
+
+    "Untracked" is not proof an order is gone. Cancelling one that genuinely is
+    gone costs nothing; assuming it is gone costs the position.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_unfilled_untracked_order_is_cancelled_for_real(self):
+        from execution.negrisk_guard import NegRiskBundleGuard
+
+        sig = _signal()
+        client = _StubClient({"o0": None, "o1": None, "o2": None})
+        client.order_fills = {}          # nothing attributed to any leg
+        breaker, notifier = _StubBreaker(), _StubNotifier()
+        guard = NegRiskBundleGuard(client, breaker, notifier, index_grace=0.0)
+
+        guard.watch_bundle(sig, _acks())
+        await guard.poll_once()
+
+        assert sorted(client.cancelled) == ["o0", "o1", "o2"], (
+            "walked away from orders without cancelling them"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_filled_leg_is_not_cancelled(self):
+        """A leg the feed confirms filled must be flattened, not cancelled."""
+        from execution.negrisk_guard import NegRiskBundleGuard
+
+        sig = _signal()
+        client = _StubClient({"o0": None, "o1": None, "o2": None})
+        client.order_fills = {"o0": 10.0, "o1": 10.0, "o2": 10.0}
+        breaker, notifier = _StubBreaker(), _StubNotifier()
+        guard = NegRiskBundleGuard(client, breaker, notifier, index_grace=0.0)
+
+        guard.watch_bundle(sig, _acks())
+        await guard.poll_once()
+
+        assert client.cancelled == []
+        assert breaker.filled, "a complete bundle must be booked"
