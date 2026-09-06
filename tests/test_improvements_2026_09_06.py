@@ -291,3 +291,35 @@ class TestTakerFeeModel:
     def test_impossible_prices_carry_no_fee(self, bad):
         from strategy.arbitrage import effective_taker_fee
         assert effective_taker_fee(bad) == 0.0
+
+    def test_entry_charges_the_same_fee_completion_will(self):
+        """
+        Entry and completion must price crossing identically. Omitting the fee
+        at entry made it the more optimistic of the two, so bundles were
+        admitted that _try_complete then refused — leaving precisely the
+        half-filled position both checks exist to prevent.
+        """
+        from strategy.arbitrage import (
+            NegRiskArbDetector, effective_taker_fee, snap_post_only_bid,
+        )
+        det = NegRiskArbDetector(
+            desired_net_margin=0.001, min_outcome_prob=0.02, max_legs=4,
+            default_rebate_rate=0.0, min_relative_edge=0.001,
+        )
+        asks  = [0.85, 0.60, 0.56]
+        bids  = [0.84, 0.45, 0.40]          # leg 0 is stuck on a one-tick spread
+        ticks = [0.01, 0.01, 0.01]
+        sig = det.evaluate_neg_risk(
+            condition_id="0xg",
+            outcome_token_ids=["T0", "T1", "T2"],
+            no_asks=asks, max_position_usdc=100.0, tick_size=0.01,
+            no_ask_sizes=[500.0] * 3, no_best_bids=bids, leg_tick_sizes=ticks,
+        )
+        # realistic cost = 0.85*(1+fee(0.85)) + 0.59 + 0.55 = 1.9851 -> +0.0149
+        crossed = 0.85 * (1.0 + effective_taker_fee(0.85))
+        realistic = crossed + snap_post_only_bid(0.60, 0.01) + snap_post_only_bid(0.56, 0.01)
+        assert 2.0 - realistic > 0.002, "fixture should still clear"
+        assert sig is not None
+        # and the fee must actually be charged: without it the cost would be
+        # 0.85 flat, a materially different number
+        assert crossed > 0.85

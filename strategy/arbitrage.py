@@ -1415,7 +1415,18 @@ class NegRiskArbDetector:
             for ask, tick, bid in zip(sel_asks, sel_ticks, sel_bids):
                 quote = snap_post_only_bid(ask, tick)
                 leads = bid is None or quote > bid + 1e-12
-                realistic += quote if leads else ask
+                if leads:
+                    # Resting maker order: no fee, Polymarket charges takers only.
+                    realistic += quote
+                else:
+                    # We will have to cross this leg, so charge what crossing
+                    # actually costs. Omitting the fee here made entry more
+                    # optimistic than completion: bundles were admitted that
+                    # _try_complete then refused on the fee, leaving exactly the
+                    # half-filled position both checks exist to prevent. The fee
+                    # is heaviest on cheap legs (4.1% at p=0.18 against 0.2% at
+                    # p=0.96) and cheap NO legs are the ones that need crossing.
+                    realistic += ask * (1.0 + effective_taker_fee(ask))
             realistic_edge = float(m - 1) - realistic
             self.completable_checks += 1
             if realistic_edge < self._min_completable_edge:
