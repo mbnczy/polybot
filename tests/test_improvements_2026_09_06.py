@@ -372,3 +372,39 @@ class TestLeadBookBid:
         for ask, bid, tick in ((0.90, 0.85, 0.01), (0.58, 0.53, 0.01),
                                (0.982, 0.966, 0.001)):
             assert lead_book_bid(ask, bid, tick) > bid
+
+
+class TestMakerRebateIsNotEntryIncome:
+    """
+    The maker rebate is real but it is neither per-fill nor 1%.
+
+    Measured 2026-09-06: 175 maker fills moved exactly size x price (max
+    deviation 7e-10), and the account has received one MAKER_REBATE activity
+    entry of 2.4467 USDC — 0.2157% against 1134.33 USDC of maker volume, versus
+    the 1% the code assumed for politics.
+
+    Discounting entry cost by it books unearned, conditional, separately-paid
+    income at the moment of purchase. On a bundle whose real edge is +0.0300 the
+    assumed 1% added +0.0197: 40% of the perceived edge, invented.
+    """
+
+    def test_default_rebate_is_zero(self):
+        from strategy.arbitrage import DEFAULT_MAKER_REBATE
+        assert DEFAULT_MAKER_REBATE == 0.0
+
+    def test_engine_defaults_to_no_rebate(self):
+        from strategy.arbitrage import MakerRebateEngine
+        assert MakerRebateEngine()._default == 0.0
+
+    def test_bundle_edge_is_not_inflated_by_a_phantom_rebate(self):
+        """The arb must stand on its own; the rebate is upside on top."""
+        combined_bid, payout = 1.97, 2.0
+        assert payout - combined_bid * (1 - 0.0) == pytest.approx(0.03)
+        # what the old default did
+        assert payout - combined_bid * (1 - 0.01) == pytest.approx(0.0497, abs=1e-4)
+
+    def test_an_explicit_rebate_is_still_honoured(self):
+        """Opt-in remains possible for anyone who has measured the credit."""
+        from strategy.arbitrage import MakerRebateEngine
+        eng = MakerRebateEngine(default_rebate=0.002)
+        assert eng._default == pytest.approx(0.002)

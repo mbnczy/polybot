@@ -131,6 +131,10 @@ from core import market_titles          # dependency-free registry
 logger = logging.getLogger(__name__)
 
 # ── Maker rebate schedule — 2026 Polymarket category rates ──────────────────
+# Published reward-programme rates by category. These are advertised rates, not
+# per-fill credits, and the one payment this account has received works out at
+# 0.2157% against maker volume rather than the 1% listed for politics. Consulted
+# only when a caller passes an explicit rebate. See DEFAULT_MAKER_REBATE.
 MAKER_REBATES: dict[str, float] = {
     "politics":     0.0100,   # 1.00 %
     "crypto":       0.0144,   # 1.44 %
@@ -140,7 +144,31 @@ MAKER_REBATES: dict[str, float] = {
     "science":      0.0060,   # 0.60 %
     # Any category not in this map falls back to DEFAULT_MAKER_REBATE
 }
-DEFAULT_MAKER_REBATE: float = 0.0050   # 0.50 % — conservative unknown-category default
+# MEASURED, 2026-09-06. Two separate findings, and the first one corrects an
+# earlier claim of mine that the rebate does not exist at all.
+#
+# 1. It is NOT a per-fill credit. Across 175 settled maker fills the amount that
+#    moved is exactly size x price, largest deviation 7e-10. Nothing is added or
+#    deducted at fill time. It arrives instead as its own activity entry — one
+#    MAKER_REBATE of 2.4467 USDC in the whole account history.
+#
+# 2. The rate is not 1%. Against 1134.33 USDC of maker volume that single credit
+#    is 0.2157%, so the politics figure in the table above overstates what is
+#    actually received by 4.6x.
+#
+# Both matter, but the first matters more. `effective_cost = combined_bid x
+# (1 - rebate)` discounts the COST OF ENTRY, which books income at the moment of
+# purchase that has not been earned, is conditional on a quoting programme's own
+# criteria, and arrives much later if at all. The NegRisk guarantee is that
+# k-1 legs pay out; rebates are not part of that guarantee and must not relax
+# the test that decides whether the guarantee is worth buying.
+#
+# On a bundle whose real edge is +0.0300 the assumed 1% added +0.0197 — 40% of
+# the perceived edge, invented, in the dangerous direction.
+#
+# Default is therefore 0: the arb has to stand on its own, and the rebate is
+# upside on top. MAKER_REBATE_DEFAULT re-enables the old behaviour.
+DEFAULT_MAKER_REBATE: float = float(os.environ.get("MAKER_REBATE_DEFAULT", 0.0))
 MAX_MAKER_REBATE:     float = 0.0200   # sanity clamp
 
 # ── Taker fee constants (used by FeeEngine / ArbDetector) ───────────────────
