@@ -237,6 +237,36 @@ def check_prices(rels: list, markets: list[dict], args) -> list:
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+def _load_announced(args) -> set:
+    """
+    Implications already announced, across restarts.
+
+    In-memory dedup is not enough: the process restarts on deploys and on
+    failure, and each restart re-announced the whole set — ten identical
+    messages, which is exactly the flood the dedup exists to stop.
+    """
+    path = Path(args.state_file)
+    try:
+        rows = json.loads(path.read_text())
+        return {tuple(r) for r in rows if isinstance(r, list) and len(r) == 2}
+    except FileNotFoundError:
+        return set()
+    except Exception as exc:  # noqa: BLE001
+        print(f"  WARN could not read {path}: {exc} — starting empty")
+        return set()
+
+
+def _save_announced(args, announced: set) -> None:
+    path = Path(args.state_file)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(sorted(list(p) for p in announced)))
+        tmp.replace(path)          # atomic, so a crash mid-write cannot corrupt it
+    except Exception as exc:  # noqa: BLE001
+        print(f"  WARN could not persist {path}: {exc}")
+
+
 def one_pass(args, markets_cache: dict) -> int:
     markets = markets_cache.get("markets")
     if markets is None:
@@ -263,12 +293,13 @@ def one_pass(args, markets_cache: dict) -> int:
         # Fed rate-cut ladders arrived again every 90 minutes, unchanged. A
         # relation is news exactly once; after that it is a fact about the world
         # that has not moved.
-        announced = markets_cache.setdefault("announced", set())
+        announced = markets_cache.setdefault("announced", _load_announced(args))
         fresh = [r for r in rels if (r.narrow, r.broad) not in announced]
         if fresh and not args.no_implication_alerts:
             deliver([fmt_implication(r, titles) for r in fresh[:args.max_alerts]],
                     args.dry_run)
         announced.update((r.narrow, r.broad) for r in rels)
+        _save_announced(args, announced)
         if rels and not fresh:
             print(f"  {len(rels)} implication(s), all already announced — quiet.")
 
@@ -312,6 +343,9 @@ def main() -> int:
                     help="re-poll prices every N seconds (0 = single pass)")
     ap.add_argument("--rediscover",  type=int,   default=6, metavar="PASSES",
                     help="re-run the model every N passes when looping")
+    ap.add_argument("--state-file", default=str(REPO / "announced.json"),
+                    help="where announced implications are remembered across "
+                         "restarts (default: announced.json in the worktree)")
     ap.add_argument("--arb-cooldown", type=float, default=3600.0, metavar="SEC",
                     help="do not re-alert the same violated pair within this "
                          "window (default 3600)")
