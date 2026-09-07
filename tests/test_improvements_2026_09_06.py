@@ -722,3 +722,87 @@ class TestArbAlertShowsTheFeeMath:
         txt = self._alert()
         assert "Fee rate" not in txt
         assert "224.0 bps" in txt
+
+
+class TestConsolidatedArbEpisode:
+    """
+    One opportunity used to produce four or five separate messages — a DETECTED
+    per signal (throttled, so sometimes several), a guard notice on the outcome,
+    and a WINDOW CLOSED with the duration, arriving out of order and often
+    minutes apart. Reading them meant reassembling one event from fragments.
+
+    Now they buffer and emit once, at the close, in the order things happened.
+    """
+
+    def _n(self):
+        import os
+        os.environ.setdefault("TELEGRAM_BOT_TOKEN", "dummy:token")
+        os.environ.setdefault("TELEGRAM_CHAT_ID", "1")
+        from telemetry.telegram import TelegramNotifier
+        n = TelegramNotifier()
+        n._enabled = True
+        n._arb_min_bps = 0.0
+        n._sent = []
+        # Strip the HTML so assertions read the message as a person would.
+        import re as _re
+        n._fire = lambda t, **k: n._sent.append(_re.sub(r"</?(b|code)>", "", t))
+        return n
+
+    def test_detections_fire_nothing_on_their_own(self):
+        n = self._n()
+        n.arb_detected(condition_id="0xa", combined_cost=0.94, net_edge=0.02,
+                       is_maker=False, yes_price=0.12, no_price=0.82)
+        n.arb_detected(condition_id="0xa", combined_cost=0.95, net_edge=0.01,
+                       is_maker=False, yes_price=0.13, no_price=0.82)
+        assert n._sent == [], "a detection must not alert on its own any more"
+
+    def test_summary_carries_the_whole_episode_once(self):
+        n = self._n()
+        n.arb_detected(condition_id="0xb", combined_cost=0.94, net_edge=0.0224,
+                       is_maker=False, yes_price=0.1210, no_price=0.8190,
+                       fee_type="economics_fees", fee_rate=0.05)
+        n.arb_event("0xb", "NO leg filled, YES expired")
+        n.arb_event("0xb", "flattened 10.54 naked NO", -0.0813)
+        n.send_arb_summary("0xb", 42.31, 224.0, 7, False)
+
+        assert len(n._sent) == 1, "one opportunity, one message"
+        t = n._sent[0]
+        assert "224.0 bps" in t and "42.31" in t          # the window
+        assert "economics_fees" in t                       # the category
+        assert "(1−0.1210)" in t                           # the fee arithmetic
+        assert "NO leg filled" in t and "flattened" in t    # what happened
+        assert "-0.0813" in t                              # the realised total
+
+    def test_best_signal_is_the_one_reported(self):
+        n = self._n()
+        n.arb_detected(condition_id="0xc", combined_cost=0.98, net_edge=0.005,
+                       is_maker=False, yes_price=0.20, no_price=0.78)
+        n.arb_detected(condition_id="0xc", combined_cost=0.94, net_edge=0.030,
+                       is_maker=False, yes_price=0.12, no_price=0.82)
+        n.send_arb_summary("0xc", 10.0, 300.0, 3, False)
+        t = n._sent[0]
+        assert "Signals:   2" in t
+        assert "0.1210" not in t and "0.1200" in t, "must quote the best signal"
+
+    def test_a_window_with_nothing_in_it_stays_quiet(self):
+        """A price that briefly looked interesting is not worth a message."""
+        n = self._n()
+        n._arb_min_bps = 50.0
+        n.send_arb_summary("0xquiet", 0.03, 10.0, 1, False)
+        assert n._sent == []
+
+    def test_no_execution_is_stated_explicitly(self):
+        n = self._n()
+        n.arb_detected(condition_id="0xd", combined_cost=0.94, net_edge=0.02,
+                       is_maker=False, yes_price=0.12, no_price=0.82)
+        n.send_arb_summary("0xd", 5.0, 200.0, 2, False)
+        assert "nothing — no execution attempted" in n._sent[0]
+
+    def test_episode_is_forgotten_after_the_summary(self):
+        n = self._n()
+        n.arb_detected(condition_id="0xe", combined_cost=0.94, net_edge=0.02,
+                       is_maker=False, yes_price=0.12, no_price=0.82)
+        n.send_arb_summary("0xe", 5.0, 200.0, 2, False)
+        n.send_arb_summary("0xe", 5.0, 200.0, 2, False)
+        assert len(n._sent) == 2
+        assert "Signals" not in n._sent[1], "state leaked into the next episode"

@@ -663,11 +663,9 @@ class NegRiskBundleGuard:
             "%.2f bundles, profit=%+.4f USDC",
             bundle.condition_id[:16], bought, n, profit,
         )
-        await self._notifier.notify(
-            f"\u2705 NegRisk bundle on {market_titles.label(bundle.condition_id)} "
+        self._notifier.arb_event(bundle.condition_id, f"\u2705 NegRisk bundle on {market_titles.label(bundle.condition_id)} "
             f"completed as taker \u2014 {n:.2f} bundles, "
-            f"profit={profit:+.4f} USDC"
-        )
+            f"profit={profit:+.4f} USDC")
         return round(profit, 6)
 
     async def _recheck_fills(
@@ -727,10 +725,8 @@ class NegRiskBundleGuard:
                 "pnl=%+.4f USDC",
                 bundle.condition_id[:16], len(bundle.legs), filled, pnl,
             )
-            await self._notifier.notify(
-                f"✅ NegRisk bundle on {bundle.condition_id[:16]} — "
-                f"{len(bundle.legs)} legs × {filled:.2f}, pnl={pnl:+.4f} USDC"
-            )
+            self._notifier.arb_event(bundle.condition_id, f"✅ NegRisk bundle on {bundle.condition_id[:16]} — "
+                f"{len(bundle.legs)} legs × {filled:.2f}, pnl={pnl:+.4f} USDC")
             return
 
         naked = [leg for leg in bundle.legs if leg.matched > _SHARE_EPS]
@@ -776,11 +772,9 @@ class NegRiskBundleGuard:
             bundle.condition_id[:16], len(naked), len(bundle.legs),
             realised, note,
         )
-        await self._notifier.notify(
-            f"🔻 NegRisk bundle on {bundle.condition_id[:16]} incomplete — "
+        self._notifier.arb_event(bundle.condition_id, f"🔻 NegRisk bundle on {bundle.condition_id[:16]} incomplete — "
             f"{len(naked)}/{len(bundle.legs)} legs filled, unwound, "
-            f"pnl={realised:+.4f} USDC{note}"
-        )
+            f"pnl={realised:+.4f} USDC{note}")
 
     async def _unwind_all(
         self,

@@ -471,7 +471,7 @@ async def strategy_loop(
                         condition_id[:16], nr_signal.n_outcomes,
                         nr_signal.combined_bid, nr_signal.relative_edge,
                     )
-                    notifier.send_arb_detected(
+                    notifier.arb_detected(
                         condition_id=condition_id,
                         combined_cost=nr_signal.combined_bid,
                         net_edge=nr_signal.relative_edge,
@@ -720,7 +720,10 @@ async def strategy_loop(
                 edge_bps=_dur_edge_bps, is_maker=_dur_is_maker,
             )
             if _window is not None:
-                notifier.send_arb_duration(
+                # One message per opportunity, at the close, carrying the whole
+                # episode. The detections and outcomes were buffered as they
+                # happened rather than fired separately.
+                notifier.send_arb_summary(
                     _window.condition_id, _window.duration_s,
                     _window.peak_edge_bps, _window.ticks, _window.is_maker_peak,
                 )
@@ -756,7 +759,7 @@ async def strategy_loop(
                 _ft = fee_engine.peek_fee_type(condition_id) or ""
             except Exception:  # noqa: BLE001
                 pass
-            notifier.send_arb_detected(
+            notifier.arb_detected(
                 condition_id=condition_id,
                 combined_cost=arb_signal.combined_cost,
                 net_edge=display_edge,

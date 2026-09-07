@@ -545,7 +545,7 @@ class MakerPairGuard:
                     f"no shares paired. Directional result on the unwound leg, "
                     f"pnl={pnl:+.4f} USDC (not arbitrage)"
                 )
-            await self._notifier.notify(headline + hedged_note)
+            self._notifier.arb_event(pair.condition_id, headline + hedged_note)
             if paired > _SHARE_EPS:
                 self._register_settlement(pair, paired)
         else:
@@ -555,9 +555,7 @@ class MakerPairGuard:
                 pair.condition_id[:16], hedged_note,
             )
             if hedged_note:
-                await self._notifier.notify(
-                    f"⚠️ Maker pair on {pair.condition_id[:16]} dissolved{hedged_note}"
-                )
+                self._notifier.arb_event(pair.condition_id, f"⚠️ Maker pair on {pair.condition_id[:16]} dissolved{hedged_note}")
 
     async def _complete_or_unwind(
         self,

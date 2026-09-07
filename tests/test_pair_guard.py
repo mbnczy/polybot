@@ -103,12 +103,18 @@ class FakeNotifier:
     def __init__(self) -> None:
         self.messages: list[str] = []
         self.critical: list[str] = []
+        self.events: list = []
 
     async def notify(self, msg: str) -> None:
         self.messages.append(msg)
 
     async def send_critical_error(self, msg: str) -> None:
         self.critical.append(msg)
+    def arb_event(self, condition_id, text, pnl=None):
+        """Buffered into the episode summary rather than fired immediately."""
+        self.messages.append(text)
+        self.events.append((condition_id, text, pnl))
+
 
 
 class FakeInventory:

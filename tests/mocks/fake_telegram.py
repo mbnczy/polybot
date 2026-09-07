@@ -8,12 +8,34 @@ from typing import Any, Callable, Coroutine, Optional
 class FakeTelegramNotifier:
     def __init__(self, on_status: Optional[Callable[[], dict]] = None) -> None:
         self.messages: list[str] = []
+        self.arb_signals: list = []
+        self.arb_events: list = []
+        self.arb_summaries: list = []
         self.alerts:   list[tuple[str, str]] = []
         self.trade_executions: list[dict] = []
         self.critical_errors:  list[str] = []
         self._on_status = on_status
         self._on_halt: Optional[Callable[[], Coroutine]] = None
         self.closed = False
+
+
+    # ── consolidated arb episodes ─────────────────────────────────────────────
+    def arb_detected(self, **kwargs) -> None:
+        """Buffered by the real notifier; recorded here for assertions."""
+        self.arb_signals.append(kwargs)
+        if not hasattr(self, "arb_detections"):
+            self.arb_detections = []
+        self.arb_detections.append(kwargs)
+
+    def arb_event(self, condition_id: str, text: str, pnl=None) -> None:
+        self.arb_events.append((condition_id, text, pnl))
+
+    def send_arb_summary(self, condition_id: str, duration_s: float,
+                         peak_edge_bps: float, ticks: int, is_maker: bool,
+                         *, still_open: bool = False) -> None:
+        self.arb_summaries.append(
+            (condition_id, duration_s, peak_edge_bps, ticks, is_maker)
+        )
 
     def set_halt_callback(self, cb: Callable[[], Coroutine]) -> None:
         self._on_halt = cb

@@ -151,6 +151,8 @@ class TelegramNotifier:
             os.environ.get("ARB_ALERT_MIN_BPS", "0")
         )
         self._last_arb_alert: dict[str, float] = {}   # condition_id → monotonic ts
+        # condition_id -> in-flight arb episode (see send_arb_summary)
+        self._episodes: dict[str, dict] = {}
 
         # python-telegram-bot Application (command listener only)
         self._closing: bool = False
@@ -417,6 +419,132 @@ class TelegramNotifier:
     # ──────────────────────────────────────────────────────────────────────────
     # Real-time arb DETECTION alert (fires on signal, before/independent of fill)
     # ──────────────────────────────────────────────────────────────────────────
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Consolidated arb episodes
+    #
+    # One opportunity used to produce three or four separate messages — a
+    # DETECTED on the signal, an EXECUTED or a guard notice on the outcome, and
+    # a WINDOW CLOSED with the duration — arriving out of order and often
+    # minutes apart. Reading them meant reassembling one event from fragments
+    # scattered through a chat.
+    #
+    # These buffer the episode by market and emit a single summary when the
+    # window closes. Nothing is dropped; it is the same information in the order
+    # it happened, once.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def arb_detected(
+        self,
+        condition_id:  str,
+        combined_cost: float,
+        net_edge:      float,
+        is_maker:      bool,
+        yes_price:     float,
+        no_price:      float,
+        *,
+        category:  str = "",
+        fee_type:  str = "",
+        fee_rate:  "float | None" = None,
+    ) -> None:
+        """Record a detection. Fires nothing; the summary carries it."""
+        ep = self._episodes.setdefault(condition_id, {
+            "detections": 0, "best_edge": 0.0, "yes": yes_price, "no": no_price,
+            "cost": combined_cost, "is_maker": is_maker, "category": category,
+            "fee_type": fee_type, "fee_rate": fee_rate, "events": [],
+        })
+        ep["detections"] += 1
+        edge_bps = round(net_edge * 10_000, 1)
+        if edge_bps > ep["best_edge"]:
+            ep.update(best_edge=edge_bps, yes=yes_price, no=no_price,
+                      cost=combined_cost, is_maker=is_maker)
+        if fee_rate is not None and ep.get("fee_rate") is None:
+            ep["fee_rate"], ep["fee_type"] = fee_rate, fee_type
+
+    def arb_event(self, condition_id: str, text: str,
+                  pnl: "float | None" = None) -> None:
+        """
+        Record something that happened to this market's opportunity — an
+        execution, a block, a flatten, a completion. Ordered, kept verbatim.
+        """
+        ep = self._episodes.setdefault(condition_id, {
+            "detections": 0, "best_edge": 0.0, "yes": 0.0, "no": 0.0,
+            "cost": 0.0, "is_maker": False, "category": "",
+            "fee_type": "", "fee_rate": None, "events": [],
+        })
+        ep["events"].append((text, pnl))
+
+    def send_arb_summary(
+        self,
+        condition_id:  str,
+        duration_s:    float,
+        peak_edge_bps: float,
+        ticks:         int,
+        is_maker:      bool,
+        *,
+        still_open: bool = False,
+    ) -> None:
+        """Emit the whole episode as one message and forget it."""
+        if not self._enabled:
+            self._episodes.pop(condition_id, None)
+            return
+        ep = self._episodes.pop(condition_id, None)
+
+        # A window with no detection and nothing that happened is not worth a
+        # message — that is just a price that briefly looked interesting.
+        if ep is None and peak_edge_bps < self._arb_min_bps:
+            return
+        if ep is not None and not ep["events"] and peak_edge_bps < self._arb_min_bps:
+            return
+
+        path  = "MAKER" if is_maker else "TAKER"
+        title = "ARB WINDOW OPEN AT SHUTDOWN" if still_open else "ARB EPISODE"
+        lines = [
+            f"<b>{title}</b> ({path})",
+            f"<b>Market:</b> {_market(condition_id)}",
+        ]
+        if ep and ep.get("fee_type"):
+            lines.append(f"<b>Fee type:</b> <code>{_h(ep['fee_type'])}</code>")
+        lines += [
+            f"<b>Duration:</b>  <code>{duration_s:.2f} s</code>",
+            f"<b>Peak edge:</b> <code>{peak_edge_bps:.1f} bps</code>",
+            f"<b>Ticks:</b>     <code>{ticks}</code>",
+        ]
+        if ep and ep["detections"]:
+            lines.append(
+                f"<b>Signals:</b>   <code>{ep['detections']}</code> "
+                f"(best {ep['best_edge']:.1f} bps at "
+                f"YES {ep['yes']:.4f} / NO {ep['no']:.4f})"
+            )
+            rate = ep.get("fee_rate")
+            if rate is not None:
+                both = 0.0
+                for label, px in (("YES", ep["yes"]), ("NO ", ep["no"])):
+                    if 0.0 < px < 1.0:
+                        lines.append(
+                            f"  <code>{label} {rate:.2f} × (1−{px:.4f}) "
+                            f"= {rate * (1.0 - px) * 100:.3f}%</code>"
+                        )
+                        both += rate * (1.0 - px) * px
+                if both > 0:
+                    lines.append(
+                        f"  <code>both legs = {both:.5f} USDC/pair "
+                        f"({both * 10_000:.1f} bps)</code>"
+                    )
+        if ep and ep["events"]:
+            lines.append("<b>What happened:</b>")
+            total = 0.0
+            for text, pnl in ep["events"]:
+                suffix = f" <code>{pnl:+.4f}</code>" if pnl is not None else ""
+                lines.append(f"  • {_h(text)}{suffix}")
+                if pnl is not None:
+                    total += pnl
+            if any(p is not None for _, p in ep["events"]):
+                lines.append(f"<b>Realised:</b>  <code>{total:+.4f} USDC</code>")
+        elif ep and ep["detections"]:
+            lines.append("<b>What happened:</b> nothing — no execution attempted")
+
+        self._fire("\n".join(lines), parse_mode="HTML")
 
     def send_arb_detected(
         self,
