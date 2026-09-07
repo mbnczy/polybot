@@ -520,11 +520,32 @@ class MakerPairGuard:
             # Book P&L (profit OR loss) and release the reservation. This is the
             # single booking point; InventoryManager merges recycle-only.
             self._breaker.on_fill(pnl=round(pnl, 6))
-            emoji = "✅" if pnl >= 0 else "🔻"
-            await self._notifier.notify(
-                f"{emoji} Maker pair on {pair.condition_id[:16]} — "
-                f"{paired:.2f} paired shares, pnl={pnl:+.4f} USDC{hedged_note}"
-            )
+            # Report what actually happened, not just the sign of the P&L.
+            #
+            # With paired == 0 no pair was ever formed: the arb failed, we were
+            # left holding one naked leg, and the result is whichever way its
+            # price happened to move before the guard could flatten it. Calling
+            # that a "Maker pair" with a green tick claims a guaranteed profit
+            # that was never earned — the same +0.1238 would have been -0.1238
+            # had the price gone the other way, and did on the leg twelve
+            # seconds earlier.
+            #
+            # Reserve the tick for genuinely paired shares, where the profit is
+            # locked by construction rather than by luck.
+            if paired > _SHARE_EPS:
+                emoji = "✅" if pnl >= 0 else "🔻"
+                headline = (
+                    f"{emoji} Maker pair on {pair.condition_id[:16]} — "
+                    f"{paired:.2f} paired shares, pnl={pnl:+.4f} USDC"
+                )
+            else:
+                emoji = "🎲" if pnl >= 0 else "🔻"
+                headline = (
+                    f"{emoji} Maker pair on {pair.condition_id[:16]} FAILED — "
+                    f"no shares paired. Directional result on the unwound leg, "
+                    f"pnl={pnl:+.4f} USDC (not arbitrage)"
+                )
+            await self._notifier.notify(headline + hedged_note)
             if paired > _SHARE_EPS:
                 self._register_settlement(pair, paired)
         else:

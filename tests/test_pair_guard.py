@@ -443,3 +443,56 @@ async def test_taker_completion_books_positive_pnl_and_merges():
     assert breaker.fills[0] == pytest.approx(0.11, abs=1e-6)   # 10×(1−0.989)
     assert breaker.releases == 0
     assert inventory.paired == ["0xcond"]   # completed excess → full pair merged
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Alerts must report what happened, not just the sign of the P&L
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_unpaired_outcome_is_not_reported_as_a_successful_pair():
+    """
+    Regression for the 2026-09-07 alert:
+
+        ✅ Maker pair on 0x88ceaf60937fbe — 0.00 paired shares,
+           pnl=+0.1238 USDC (10.21 naked shares unwound, pnl=+0.1238)
+
+    Zero paired shares means the arb never formed. We were left holding one
+    naked leg and the result is whichever way its price moved before the guard
+    could flatten it — the identical setup lost 0.0813 twelve seconds earlier.
+    A green tick over "Maker pair" claims a guaranteed profit that was never
+    earned.
+    """
+    client = FakeGuardClient()
+    client.orders["oy"] = {"status": "matched", "size_matched": 10.0}
+    client.orders["on"] = {"status": "canceled", "size_matched": 0.0}
+    client.best_asks["tok-no"] = 0.99          # completion impossible
+    client.unwind_sell_price = 0.80            # unwind at a profit vs 0.78 bid
+    guard, breaker, notifier = _build_guard(client)
+
+    guard.watch_pair(_maker_signal(10.0), 10.0,
+                     _resting_resp("oy"), _resting_resp("on"))
+    await guard.poll_once()
+
+    msgs = " ".join(notifier.messages)
+    assert "FAILED" in msgs, f"unpaired outcome not flagged: {msgs}"
+    assert "not arbitrage" in msgs
+    assert "✅" not in msgs, "green tick on a pair that never formed"
+
+
+@pytest.mark.asyncio
+async def test_a_genuinely_paired_fill_still_reads_as_success():
+    """The tick belongs to profit that is locked by construction."""
+    client = FakeGuardClient()
+    client.orders["oy"] = {"status": "matched", "size_matched": 10.0}
+    client.orders["on"] = {"status": "matched", "size_matched": 10.0}
+    inventory = FakeInventory()
+    guard, breaker, notifier = _build_guard(client, inventory)
+
+    guard.watch_pair(_maker_signal(10.0), 10.0,
+                     _resting_resp("oy"), _resting_resp("on"))
+    await guard.poll_once()
+
+    msgs = " ".join(notifier.messages)
+    assert "✅" in msgs
+    assert "FAILED" not in msgs
