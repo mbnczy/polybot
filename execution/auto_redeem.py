@@ -387,7 +387,11 @@ class AutoRedeemer:
         try:
             async with session.get(
                 url,
-                params={"conditionId": condition_id},
+                # Gamma filters on `condition_ids`. With `conditionId` it
+                # ignores the filter and returns an unrelated page — and this
+                # function then read THAT market's resolution and winner, which
+                # could redeem our position against someone else's outcome.
+                params={"condition_ids": condition_id},
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if getattr(resp, "status", None) == 429:
@@ -420,6 +424,22 @@ class AutoRedeemer:
             return None
 
         market = markets[0]
+
+        # Belt and braces: never trust a row that is not the market we asked
+        # about. A filter that silently stops filtering is exactly the failure
+        # this guards against, and the cost of getting it wrong is redeeming
+        # against the wrong outcome.
+        returned_id = str(
+            market.get("conditionId") or market.get("condition_id") or ""
+        ).lower()
+        if returned_id and returned_id != condition_id.lower():
+            logger.error(
+                "AutoRedeemer | Gamma returned %s when asked about %s — "
+                "refusing to read a resolution from the wrong market",
+                returned_id[:16], condition_id[:16],
+            )
+            return None
+
         resolved: bool = bool(market.get("resolved", False) or market.get("is_resolved", False))
         if not resolved:
             return None

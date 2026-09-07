@@ -419,7 +419,10 @@ class MakerRebateEngine:
             session = self._get_session()
             async with session.get(
                 f"{_GAMMA_HOST}/markets",
-                params={"conditionId": condition_id},
+                # Gamma filters on `condition_ids`. With `conditionId` it ignores
+                # the filter entirely and returns an unrelated page, so every
+                # lookup here was reading some other market's fee schedule.
+                params={"condition_ids": condition_id},
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status != 200:
@@ -785,6 +788,7 @@ class FeeEngine:
         self._calibrated = False
         self._fallbacks = 0
         self._cache: dict[str, tuple[float, float]] = {}
+        self._rate_cache: dict[str, tuple[float, float]] = {}
         # Persistent keep-alive session — reused across cold-miss fee fetches.
         self._session: "aiohttp.ClientSession | None" = None
 
@@ -828,6 +832,35 @@ class FeeEngine:
         """How many markets fell through to the default. Nonzero is expected;
         growing without a calibration behind it means we are guessing."""
         return self._fallbacks
+
+    async def get_taker_rate(self, condition_id: str) -> float:
+        """
+        This market's OWN schedule rate, falling back to the live estimate.
+
+        The rate is per-market and Gamma publishes it correctly: 0.03 on one
+        market, 0.04 on another, 0.07 on a third, all reporting feeType
+        politics_fees. Everything that made it look unpredictable — including
+        the "it was cut over time" reading — came from querying Gamma with the
+        filter name `conditionId`, which it ignores, handing back an unrelated
+        market's schedule. The correct parameter is `condition_ids`.
+        """
+        cached = self._rate_cache.get(condition_id)
+        if cached is not None:
+            rate, ts = cached
+            if time.monotonic() - ts < _CACHE_TTL:
+                return rate
+        sched = await self._try_schedule(condition_id)
+        rate = sched[0] if sched else _LIVE_TAKER_RATE
+        self._rate_cache[condition_id] = (rate, time.monotonic())
+        return rate
+
+    def peek_taker_rate(self, condition_id: str) -> "float | None":
+        cached = self._rate_cache.get(condition_id)
+        if cached is not None:
+            rate, ts = cached
+            if time.monotonic() - ts < _CACHE_TTL:
+                return rate
+        return None
 
     async def get_taker_fee(self, condition_id: str) -> float:
         """Return the taker fee rate as a fraction (0.02 = 2.0 %)."""
@@ -892,7 +925,10 @@ class FeeEngine:
             session = self._get_session()
             async with session.get(
                 f"{_GAMMA_HOST}/markets",
-                params={"conditionId": condition_id},
+                # Gamma filters on `condition_ids`. With `conditionId` it ignores
+                # the filter entirely and returns an unrelated page, so every
+                # lookup here was reading some other market's fee schedule.
+                params={"condition_ids": condition_id},
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status != 200:
@@ -923,7 +959,10 @@ class FeeEngine:
             session = self._get_session()
             async with session.get(
                 f"{_GAMMA_HOST}/markets",
-                params={"conditionId": condition_id},
+                # Gamma filters on `condition_ids`. With `conditionId` it ignores
+                # the filter entirely and returns an unrelated page, so every
+                # lookup here was reading some other market's fee schedule.
+                params={"condition_ids": condition_id},
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status != 200:

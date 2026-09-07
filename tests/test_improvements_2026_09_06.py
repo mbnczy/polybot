@@ -558,3 +558,44 @@ class TestRebateTableHonoursTheMeasurement:
         """Kept for reference and for anyone who re-enables the credit."""
         from strategy.arbitrage import _resolve_rebate_from_table
         assert _resolve_rebate_from_table("politics") == pytest.approx(0.01)
+
+
+class TestGammaFilterParameter:
+    """
+    Gamma filters /markets on `condition_ids`. Given `conditionId` it ignores
+    the filter entirely and returns an unrelated page, first row first.
+
+    Every caller that used the wrong name was silently reading some other
+    market's data:
+
+      * FeeEngine read a stranger's fee schedule, which is what made the rate
+        look unpredictable and produced the false "it was cut over time"
+        reading. With the right parameter Gamma matches the measured rate
+        exactly, per market: 0.03, 0.04, 0.05, 0.07.
+      * AutoRedeemer read a stranger's `resolved` flag and `winner`, so it could
+        have redeemed a position against a different market's outcome.
+    """
+
+    def test_no_caller_uses_the_ignored_parameter(self):
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parent.parent
+        offenders = []
+        for f in root.rglob("*.py"):
+            if ".venv" in f.parts or "tests" in f.parts:
+                continue
+            txt = f.read_text()
+            if '"conditionId": condition_id' in txt:
+                offenders.append(str(f.relative_to(root)))
+        assert not offenders, f"Gamma filter ignored in: {offenders}"
+
+    def test_effective_fee_honours_a_per_market_rate(self):
+        from strategy.arbitrage import effective_taker_fee as f
+        # same price, different markets, genuinely different charges
+        assert f(0.85, rate=0.03) == pytest.approx(0.0045)
+        assert f(0.85, rate=0.07) == pytest.approx(0.0105)
+
+    def test_engine_exposes_a_per_market_rate(self):
+        from strategy.arbitrage import FeeEngine
+        fe = FeeEngine()
+        assert hasattr(fe, "get_taker_rate")
+        assert fe.peek_taker_rate("0xunseen") is None

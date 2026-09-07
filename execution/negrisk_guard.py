@@ -213,6 +213,7 @@ class NegRiskBundleGuard:
         complete_partial: bool  = NEGRISK_COMPLETE_PARTIAL,
         taker_fee:        float = NEGRISK_TAKER_FEE,
         min_complete_profit: float = NEGRISK_MIN_COMPLETE_PROFIT,
+        fee_engine=None,
     ) -> None:
         self._client   = client
         self._breaker  = breaker
@@ -227,6 +228,8 @@ class NegRiskBundleGuard:
         self._fee      = max(0.0, taker_fee)
         # Use the published schedule rather than a flat rate unless told not to.
         self._fee_schedule = NEGRISK_USE_FEE_SCHEDULE
+        self._fee_engine = fee_engine
+        self._group_rate: "float | None" = None
         self._min_cp   = max(0.0, min_complete_profit)
         # condition_id -> consecutive failures, for the escalating backoff
         self._strikes: dict[str, int] = {}
@@ -577,6 +580,18 @@ class NegRiskBundleGuard:
         n = max(leg.matched for leg in legs)
         if n <= _SHARE_EPS:
             return None
+
+        # This group's own rate, not a global guess. Gamma publishes it per
+        # market and they genuinely differ (0.03 / 0.04 / 0.07 observed), so a
+        # single number over-charges most groups and under-charges some.
+        self._group_rate = None
+        if self._fee_engine is not None:
+            try:
+                self._group_rate = await self._fee_engine.get_taker_rate(
+                    bundle.condition_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("NegRiskGuard | rate lookup failed: %s", exc)
         n = math.floor(n * 100) / 100.0
 
         spent  = sum(leg.matched * leg.bid for leg in legs)
@@ -598,7 +613,10 @@ class NegRiskBundleGuard:
             # so a leg at 0.96 costs 0.16% to cross while one at 0.50 costs 2%.
             # A flat rate over-charges the extremes this strategy lives on and
             # under-charges the middle, which is where completion is marginal.
-            leg_fee = effective_taker_fee(ask) if self._fee_schedule else self._fee
+            leg_fee = (
+                effective_taker_fee(ask, rate=self._group_rate)
+                if self._fee_schedule else self._fee
+            )
             cost += qty * ask * (1.0 + leg_fee)
 
         if not wanted:

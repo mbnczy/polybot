@@ -1145,7 +1145,8 @@ async def main() -> None:
     #    missing legs still leave it under its payout floor) or flattens what
     #    filled. Only needed when executing.
     negrisk_guard = (
-        NegRiskBundleGuard(client, breaker, notifier, taker_fee=_fee_rate)
+        NegRiskBundleGuard(client, breaker, notifier, taker_fee=_fee_rate,
+                           fee_engine=fee_engine)
         if _negrisk_exec_mode == "clob" else None
     )
 
