@@ -633,6 +633,18 @@ def _is_insufficient_balance(exc: Exception) -> bool:
     return "not enough balance" in text or "balance is not enough" in text
 
 
+def _is_bad_order_params(exc: Exception) -> bool:
+    """
+    True when the exchange rejected the order's SHAPE rather than its content.
+
+    "amount is required for BUY market orders" is a programming error on our
+    side; retrying it five times with backoff only delays the inevitable and
+    buries the cause under four identical warnings.
+    """
+    text = str(exc).lower()
+    return "amount is required" in text or "shares is required" in text
+
+
 def _terminal_order_error(exc: Exception) -> "str | None":
     """
     Name the reason an order rejection can never succeed on retry, else None.
@@ -648,6 +660,8 @@ def _terminal_order_error(exc: Exception) -> "str | None":
         return "duplicate order"
     if _is_insufficient_balance(exc):
         return "insufficient balance/allowance"
+    if _is_bad_order_params(exc):
+        return "malformed order parameters"
     return None
 
 
@@ -1189,11 +1203,31 @@ class PolyClient:
         """
         side = side.upper()
         kwargs: dict[str, Any] = {
-            "token_id": token_id, "side": side,
-            "shares": shares, "order_type": "FOK",
+            "token_id": token_id, "side": side, "order_type": "FOK",
         }
-        if price is not None and price > 0:
-            kwargs["max_price" if side == "BUY" else "min_price"] = price
+
+        # The two sides take DIFFERENT quantity parameters. From the SDK:
+        # "BUY orders use `amount` as the spend amount ... SELL orders use
+        # `shares` as the number of shares to sell."
+        #
+        # Passing `shares` on a BUY is rejected outright with "amount is
+        # required for BUY market orders", so every taker BUY this bot has ever
+        # attempted failed. Unwinds are SELLs and worked, which is why the fault
+        # stayed hidden: the only thing that could not work was COMPLETION —
+        # buying the missing leg of a half-filled arb — and completion silently
+        # degraded to flattening every time.
+        if side == "BUY":
+            if price is None or price <= 0:
+                raise ValueError("BUY market order needs a price to size the spend")
+            # Spend = shares x limit price, rounded UP to the cent so rounding
+            # can never leave us short of the shares we are trying to buy.
+            kwargs["amount"] = math.ceil(shares * price * 100.0) / 100.0
+            kwargs["max_price"] = price
+        else:
+            kwargs["shares"] = shares
+            if price is not None and price > 0:
+                kwargs["min_price"] = price
+
         return self._client.create_market_order(**kwargs)
 
     def _post(self, signed_order: Any) -> dict:

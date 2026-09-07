@@ -599,3 +599,68 @@ class TestGammaFilterParameter:
         fe = FeeEngine()
         assert hasattr(fe, "get_taker_rate")
         assert fe.peek_taker_rate("0xunseen") is None
+
+
+class TestMarketOrderSideParameters:
+    """
+    Regression for 2026-09-07 15:15 UTC.
+
+        ARB EXECUTION ERROR: amount is required for BUY market orders.
+
+    The SDK is explicit: "BUY orders use `amount` as the spend amount ... SELL
+    orders use `shares` as the number of shares to sell." _create_market always
+    sent `shares`, so every taker BUY the bot ever attempted was rejected.
+
+    Unwinds are SELLs and worked, which is exactly why this stayed hidden: the
+    only capability that needed a BUY was COMPLETION — buying the missing leg of
+    a half-filled arb — and it degraded silently to flattening every time. A
+    224 bps opportunity was detected and lost to it.
+    """
+
+    def _capture(self):
+        calls = []
+
+        class _SDK:
+            def create_market_order(self, **kw):
+                calls.append(kw)
+                return object()
+
+        from core.clob_client import PolyClient
+        c = PolyClient.__new__(PolyClient)
+        c._client = _SDK()
+        return c, calls
+
+    def test_buy_sends_amount_not_shares(self):
+        c, calls = self._capture()
+        c._create_market(token_id="T", side="BUY", shares=10.0, price=0.85)
+        kw = calls[0]
+        assert "amount" in kw, "BUY without amount is rejected by the exchange"
+        assert "shares" not in kw
+        assert kw["max_price"] == pytest.approx(0.85)
+
+    def test_buy_amount_covers_the_shares_wanted(self):
+        """Round the spend UP, or rounding leaves us short of the shares."""
+        c, calls = self._capture()
+        c._create_market(token_id="T", side="BUY", shares=5.07, price=0.833)
+        spend = calls[0]["amount"]
+        assert spend >= 5.07 * 0.833
+        assert spend == pytest.approx(4.23)     # ceil to the cent
+
+    def test_sell_still_sends_shares(self):
+        c, calls = self._capture()
+        c._create_market(token_id="T", side="SELL", shares=10.0, price=0.80)
+        kw = calls[0]
+        assert kw["shares"] == pytest.approx(10.0)
+        assert "amount" not in kw
+        assert kw["min_price"] == pytest.approx(0.80)
+
+    def test_buy_without_a_price_is_refused_locally(self):
+        """A BUY spend cannot be sized without one; fail here, not at the API."""
+        c, _ = self._capture()
+        with pytest.raises(ValueError):
+            c._create_market(token_id="T", side="BUY", shares=10.0, price=None)
+
+    def test_malformed_order_is_terminal_not_retried(self):
+        from core.clob_client import _terminal_order_error
+        exc = RuntimeError("amount is required for BUY market orders.")
+        assert _terminal_order_error(exc) == "malformed order parameters"
