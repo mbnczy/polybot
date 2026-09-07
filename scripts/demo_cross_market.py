@@ -255,13 +255,41 @@ def one_pass(args, markets_cache: dict) -> int:
     if rels is None:
         rels = discover(markets, args)
         markets_cache["rels"] = rels
-        if rels and not args.no_implication_alerts:
-            deliver([fmt_implication(r, titles) for r in rels[:args.max_alerts]],
+
+        # Only announce relations we have not announced before.
+        #
+        # Rediscovery re-runs the model over the same universe and gets the same
+        # answers, so without this every cycle re-sent an identical batch — the
+        # Fed rate-cut ladders arrived again every 90 minutes, unchanged. A
+        # relation is news exactly once; after that it is a fact about the world
+        # that has not moved.
+        announced = markets_cache.setdefault("announced", set())
+        fresh = [r for r in rels if (r.narrow, r.broad) not in announced]
+        if fresh and not args.no_implication_alerts:
+            deliver([fmt_implication(r, titles) for r in fresh[:args.max_alerts]],
                     args.dry_run)
+        announced.update((r.narrow, r.broad) for r in rels)
+        if rels and not fresh:
+            print(f"  {len(rels)} implication(s), all already announced — quiet.")
 
     sigs = check_prices(rels, markets, args)
     if sigs:
-        deliver([fmt_arbitrage(s) for s in sigs[:args.max_alerts]], args.dry_run)
+        # An arbitrage is a price condition, not a fact: it can open, close and
+        # reopen on the same pair, and each opening is worth saying. Re-alert
+        # only after the pair has been quiet for a cooldown, so a violation that
+        # simply persists across polls does not repeat every cycle.
+        now = time.time()
+        last = markets_cache.setdefault("last_arb", {})
+        due = [
+            s for s in sigs
+            if now - last.get((s.narrow, s.broad), 0.0) >= args.arb_cooldown
+        ]
+        if due:
+            deliver([fmt_arbitrage(s) for s in due[:args.max_alerts]], args.dry_run)
+            for s in due:
+                last[(s.narrow, s.broad)] = now
+        else:
+            print(f"  {len(sigs)} violation(s), all within the alert cooldown.")
     else:
         print("  no price violation this pass.")
     return len(sigs)
@@ -284,6 +312,9 @@ def main() -> int:
                     help="re-poll prices every N seconds (0 = single pass)")
     ap.add_argument("--rediscover",  type=int,   default=6, metavar="PASSES",
                     help="re-run the model every N passes when looping")
+    ap.add_argument("--arb-cooldown", type=float, default=3600.0, metavar="SEC",
+                    help="do not re-alert the same violated pair within this "
+                         "window (default 3600)")
     ap.add_argument("--no-implication-alerts", action="store_true",
                     help="only alert on price violations, not on discoveries")
     ap.add_argument("--dry-run",     action="store_true")
