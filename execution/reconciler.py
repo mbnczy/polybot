@@ -110,6 +110,30 @@ class WalletReconciler:
                 "WalletReconciler | baseline: %d position(s), cash=%.4f",
                 len(held), cash,
             )
+            # Inventory that exists before any bundle is watched is UNMANAGED.
+            # The guards only resolve bundles they registered themselves, and
+            # their watch list is in memory, so it is empty after every restart.
+            # Anything already held is therefore nobody's: no guard will ever
+            # flatten it, complete it, or even notice it. That is how the
+            # positions left by the 2026-09-05 leak came to sit untouched for
+            # 37 hours while the bot happily opened and closed new bundles
+            # around them.
+            #
+            # Adopting them automatically is not safe — the original bundle
+            # structure is gone, so we cannot know what they were meant to hedge
+            # or at what price. Say so instead, and let a human decide.
+            if held:
+                detail = ", ".join(f"{k} {v:.2f}" for k, v in sorted(held.items()))
+                logger.warning(
+                    "WalletReconciler | %d UNMANAGED position(s) held at "
+                    "startup — no guard is watching these and none will: %s",
+                    len(held), detail,
+                )
+                await self._notifier.notify(
+                    f"⚠️ {len(held)} pozíció felügyelet nélkül\n{detail}\n"
+                    "Ezeket egyik guard sem figyeli — nem fogja se kiegészíteni, "
+                    "se lezárni. Kézi döntést igényelnek."
+                )
             return None
 
         moves = {

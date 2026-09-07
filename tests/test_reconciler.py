@@ -59,6 +59,7 @@ async def test_first_pass_only_takes_a_baseline():
 async def test_quiet_wallet_reports_nothing():
     r, c, _, n = _rig([_row("Market A", "No", 10.0)])
     await r.check_once()
+    n.sent.clear()          # discard the startup unmanaged-inventory notice
     assert await r.check_once() is None
     assert n.sent == []
 
@@ -86,6 +87,7 @@ async def test_movement_is_expected_while_a_position_is_open():
     """No false alarm when the bot is legitimately trading."""
     r, c, b, n = _rig([_row("Beriont", "No", 10.0)], open_positions=1)
     await r.check_once()
+    n.sent.clear()
     c.rows = [_row("Beriont", "No", 20.0)]
     assert await r.check_once() is None
     assert n.sent == []
@@ -114,6 +116,7 @@ async def test_dust_moves_are_ignored():
     """Share counts carry rounding; sub-0.01 drift is not a trade."""
     r, c, _, n = _rig([_row("A", "No", 5.0)])
     await r.check_once()
+    n.sent.clear()
     c.rows = [_row("A", "No", 5.001)]
     assert await r.check_once() is None
     assert n.sent == []
@@ -124,6 +127,7 @@ async def test_an_unreadable_snapshot_is_not_an_alert():
     """A failed read must never be reported as a phantom fill."""
     r, c, _, n = _rig([_row("A", "No", 5.0)])
     await r.check_once()
+    n.sent.clear()
 
     async def _fail():
         return None
@@ -139,3 +143,24 @@ async def test_the_reconciler_never_trades():
     for forbidden in ("post_order", "unwind_leg", "cancel_order", "cancel_all_orders"):
         assert not hasattr(c, forbidden)
     await r.check_once()
+
+
+@pytest.mark.asyncio
+async def test_positions_held_at_startup_are_reported_as_unmanaged():
+    """
+    The guards only resolve bundles they registered, and their watch list is in
+    memory — empty after every restart. Anything already held is therefore
+    nobody's: no guard will flatten it, complete it, or notice it. The positions
+    left by the 2026-09-05 leak sat untouched for 37 hours exactly this way.
+    """
+    r, _, _, n = _rig([_row("Beriont", "No", 25.36), _row("Sullivan", "No", 20.28)])
+    assert await r.check_once() is None      # baseline pass returns no report
+    assert n.sent, "startup inventory must be surfaced"
+    assert "Beriont" in n.sent[0] and "Sullivan" in n.sent[0]
+
+
+@pytest.mark.asyncio
+async def test_a_clean_start_says_nothing():
+    r, _, _, n = _rig([])
+    await r.check_once()
+    assert n.sent == []
