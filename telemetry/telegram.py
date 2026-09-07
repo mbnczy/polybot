@@ -428,6 +428,8 @@ class TelegramNotifier:
         no_price:      float,
         *,
         category:      str = "",
+        fee_type:      str = "",
+        fee_rate:      "float | None" = None,
     ) -> None:
         """
         Fire a non-blocking alert the moment an arbitrage signal is detected —
@@ -464,12 +466,38 @@ class TelegramNotifier:
         ]
         if category:
             lines.append(f"<b>Category:</b> <code>{_h(category)}</code>")
+        if fee_type:
+            lines.append(f"<b>Fee type:</b> <code>{_h(fee_type)}</code>")
         lines += [
             f"<b>YES:</b>      <code>{yes_price:.4f}</code>",
             f"<b>NO:</b>       <code>{no_price:.4f}</code>",
             f"<b>Combined:</b> <code>{combined_cost:.6f} USDC/pair</code>",
             f"<b>Edge:</b>     <code>{edge_bps:.1f} bps</code>",
         ]
+        if fee_rate is not None:
+            # Taker fee is rate x (1 - p) of notional and is charged PER LEG, so
+            # the cheap leg costs several times what the expensive one does.
+            # Spelling the substitution out is the point: a 224 bps edge next to
+            # a 3.5% fee on one of its legs is not the trade it appears to be,
+            # and that comparison is impossible to make from a rate alone.
+            lines.append(
+                f"<b>Fee rate:</b> <code>{fee_rate:.2f}</code> "
+                f"(taker only, maker 0)"
+            )
+            for label, px in (("YES", yes_price), ("NO ", no_price)):
+                if 0.0 < px < 1.0:
+                    pct = fee_rate * (1.0 - px)
+                    lines.append(
+                        f"  <code>{label} {fee_rate:.2f} × (1−{px:.4f}) "
+                        f"= {pct * 100:.3f}%</code>"
+                    )
+            if 0.0 < yes_price < 1.0 and 0.0 < no_price < 1.0:
+                both = fee_rate * (1.0 - yes_price) * yes_price + \
+                       fee_rate * (1.0 - no_price) * no_price
+                lines.append(
+                    f"  <code>both legs = {both:.5f} USDC/pair "
+                    f"({both * 10_000:.1f} bps of the edge)</code>"
+                )
         self._fire("\n".join(lines), parse_mode="HTML")
 
     def send_arb_duration(

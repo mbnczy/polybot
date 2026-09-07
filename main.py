@@ -746,6 +746,16 @@ async def strategy_loop(
                 if arb_signal.is_maker_signal
                 else arb_signal.net_edge
             )
+            # The market's own fee schedule, so the alert can show what taking
+            # each leg would actually cost rather than only the edge.
+            _ft, _fr = "", None
+            try:
+                _sched = await fee_engine._try_schedule(condition_id)
+                if _sched:
+                    _fr = _sched[0]
+                _ft = fee_engine.peek_fee_type(condition_id) or ""
+            except Exception:  # noqa: BLE001
+                pass
             notifier.send_arb_detected(
                 condition_id=condition_id,
                 combined_cost=arb_signal.combined_cost,
@@ -753,6 +763,8 @@ async def strategy_loop(
                 is_maker=arb_signal.is_maker_signal,
                 yes_price=yes_ask,
                 no_price=no_ask,
+                fee_type=_ft,
+                fee_rate=_fr,
             )
 
             # ── 3c. Per-market re-entry guard ─────────────────────────────────

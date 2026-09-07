@@ -664,3 +664,61 @@ class TestMarketOrderSideParameters:
         from core.clob_client import _terminal_order_error
         exc = RuntimeError("amount is required for BUY market orders.")
         assert _terminal_order_error(exc) == "malformed order parameters"
+
+
+class TestArbAlertShowsTheFeeMath:
+    """
+    The 15:15 alert quoted a 224 bps edge and said nothing about cost. On that
+    market (economics_fees, rate 0.05) taking both legs costs 127 bps — more
+    than half the edge — and the cheap leg alone is charged 4.4%. None of that
+    was visible, so the alert read as a far better opportunity than it was.
+    """
+
+    _n = 0
+
+    def _alert(self, **kw):
+        import os, re
+        os.environ.setdefault("TELEGRAM_BOT_TOKEN", "dummy:token")
+        os.environ.setdefault("TELEGRAM_CHAT_ID", "1")
+        from telemetry.telegram import TelegramNotifier
+        n = TelegramNotifier()
+        n._enabled = True        # construction reads env at import time
+        n._arb_min_bps = 0.0
+        n._arb_cooldown_s = 0.0
+        sent = []
+        n._fire = lambda text, **k: sent.append(text)
+        # A fresh condition_id per call: the notifier throttles repeat alerts
+        # on the same market, which would silence every case after the first.
+        TestArbAlertShowsTheFeeMath._n += 1
+        n.send_arb_detected(
+            condition_id=f"0xfeed{TestArbAlertShowsTheFeeMath._n:04d}",
+            combined_cost=0.94, net_edge=0.0224,
+            is_maker=False, yes_price=0.1210, no_price=0.8190, **kw
+        )
+        assert sent, "alert was suppressed"
+        return re.sub(r"</?(b|code)>", "", sent[0])
+
+    def test_rate_and_substitution_are_both_shown(self):
+        txt = self._alert(fee_type="economics_fees", fee_rate=0.05)
+        assert "economics_fees" in txt
+        assert "0.05" in txt
+        # the substitution, not just the rate
+        assert "(1−0.1210)" in txt and "4.395%" in txt
+        assert "(1−0.8190)" in txt and "0.905%" in txt
+
+    def test_combined_cost_is_comparable_to_the_edge(self):
+        """Both quoted in bps so the comparison needs no arithmetic."""
+        txt = self._alert(fee_type="economics_fees", fee_rate=0.05)
+        assert "224.0 bps" in txt          # the edge
+        assert "127.3 bps" in txt          # what taking both legs costs
+
+    def test_cheap_leg_is_visibly_the_expensive_one(self):
+        txt = self._alert(fee_type="crypto_fees_v2", fee_rate=0.07)
+        yes_pct = float(txt.split("(1−0.1210) = ")[1].split("%")[0])
+        no_pct  = float(txt.split("(1−0.8190) = ")[1].split("%")[0])
+        assert yes_pct > no_pct * 4, "the cheap leg's cost must stand out"
+
+    def test_alert_is_unchanged_when_no_schedule_is_known(self):
+        txt = self._alert()
+        assert "Fee rate" not in txt
+        assert "224.0 bps" in txt

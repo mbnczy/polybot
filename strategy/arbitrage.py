@@ -789,6 +789,7 @@ class FeeEngine:
         self._fallbacks = 0
         self._cache: dict[str, tuple[float, float]] = {}
         self._rate_cache: dict[str, tuple[float, float]] = {}
+        self._fee_types: dict[str, str] = {}
         # Persistent keep-alive session — reused across cold-miss fee fetches.
         self._session: "aiohttp.ClientSession | None" = None
 
@@ -853,6 +854,10 @@ class FeeEngine:
         rate = sched[0] if sched else _LIVE_TAKER_RATE
         self._rate_cache[condition_id] = (rate, time.monotonic())
         return rate
+
+    def peek_fee_type(self, condition_id: str) -> "str | None":
+        """The market's fee category, once a schedule lookup has seen it."""
+        return self._fee_types.get(condition_id)
 
     def peek_taker_rate(self, condition_id: str) -> "float | None":
         cached = self._rate_cache.get(condition_id)
@@ -940,6 +945,7 @@ class FeeEngine:
             market = markets[0]
             if market.get("feesEnabled") is False:
                 return (0.0, 1.0)
+            self._fee_types[condition_id] = str(market.get("feeType") or "")
             sched = market.get("feeSchedule")
             if not isinstance(sched, dict):
                 return None
