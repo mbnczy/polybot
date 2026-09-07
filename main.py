@@ -117,6 +117,7 @@ from risk.circuit_breaker import (                                 # noqa: E402
 from core.clob_client import BundleLeg                             # noqa: E402
 from strategy.arbitrage import (                                   # noqa: E402
     _FEE_SCHEDULE_RATE,
+    MAX_TAKER_FEE,
     set_taker_rate,
     ArbDetector,
     ArbSignal,
@@ -1011,7 +1012,18 @@ async def main() -> None:
         logger.warning("Taker rate calibration unavailable: %s", exc)
     if _solved is not None:
         set_taker_rate(_solved)
-        _fee_rate = _solved
+        # ArbDetector wants a FEE FRACTION of notional, capped at MAX_TAKER_FEE.
+        # `_solved` is the schedule's RATE, a different quantity: the fee is
+        # rate x (1-p), so the rate is only the fraction in the limit p -> 0.
+        # Passing it through unclamped crashed the process at startup when a
+        # noisy solve returned 0.0699 against a 0.04 cap — a calibration must
+        # never be able to stop the bot from booting.
+        _fee_rate = max(0.0, min(_solved, MAX_TAKER_FEE))
+        if _fee_rate != _solved:
+            logger.warning(
+                "Fee | solved rate %.4f clamped to %.4f for the taker detector",
+                _solved, _fee_rate,
+            )
         logger.info(
             "Fee | taker = %.4f x (1-p) of notional (solved from recent "
             "settled fills), maker = 0; at p=0.96 that is %.3f%%, "
