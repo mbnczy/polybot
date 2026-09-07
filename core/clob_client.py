@@ -309,6 +309,10 @@ _FEE_CALIBRATION_TRADES: int = int(os.environ.get("FEE_CALIBRATION_TRADES", 200)
 # move it on its own.
 _FEE_RATE_WINDOW: int = int(os.environ.get("FEE_RATE_WINDOW", 12))
 
+# Only fills within this span of the newest one decide the rate. Bounds how long
+# a superseded rate can keep being quoted after a change.
+_FEE_RATE_MAX_AGE_S: int = int(os.environ.get("FEE_RATE_MAX_AGE_S", 86_400))
+
 # How far below the best bid still counts as real liquidity when sizing an
 # unwind slice. 0.10 = accept the top 10% price band. Dust orders parked at
 # 0.001 on a 0.96 book are not depth; counting them made the probe useless.
@@ -1003,7 +1007,16 @@ class PolyClient:
             return None
         solved.sort(key=lambda t: -t[0])
         recent = solved[:_FEE_RATE_WINDOW]
-        return max(r for _, r in recent)
+
+        # Max over the recent slice, not over all history. The exchange has now
+        # cut this rate twice inside one sample — 0.05 (Jul-Sep 4), 0.04
+        # (Sep 5-6), 0.03 (Sep 7) — so a window wide enough to hold the previous
+        # regime keeps quoting it, and on a FALLING rate that means permanently
+        # over-charging ourselves and refusing trades that are actually
+        # profitable. Max within the window still protects against a rise.
+        newest_ts = recent[0][0]
+        fresh = [r for ts, r in recent if newest_ts - ts <= _FEE_RATE_MAX_AGE_S]
+        return max(fresh) if fresh else max(r for _, r in recent)
 
     async def open_positions_detail(self) -> "list[dict] | None":
         """

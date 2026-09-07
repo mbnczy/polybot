@@ -457,3 +457,53 @@ class TestNegRiskGroupVolumeFloor:
         """An absent figure must not be treated as unlimited liquidity."""
         from core.scanner import _market_volume
         assert _market_volume({}) == 0.0
+
+
+class TestFeeRateTracksChanges:
+    """
+    The taker rate is not a constant to be pinned. The exchange has cut it twice
+    inside one sample:
+
+        0.05   2026-07-19 .. 2026-09-04
+        0.04   2026-09-05 .. 2026-09-06
+        0.03   2026-09-07
+
+    Calibrating only at startup left the bot quoting 0.04 for hours after the
+    cut to 0.03, over-charging every completion it evaluated and refusing trades
+    that were profitable.
+    """
+
+    def test_set_taker_rate_moves_the_estimate(self):
+        import strategy.arbitrage as a
+        prev = a._LIVE_TAKER_RATE
+        try:
+            a.set_taker_rate(0.03)
+            assert a.effective_taker_fee(0.85) == pytest.approx(0.03 * 0.15)
+            a.set_taker_rate(0.05)
+            assert a.effective_taker_fee(0.85) == pytest.approx(0.05 * 0.15)
+        finally:
+            a.set_taker_rate(prev)
+
+    def test_todays_observed_rate_reproduces_todays_charges(self):
+        """Both fills of 2026-09-07 solve to exactly 0.0300."""
+        import strategy.arbitrage as a
+        prev = a._LIVE_TAKER_RATE
+        try:
+            a.set_taker_rate(0.03)
+            for size, px, gross, net in ((5.13, 0.83, 4.25790, 4.23619),
+                                         (5.13, 0.85, 4.36050, 4.38012)):
+                charged = abs(gross - net) / gross
+                assert a.effective_taker_fee(px) == pytest.approx(charged, abs=2e-4)
+        finally:
+            a.set_taker_rate(prev)
+
+    def test_rate_is_clamped_to_a_sane_band(self):
+        import strategy.arbitrage as a
+        prev = a._LIVE_TAKER_RATE
+        try:
+            a.set_taker_rate(-1.0)
+            assert a._LIVE_TAKER_RATE == 0.0
+            a.set_taker_rate(99.0)
+            assert a._LIVE_TAKER_RATE <= 0.5
+        finally:
+            a.set_taker_rate(prev)

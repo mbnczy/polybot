@@ -119,6 +119,44 @@ async def _query_last_hour(db_path: str, since: float) -> tuple[int, float]:
 
 # ── Background coroutine ──────────────────────────────────────────────────────
 
+async def fee_recalibration_loop(
+    client,
+    guard=None,
+    interval: float = float(os.environ.get("FEE_RECALIBRATE_S", 1800.0)),
+) -> None:
+    """
+    Re-solve the taker fee rate from settled fills while the bot runs.
+
+    Calibrating only at startup was not enough: the exchange has cut this rate
+    twice inside a single sample — 0.05 through 4 Sep, 0.04 on 5-6 Sep, 0.03 on
+    7 Sep — and the bot carried a stale 0.04 for hours after the change, pricing
+    every completion above what it would actually be charged and refusing
+    trades that were in fact profitable.
+
+    Cheap: one paginated read per cycle, and it touches nothing unless the
+    solved rate actually moves.
+    """
+    from strategy.arbitrage import set_taker_rate
+
+    logger.info("fee_recalibration_loop started | interval=%.0fs", interval)
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                rate = await client.observed_taker_rate()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("fee recalibration failed: %s", exc)
+                continue
+            if rate is None:
+                continue
+            set_taker_rate(rate)
+            if guard is not None and hasattr(guard, "set_taker_fee"):
+                guard.set_taker_fee(rate)
+    except asyncio.CancelledError:
+        logger.info("fee_recalibration_loop stopped")
+        raise
+
+
 async def tuner_loop(
     detector:  "ArbDetector",
     db_path:   str = _DB_PATH,

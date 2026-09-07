@@ -128,7 +128,7 @@ from strategy.arbitrage import (                                   # noqa: E402
     _normalise_fee,
 )
 from strategy.arb_duration import ArbDurationTracker               # noqa: E402
-from strategy.tuner import tuner_loop                               # noqa: E402
+from strategy.tuner import fee_recalibration_loop, tuner_loop                               # noqa: E402
 from telemetry.db_logger import SignalLogger                        # noqa: E402
 from telemetry.metrics import (                                    # noqa: E402
     ACTIVE_MARKETS,
@@ -1208,6 +1208,8 @@ async def main() -> None:
         asyncio.create_task(metrics_server(),                                  name="metrics"),
         asyncio.create_task(tuner_loop(detector, fills_since=breaker.fills_since),
                             name="tuner"),
+        asyncio.create_task(fee_recalibration_loop(client, negrisk_guard),
+                            name="fee_recalibration"),
     ]
     # Populate halt-tasks so /halt can cancel this exact gather group.
     _halt_tasks.extend(tasks)
