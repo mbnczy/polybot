@@ -116,6 +116,14 @@ V2_VOL_EXP:        float = 0.30     # volume24h exponent (dampened)
 V2_LIQ_EXP:        float = 0.20     # liquidity exponent (dampened)
 V2_MIN_LIQUIDITY:  float = 500.0    # exclude markets below this liquidity ($)
 V2_MIN_VOLUME_24H: float = 100.0    # exclude markets below this 24h volume ($)
+
+# Minimum combined 24h volume for a NegRisk GROUP to be worth a feed slot.
+# A quote only fills if someone crosses to it, and on a dead book nobody does —
+# while the wide spread makes the group look maximally attractive to a detector
+# that only reads prices. Live groups that actually trade start around 53k.
+NEGRISK_MIN_GROUP_VOLUME_24H: float = float(
+    os.environ.get("NEGRISK_MIN_GROUP_VOLUME_24H", 5000.0)
+)
 V2_SPREAD_WEIGHT:  float = 100.0    # weight on relative spread in I_factor
 V2_INEFF_WEIGHT:   float = 1000.0   # weight on YES+NO arb edge in I_factor
 V2_PENALTY_PIVOT:  float = 100_000.0  # 24h volume at which P_eff halves-ish
@@ -535,6 +543,7 @@ class MarketScanner:
         feed_registry:      "FeedRegistry | None" = None,
         prune_idle_s:       float = 0.0,
         min_volume_24h:     float = 0.0,
+        negrisk_min_group_volume: float = NEGRISK_MIN_GROUP_VOLUME_24H,
         on_admit:           "Callable[[str, dict], None] | None" = None,
         on_neg_risk_group:  "Callable[[str, list[str]], Awaitable[bool]] | None" = None,
         negrisk_feed_outcomes: int = NEGRISK_FEED_OUTCOMES,
@@ -552,6 +561,7 @@ class MarketScanner:
         # Liquidity floor: skip candidates whose 24h volume is below this (dead
         # books waste a feed slot and rarely offer capturable arbs). 0 = off.
         self._min_volume_24h  = max(0.0, min_volume_24h)
+        self._negrisk_min_group_volume = max(0.0, negrisk_min_group_volume)
         # Latency: fired (condition_id, market_dict) on each admitted market so
         # callers can pre-warm fee/rebate caches BEFORE the first tick arrives,
         # removing a network round-trip from the hot path. Synchronous + cheap.
@@ -825,6 +835,30 @@ class MarketScanner:
             groups.setdefault(group_id, []).append(m)
 
         for group_id, members in groups.items():
+            # Volume floor. The binary-pair path has had one since forever
+            # (_min_volume_24h, and the V2 scorer's own exclusions); this path
+            # had none at all, so a NegRisk group was registered on the negRisk
+            # flag alone no matter how dead its book.
+            #
+            # That is how the bot came to spend 114 bundles an hour quoting
+            # "Will Jack Doherty be sentenced to at least 5 years in prison" —
+            # 49 USD of 24h volume and a 22-tick spread. A wide spread on a dead
+            # market LOOKS like the best opportunity on the board, because a
+            # quote can sit far below the ask and still lead the book, and the
+            # entry filter passes it since both legs lead. Nothing ever comes to
+            # take the other side.
+            #
+            # Measured over 46 live NegRisk groups the smallest real one turns
+            # over 53k in 24h, so this floor discards nothing that trades.
+            group_volume = sum(_market_volume(m) for m in members)
+            if group_volume < self._negrisk_min_group_volume:
+                logger.debug(
+                    "MarketScanner | negrisk group=%s skipped — 24h volume "
+                    "%.0f < floor %.0f",
+                    group_id[:16], group_volume, self._negrisk_min_group_volume,
+                )
+                continue
+
             # Rank by traded volume, keep the top slice, resolve NO token IDs.
             members.sort(key=_market_volume, reverse=True)
             # Name the group after its highest-volume member so alerts and the

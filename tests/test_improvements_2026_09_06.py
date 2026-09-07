@@ -408,3 +408,52 @@ class TestMakerRebateIsNotEntryIncome:
         from strategy.arbitrage import MakerRebateEngine
         eng = MakerRebateEngine(default_rebate=0.002)
         assert eng._default == pytest.approx(0.002)
+
+
+class TestNegRiskGroupVolumeFloor:
+    """
+    A NegRisk group needs a live book, not just a wide spread.
+
+    The binary-pair path has had a volume floor since forever; the group path
+    had none, so a group was registered on the negRisk flag alone regardless of
+    whether anything traded there. The bot ended up placing 114 bundles an hour
+    into "Will Jack Doherty be sentenced to at least 5 years in prison" — 49 USD
+    of 24h volume, 22-tick spread, zero fills in 33 hours.
+
+    The failure is subtle because a dead market looks BEST to a price-only
+    detector: the wide spread lets a quote sit far below the ask and still lead
+    the book, so the entry filter sees both legs leading and passes it.
+    """
+
+    def _scanner(self, floor=5000.0):
+        from core.scanner import MarketScanner
+        sc = MarketScanner.__new__(MarketScanner)
+        sc._negrisk_min_group_volume = floor
+        return sc
+
+    def test_dead_group_is_below_the_floor(self):
+        from core.scanner import _market_volume
+        doherty = [{"volume24hr": "49.25"}, {"volume24hr": "0"}]
+        assert sum(_market_volume(m) for m in doherty) < 5000.0
+
+    def test_a_real_group_clears_it(self):
+        """The smallest live NegRisk group measured turns over 53k in 24h."""
+        from core.scanner import _market_volume
+        real = [{"volume24hr": "30000"}, {"volume24hr": "23011"}]
+        assert sum(_market_volume(m) for m in real) >= 5000.0
+
+    def test_floor_is_configurable(self, monkeypatch):
+        import importlib
+        monkeypatch.setenv("NEGRISK_MIN_GROUP_VOLUME_24H", "123")
+        import core.scanner as sc
+        importlib.reload(sc)
+        try:
+            assert sc.NEGRISK_MIN_GROUP_VOLUME_24H == pytest.approx(123.0)
+        finally:
+            monkeypatch.delenv("NEGRISK_MIN_GROUP_VOLUME_24H", raising=False)
+            importlib.reload(sc)
+
+    def test_missing_volume_field_reads_as_zero(self):
+        """An absent figure must not be treated as unlimited liquidity."""
+        from core.scanner import _market_volume
+        assert _market_volume({}) == 0.0

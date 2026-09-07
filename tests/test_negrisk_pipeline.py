@@ -472,6 +472,7 @@ class TestScannerGroupDiscovery:
         scanner = MarketScanner(
             on_market_added=_noop_market,
             on_neg_risk_group=_capture,
+            negrisk_min_group_volume=0.0,   # grouping under test, not the floor
         )
         await scanner._register_neg_risk_groups([
             _gamma_market("G1", "a", vol=10),
@@ -499,6 +500,7 @@ class TestScannerGroupDiscovery:
             on_market_added=_noop_market,
             on_neg_risk_group=_capture,
             negrisk_feed_outcomes=3,
+            negrisk_min_group_volume=0.0,   # grouping under test, not the floor
         )
         await scanner._register_neg_risk_groups([
             _gamma_market("BIG", f"m{i}", vol=float(i)) for i in range(10)
@@ -517,6 +519,7 @@ class TestScannerGroupDiscovery:
 
         scanner = MarketScanner(
             on_market_added=_noop_market, on_neg_risk_group=_capture,
+            negrisk_min_group_volume=0.0,   # grouping under test, not the floor
         )
         markets = [_gamma_market("G1", "a", vol=1), _gamma_market("G1", "b", vol=2)]
         await scanner._register_neg_risk_groups(markets)
@@ -536,6 +539,7 @@ class TestScannerGroupDiscovery:
 
         scanner = MarketScanner(
             on_market_added=_noop_market, on_neg_risk_group=_reject,
+            negrisk_min_group_volume=0.0,   # grouping under test, not the floor
         )
         markets = [_gamma_market("G1", "a", vol=1), _gamma_market("G1", "b", vol=2)]
         await scanner._register_neg_risk_groups(markets)
@@ -563,6 +567,7 @@ class TestScannerGroupDiscovery:
 
         scanner = MarketScanner(
             on_market_added=_noop_market, on_neg_risk_group=_capture,
+            negrisk_min_group_volume=0.0,   # grouping under test, not the floor
         )
         await scanner._register_neg_risk_groups([_gamma_market("G1", "a", vol=1)])
         assert calls == []
