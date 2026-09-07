@@ -53,9 +53,17 @@ class TestPeekRebate:
         assert MakerRebateEngine().peek_maker_rebate("0xnope") is None
 
     def test_hit_after_prime_category(self):
+        """
+        Caching by category still works; the RATE it resolves to is now gated
+        on DEFAULT_MAKER_REBATE, which measurement put at 0 — the published
+        table is a rewards schedule, not a per-fill credit, and discounting
+        entry cost by it invented edge. The cache mechanism is what this tests,
+        so assert against the resolver rather than a hard-coded 0.0144.
+        """
+        from strategy.arbitrage import _resolve_rebate
         re = MakerRebateEngine()
         re.prime_cache("0xA", category_slug="crypto")
-        assert re.peek_maker_rebate("0xA") == 0.0144
+        assert re.peek_maker_rebate("0xA") == pytest.approx(_resolve_rebate("crypto"))
 
     def test_hit_after_prime_explicit_rate(self):
         re = MakerRebateEngine()
@@ -133,7 +141,12 @@ async def test_on_admit_fires_and_prewarms(monkeypatch):
     # on_admit fired with the market dict …
     assert admitted and admitted[0][0] == "0xcrypto"
     # … and the caches are now warm BEFORE any tick (peek hits synchronously).
-    assert rebate_engine.peek_maker_rebate("0xcrypto") == 0.0144
+    # Prewarming is what this asserts; the resolved rate is gated on
+    # DEFAULT_MAKER_REBATE, which measurement put at 0.
+    from strategy.arbitrage import _resolve_rebate
+    assert rebate_engine.peek_maker_rebate("0xcrypto") == pytest.approx(
+        _resolve_rebate("crypto")
+    )
     assert fee_engine.peek_taker_fee("0xcrypto") == 0.015
     await real_reg.stop_all()
 

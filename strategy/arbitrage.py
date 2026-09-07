@@ -453,6 +453,16 @@ class MakerRebateEngine:
 
 
 def _resolve_rebate(category: str) -> float:
+    # The measurement gates the table, not just the fallback. Zeroing
+    # DEFAULT_MAKER_REBATE left this lookup untouched, so politics markets kept
+    # being discounted 1% and every NegRisk signal was still logging
+    # "rebate=1.00%" hours after the fix supposedly landed.
+    if DEFAULT_MAKER_REBATE <= 0.0:
+        return 0.0
+    return _resolve_rebate_from_table(category)
+
+
+def _resolve_rebate_from_table(category: str) -> float:
     """Map a category string to the closest MAKER_REBATES entry."""
     slug = category.strip().lower()
     # Direct match

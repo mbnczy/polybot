@@ -850,7 +850,7 @@ class MarketScanner:
             #
             # Measured over 46 live NegRisk groups the smallest real one turns
             # over 53k in 24h, so this floor discards nothing that trades.
-            group_volume = sum(_market_volume(m) for m in members)
+            group_volume = sum(_market_volume_24h_strict(m) for m in members)
             if group_volume < self._negrisk_min_group_volume:
                 logger.debug(
                     "MarketScanner | negrisk group=%s skipped — 24h volume "
@@ -983,8 +983,35 @@ class MarketScanner:
 # Helpers — Gamma API response parsing
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _market_volume_24h_strict(market: dict) -> float:
+    """
+    24h traded volume ONLY — no lifetime fallback.
+
+    _market_volume falls through to lifetime `volume` when the 24h figure is
+    absent OR zero, which is fine for ranking (something is better than
+    nothing) and wrong for a liquidity floor: a long-dead market with a large
+    lifetime total then reads as highly liquid. That is how the Jack Doherty
+    group — 49 USD of 24h volume — passed a 5000 floor and kept being quoted
+    63 times an hour.
+    """
+    for key in ("volume24hr", "volume_24h"):
+        raw = market.get(key)
+        if raw is None:
+            continue
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(v):
+            return max(0.0, v)
+    return 0.0
+
+
 def _market_volume(market: dict) -> float:
-    """24h traded volume, falling back to lifetime volume then 0.0."""
+    """24h traded volume, falling back to lifetime volume then 0.0.
+
+    Ranking helper. For a liquidity FLOOR use _market_volume_24h_strict.
+    """
     raw = (
         market.get("volume24hr")
         or market.get("volume_24h")

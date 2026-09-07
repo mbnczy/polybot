@@ -507,3 +507,54 @@ class TestFeeRateTracksChanges:
             assert a._LIVE_TAKER_RATE <= 0.5
         finally:
             a.set_taker_rate(prev)
+
+
+class TestVolumeFloorUsesRealTwentyFourHourVolume:
+    """
+    A 24h liquidity floor must not be satisfied by lifetime volume.
+
+    _market_volume falls through to lifetime `volume` when the 24h figure is
+    absent or None. That is reasonable for RANKING and wrong for a FLOOR: a
+    long-dead market with a large lifetime total then reads as highly liquid.
+    The Jack Doherty group — 49 USD of 24h volume — passed a 5000 floor on
+    exactly this and kept being quoted 63 times an hour.
+    """
+
+    def test_missing_24h_field_does_not_borrow_lifetime_volume(self):
+        from core.scanner import _market_volume, _market_volume_24h_strict
+        dead = {"volume": "250000"}          # no 24h figure at all
+        assert _market_volume(dead) == pytest.approx(250000.0)   # ranking helper
+        assert _market_volume_24h_strict(dead) == 0.0            # the floor
+
+    def test_null_24h_field_is_also_zero(self):
+        from core.scanner import _market_volume_24h_strict
+        assert _market_volume_24h_strict({"volume24hr": None, "volume": "250000"}) == 0.0
+
+    def test_a_real_24h_figure_is_used_as_is(self):
+        from core.scanner import _market_volume_24h_strict
+        assert _market_volume_24h_strict(
+            {"volume24hr": "49.25", "volume": "250000"}
+        ) == pytest.approx(49.25)
+
+    def test_garbage_reads_as_zero_not_as_liquid(self):
+        from core.scanner import _market_volume_24h_strict
+        for bad in ({"volume24hr": "abc"}, {"volume24hr": float("nan")}, {}):
+            assert _market_volume_24h_strict(bad) == 0.0
+
+
+class TestRebateTableHonoursTheMeasurement:
+    """
+    Zeroing DEFAULT_MAKER_REBATE only changed the FALLBACK. The category table
+    was still consulted, so politics markets kept being discounted 1% and every
+    NegRisk signal went on logging "rebate=1.00%" hours after the fix landed.
+    """
+
+    def test_politics_lookup_returns_zero_while_the_default_is_zero(self):
+        from strategy.arbitrage import _resolve_rebate
+        assert _resolve_rebate("politics") == 0.0
+        assert _resolve_rebate("crypto") == 0.0
+
+    def test_the_published_table_is_still_intact_underneath(self):
+        """Kept for reference and for anyone who re-enables the credit."""
+        from strategy.arbitrage import _resolve_rebate_from_table
+        assert _resolve_rebate_from_table("politics") == pytest.approx(0.01)
