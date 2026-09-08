@@ -357,6 +357,7 @@ async def strategy_loop(
                     # guarantees one-leg exposure is hedged or unwound within
                     # HEDGE_TIMEOUT_S — the strategy loop must NOT release or
                     # unwind here, or a later lone fill would go unnoticed.
+                    notifier.arb_execution_started(condition_id)
                     pair_guard.watch_pair(arb_signal, n_shares, yes_resp, no_resp)
                     logger.info(
                         "Maker orders resting for %s (%s) — PairGuard watching.",
@@ -553,6 +554,7 @@ async def strategy_loop(
                         # protected by is_watching; drop the short-lived hold.
                         _negrisk_inflight.discard(condition_id)
 
+                    notifier.arb_execution_started(condition_id)
                     if negrisk_guard is not None:
                         # A leg the exchange refused (duplicate order hash, say)
                         # will be refused again on the next signal, so back the

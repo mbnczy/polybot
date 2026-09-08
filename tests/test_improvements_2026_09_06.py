@@ -806,3 +806,83 @@ class TestConsolidatedArbEpisode:
         n.send_arb_summary("0xe", 5.0, 200.0, 2, False)
         assert len(n._sent) == 2
         assert "Signals" not in n._sent[1], "state leaked into the next episode"
+
+
+class TestEpisodeWaitsForTheOutcome:
+    """
+    Regression for 2026-09-07 19:17.
+
+        19:17:08  DUTCH BOOK SIGNAL
+        19:17:09  PairGuard watching   (orders on the book)
+        19:32:09  TTL expired          (15 minutes later)
+
+    The price window and the execution outcome run on very different clocks: the
+    window closes in seconds when the quote moves, a maker pair rests for up to
+    900 s. Summarising at window close therefore always reported "nothing — no
+    execution attempted", and worse, the real outcome arrived to an episode that
+    had already been sent and popped — so it was buffered into a fresh episode
+    no window would ever close, and dropped silently.
+
+    That is why the channel went quiet: guard outcomes stopped arriving at all.
+    """
+
+    def _n(self):
+        import os, re
+        os.environ.setdefault("TELEGRAM_BOT_TOKEN", "dummy:token")
+        os.environ.setdefault("TELEGRAM_CHAT_ID", "1")
+        from telemetry.telegram import TelegramNotifier
+        n = TelegramNotifier()
+        n._enabled = True
+        n._arb_min_bps = 0.0
+        n._sent = []
+        n._fire = lambda t, **k: n._sent.append(re.sub(r"</?(b|code)>", "", t))
+        return n
+
+    def test_summary_waits_while_orders_rest(self):
+        n = self._n()
+        n.arb_detected(condition_id="0xa", combined_cost=0.97, net_edge=0.03,
+                       is_maker=True, yes_price=0.85, no_price=0.14)
+        n.arb_execution_started("0xa")
+        n.send_arb_summary("0xa", 1.2, 300.0, 3, True)
+        assert n._sent == [], "summarised before the outcome was known"
+
+    def test_outcome_releases_the_summary_with_everything_in_it(self):
+        n = self._n()
+        n.arb_detected(condition_id="0xb", combined_cost=0.97, net_edge=0.03,
+                       is_maker=True, yes_price=0.85, no_price=0.14)
+        n.arb_execution_started("0xb")
+        n.send_arb_summary("0xb", 1.2, 300.0, 3, True)
+        n.arb_event("0xb", "TTL expired with no fills")
+
+        assert len(n._sent) == 1
+        t = n._sent[0]
+        assert "300.0 bps" in t and "1.20" in t      # the window, kept
+        assert "TTL expired" in t                     # the outcome
+        assert "no execution attempted" not in t
+
+    def test_outcome_is_never_dropped(self):
+        """The regression itself: a late event must not vanish."""
+        n = self._n()
+        n.arb_execution_started("0xc")
+        n.send_arb_summary("0xc", 1.0, 100.0, 1, True)
+        n.arb_event("0xc", "flattened 10.0 naked NO", -0.08)
+        assert n._sent, "the outcome was swallowed"
+        assert "flattened" in n._sent[0] and "-0.0800" in n._sent[0]
+
+    def test_no_execution_still_summarises_immediately(self):
+        """Without orders on the book there is nothing to wait for."""
+        n = self._n()
+        n.arb_detected(condition_id="0xd", combined_cost=0.97, net_edge=0.03,
+                       is_maker=True, yes_price=0.85, no_price=0.14)
+        n.send_arb_summary("0xd", 0.9, 300.0, 2, True)
+        assert len(n._sent) == 1
+        assert "nothing — no execution attempted" in n._sent[0]
+
+    def test_shutdown_never_defers(self):
+        """At shutdown there is no later outcome coming; report what we have."""
+        n = self._n()
+        n.arb_detected(condition_id="0xe", combined_cost=0.97, net_edge=0.03,
+                       is_maker=True, yes_price=0.85, no_price=0.14)
+        n.arb_execution_started("0xe")
+        n.send_arb_summary("0xe", 5.0, 300.0, 4, True, still_open=True)
+        assert len(n._sent) == 1

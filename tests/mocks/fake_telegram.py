@@ -11,6 +11,7 @@ class FakeTelegramNotifier:
         self.arb_signals: list = []
         self.arb_events: list = []
         self.arb_summaries: list = []
+        self.arb_executions: list = []
         self.alerts:   list[tuple[str, str]] = []
         self.trade_executions: list[dict] = []
         self.critical_errors:  list[str] = []
@@ -26,6 +27,10 @@ class FakeTelegramNotifier:
         if not hasattr(self, "arb_detections"):
             self.arb_detections = []
         self.arb_detections.append(kwargs)
+
+    def arb_execution_started(self, condition_id: str) -> None:
+        """Orders are on the book; the real notifier defers its summary."""
+        self.arb_executions.append(condition_id)
 
     def arb_event(self, condition_id: str, text: str, pnl=None) -> None:
         self.arb_events.append((condition_id, text, pnl))

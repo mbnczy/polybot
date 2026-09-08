@@ -434,6 +434,15 @@ class TelegramNotifier:
     # it happened, once.
     # ──────────────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _blank_episode() -> dict:
+        return {
+            "detections": 0, "best_edge": 0.0, "yes": 0.0, "no": 0.0,
+            "cost": 0.0, "is_maker": False, "category": "",
+            "fee_type": "", "fee_rate": None, "events": [],
+            "pending": False, "window": None,
+        }
+
     def arb_detected(
         self,
         condition_id:  str,
@@ -448,11 +457,11 @@ class TelegramNotifier:
         fee_rate:  "float | None" = None,
     ) -> None:
         """Record a detection. Fires nothing; the summary carries it."""
-        ep = self._episodes.setdefault(condition_id, {
-            "detections": 0, "best_edge": 0.0, "yes": yes_price, "no": no_price,
-            "cost": combined_cost, "is_maker": is_maker, "category": category,
-            "fee_type": fee_type, "fee_rate": fee_rate, "events": [],
-        })
+        ep = self._episodes.setdefault(condition_id, self._blank_episode())
+        if not ep["detections"]:
+            ep.update(yes=yes_price, no=no_price, cost=combined_cost,
+                      is_maker=is_maker, category=category,
+                      fee_type=fee_type, fee_rate=fee_rate)
         ep["detections"] += 1
         edge_bps = round(net_edge * 10_000, 1)
         if edge_bps > ep["best_edge"]:
@@ -461,18 +470,37 @@ class TelegramNotifier:
         if fee_rate is not None and ep.get("fee_rate") is None:
             ep["fee_rate"], ep["fee_type"] = fee_rate, fee_type
 
+    def arb_execution_started(self, condition_id: str) -> None:
+        """
+        Mark that orders are on the book for this market.
+
+        The PRICE window and the EXECUTION outcome live on very different
+        clocks: the window closes in seconds when the quote moves, while a
+        maker pair rests for up to MAKER_ORDER_TTL_S (900 s). Summarising at
+        window close therefore always reported "nothing — no execution
+        attempted", and the real outcome arrived a quarter of an hour later with
+        no episode left to attach to — so it was dropped entirely.
+
+        With this set, the window close records its statistics and waits; the
+        summary goes out when the outcome is known.
+        """
+        ep = self._episodes.setdefault(condition_id, self._blank_episode())
+        ep["pending"] = True
+
     def arb_event(self, condition_id: str, text: str,
                   pnl: "float | None" = None) -> None:
         """
         Record something that happened to this market's opportunity — an
         execution, a block, a flatten, a completion. Ordered, kept verbatim.
         """
-        ep = self._episodes.setdefault(condition_id, {
-            "detections": 0, "best_edge": 0.0, "yes": 0.0, "no": 0.0,
-            "cost": 0.0, "is_maker": False, "category": "",
-            "fee_type": "", "fee_rate": None, "events": [],
-        })
+        ep = self._episodes.setdefault(condition_id, self._blank_episode())
         ep["events"].append((text, pnl))
+        # An outcome for an episode whose window already closed: that window was
+        # deferred waiting for exactly this, so the story is now complete.
+        if ep.get("window") is not None:
+            w = ep.pop("window")
+            ep["pending"] = False
+            self.send_arb_summary(condition_id, *w)
 
     def send_arb_summary(
         self,
@@ -488,6 +516,15 @@ class TelegramNotifier:
         if not self._enabled:
             self._episodes.pop(condition_id, None)
             return
+
+        # Orders are still on the book: hold the window statistics and let the
+        # outcome trigger the summary. Without this the message goes out while
+        # the answer is still 15 minutes away, and always reads "nothing".
+        ep = self._episodes.get(condition_id)
+        if ep is not None and ep.get("pending") and not still_open:
+            ep["window"] = (duration_s, peak_edge_bps, ticks, is_maker)
+            return
+
         ep = self._episodes.pop(condition_id, None)
 
         # A window with no detection and nothing that happened is not worth a
