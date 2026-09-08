@@ -43,6 +43,7 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -127,7 +128,10 @@ def fmt_arbitrage(sig) -> str:
     """The tradeable event: an implication contradicted by live prices."""
     return (
         f"<b>💰 CROSS-MARKET ARBITRAGE</b>\n"
-        f"<i>edge {sig.edge * 10_000:+.0f} bps · confidence {sig.confidence:.2f}</i>\n\n"
+        f"<i>edge {sig.edge * 10_000:+.0f} bps · confidence {sig.confidence:.2f}"
+        + (f" · capital locked {sig.lockup_days:.0f}d → {sig.apr * 100:.0f}% APR"
+           if sig.lockup_days > 0 else " · resolution date unknown")
+        + "</i>\n\n"
         f"<b>Narrower market</b> — priced <b>{sig.narrow_price:.3f}</b>\n"
         f"  {sig.narrow_title}\n\n"
         f"<b>Broader market</b> — priced <b>{sig.broad_price:.3f}</b>\n"
@@ -222,7 +226,25 @@ def check_prices(rels: list, markets: list[dict], args) -> list:
     needed = {r.narrow for r in rels} | {r.broad for r in rels}
     print(f"  pricing {len(needed)} leg(s) from live books…")
 
+    # Resolution dates, so the detector can price how long capital would be
+    # locked. A cross-market pair has no complete set to merge, so the money
+    # sits until the LATER leg resolves — the difference between a 2% edge over
+    # two days and the same 2% over eight months.
+    for cid in needed:
+        m = by_id.get(cid)
+        if not m:
+            continue
+        end = m.get("endDate") or m.get("end_date")
+        if not end:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(end).replace("Z", "+00:00")).timestamp()
+            det.set_resolution(cid, ts)
+        except (ValueError, TypeError):
+            pass
+
     signals = []
+    now = time.time()
     for cid in needed:
         m = by_id.get(cid)
         if not m:
@@ -230,8 +252,15 @@ def check_prices(rels: list, markets: list[dict], args) -> list:
         p = yes_price(m)
         if p is None:
             continue
-        signals += det.update_price(cid, p, str(m.get("question") or ""))
+        # One REST snapshot prices every leg, so they share an observation time
+        # by construction. The freshness checks still matter under a live feed,
+        # where each book updates on its own clock — measured median skew on a
+        # related pair was 5.6 s.
+        signals += det.update_price(cid, p, str(m.get("question") or ""), ts=now)
     print(f"    {len(signals)} violation(s) detected")
+    if det.rejected_stale or det.rejected_skew or det.rejected_lockup:
+        print(f"    filtered: {det.rejected_stale} stale, "
+              f"{det.rejected_skew} skewed, {det.rejected_lockup} lockup")
     return signals
 
 

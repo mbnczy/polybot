@@ -51,6 +51,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
@@ -63,6 +64,20 @@ CROSS_MIN_EDGE: float = float(os.environ.get("CROSS_MIN_EDGE", 0.02))
 # Confidence floor for a discovered implication. Heuristic matches below this are
 # recorded but never evaluated, so a weak guess cannot produce a signal.
 CROSS_MIN_CONFIDENCE: float = float(os.environ.get("CROSS_MIN_CONFIDENCE", 0.90))
+
+# Freshness bounds for a cross-market comparison. Measured on a live related
+# pair over 90 s: median skew 5.6 s, p90 18.9 s, max 49.3 s — the two books
+# update independently and rarely at the same moment, so a "violation" between
+# a fresh price and a stale one is a clock artefact rather than a mispricing.
+# 0 disables either check.
+CROSS_MAX_PRICE_AGE_S:  float = float(os.environ.get("CROSS_MAX_PRICE_AGE_S", 30.0))
+CROSS_MAX_PRICE_SKEW_S: float = float(os.environ.get("CROSS_MAX_PRICE_SKEW_S", 5.0))
+
+# Minimum annualised return once capital lockup is priced in. A cross-market
+# pair cannot be merged back to collateral — the legs are different conditions,
+# so there is no complete set — and the money sits until the later market
+# resolves. 0 disables the check (and lockup is simply reported).
+CROSS_MIN_APR: float = float(os.environ.get("CROSS_MIN_APR", 0.0))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -109,14 +124,20 @@ class CrossMarketSignal:
     edge:          float     # min_payout − cost
     confidence:    float
     evidence:      str
+    lockup_days:   float = 0.0   # until the later of the two markets resolves
+    apr:           float = 0.0   # edge/cost annualised over that lockup
 
     def describe(self) -> str:
-        return (
+        tail = ""
+        if self.lockup_days > 0:
+            tail = (f" | capital locked {self.lockup_days:.1f}d "
+                    f"→ {self.apr * 100:.1f}% APR")
+        return tail.join(["", ""])[:0] + (
             f"{self.narrow_title[:44]!r} priced {self.narrow_price:.3f} > "
             f"{self.broad_title[:44]!r} at {self.broad_price:.3f} "
             f"(implies ≤) | cost {self.cost:.4f} → floor {self.min_payout:.2f} "
             f"| edge {self.edge:+.4f} ({self.edge * 10_000:+.0f} bps) "
-            f"| confidence {self.confidence:.2f}"
+            f"| confidence {self.confidence:.2f}" + tail
         )
 
 
@@ -275,25 +296,44 @@ class CrossMarketDetector:
         registry:       RelationRegistry,
         min_edge:       float = CROSS_MIN_EDGE,
         min_confidence: float = CROSS_MIN_CONFIDENCE,
+        max_age_s:      float = CROSS_MAX_PRICE_AGE_S,
+        max_skew_s:     float = CROSS_MAX_PRICE_SKEW_S,
+        min_apr:        float = CROSS_MIN_APR,
     ) -> None:
         self._reg   = registry
         self._edge  = min_edge
         self._conf  = min_confidence
         self._price: dict[str, float] = {}
         self._title: dict[str, str] = {}
+        self._seen:  dict[str, float] = {}
+        self._max_age  = max_age_s
+        self._max_skew = max_skew_s
+        # Counters so the filter's effect is measurable rather than assumed.
+        self.rejected_stale  = 0
+        self.rejected_skew   = 0
+        self.rejected_lockup = 0
+        self._min_apr = min_apr
+        self._resolves: dict[str, float] = {}   # condition_id -> unix resolve ts
 
     def update_price(
-        self, condition_id: str, yes_price: float, title: str = ""
+        self, condition_id: str, yes_price: float, title: str = "",
+        ts: "float | None" = None,
     ) -> list[CrossMarketSignal]:
         """
         Record a market's YES price and return any violations it creates.
 
         Both directions are checked: this market may be the narrow side of one
         implication and the broad side of another.
+
+        `ts` is when the price was observed (default: now). Comparing two
+        markets means comparing two independently updating books, and a
+        violation between a fresh price and a stale one is an artefact of the
+        clock, not a mispricing — see _fresh_enough.
         """
         if not (0.0 < yes_price < 1.0):
             return []
         self._price[condition_id] = yes_price
+        self._seen[condition_id] = time.time() if ts is None else ts
         if title:
             self._title[condition_id] = title
 
@@ -309,12 +349,70 @@ class CrossMarketDetector:
                     signals.append(sig)
         return signals
 
+    def set_resolution(self, condition_id: str, resolve_ts: float) -> None:
+        """Record when a market resolves, so lockup can be priced."""
+        self._resolves[condition_id] = resolve_ts
+
+    def _lockup_days(self, rel: Implication) -> float:
+        """Days until BOTH legs have resolved; 0 when either is unknown."""
+        a = self._resolves.get(rel.narrow)
+        b = self._resolves.get(rel.broad)
+        if a is None or b is None:
+            return 0.0
+        return max(0.0, (max(a, b) - time.time()) / 86_400.0)
+
+    def _fresh_enough(self, rel: Implication) -> bool:
+        """
+        Both prices recent, and observed close enough together to compare.
+
+        The two legs are separate markets on separate books that update only
+        when someone trades or quotes them. Measured on a live related pair
+        (Club Brugge vs Aston Villa, 90 s):
+
+            median skew   5.6 s
+            p90          18.9 s
+            max          49.3 s
+
+        Not milliseconds — seconds to tens of seconds. So more than half the
+        time a naive comparison is pricing a fresh book against a stale one, and
+        any "violation" it finds is an artefact of the clock. That is the
+        cheapest way for this strategy to lose money, because the trade looks
+        risk-free right up until the stale leg catches up.
+
+        Two conditions, both necessary. AGE bounds how old either price may be
+        in absolute terms; SKEW bounds how far apart they were observed. A pair
+        can fail skew while both are recent (one just moved), and fail age while
+        perfectly synchronised (neither has moved in minutes).
+        """
+        now = time.time()
+        tn = self._seen.get(rel.narrow)
+        tb = self._seen.get(rel.broad)
+        if tn is None or tb is None:
+            return False
+        if self._max_age > 0 and max(now - tn, now - tb) > self._max_age:
+            self.rejected_stale += 1
+            logger.debug(
+                "cross-market | %s/%s stale (%.1fs / %.1fs old) — skip",
+                rel.narrow[:10], rel.broad[:10], now - tn, now - tb,
+            )
+            return False
+        if self._max_skew > 0 and abs(tn - tb) > self._max_skew:
+            self.rejected_skew += 1
+            logger.debug(
+                "cross-market | %s/%s observed %.1fs apart — skip",
+                rel.narrow[:10], rel.broad[:10], abs(tn - tb),
+            )
+            return False
+        return True
+
     def _check(self, rel: Implication) -> Optional[CrossMarketSignal]:
         if rel.confidence < self._conf:
             return None
         pn = self._price.get(rel.narrow)
         pb = self._price.get(rel.broad)
         if pn is None or pb is None:
+            return None
+        if not self._fresh_enough(rel):
             return None
 
         violation = pn - pb
@@ -327,7 +425,32 @@ class CrossMarketDetector:
         if edge < self._edge:
             return None
 
+        # Capital lockup. A single-market YES+NO pair can be merged back to
+        # collateral within seconds (mergePositions on the CTF), so its edge is
+        # earned almost immediately. A CROSS-market pair cannot: the two legs
+        # are different conditions, there is no complete set to merge, and the
+        # capital sits until the later market resolves — hours, or months.
+        #
+        # A 2% edge is excellent over two days and close to worthless over eight
+        # months, and nothing upstream distinguished the two. Report the APR so
+        # the comparison is possible, and refuse a lockup that cannot clear the
+        # floor.
+        lockup_days = self._lockup_days(rel)
+        apr = 0.0
+        if lockup_days > 0 and cost > 0:
+            apr = (edge / cost) * (365.0 / lockup_days)
+            if self._min_apr > 0 and apr < self._min_apr:
+                logger.debug(
+                    "cross-market | %s/%s edge %+.4f but %.0f days locked "
+                    "→ %.1f%% APR < %.1f%% floor — skip",
+                    rel.narrow[:10], rel.broad[:10], edge, lockup_days,
+                    apr * 100, self._min_apr * 100,
+                )
+                self.rejected_lockup += 1
+                return None
+
         return CrossMarketSignal(
+            lockup_days=lockup_days, apr=apr,
             narrow=rel.narrow, broad=rel.broad,
             narrow_title=self._title.get(rel.narrow, rel.narrow[:16]),
             broad_title=self._title.get(rel.broad, rel.broad[:16]),

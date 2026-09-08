@@ -183,3 +183,117 @@ def test_deadlines_are_not_margins(title):
 def test_genuine_margins_still_match(title):
     from strategy.cross_market import _MARGIN_RE
     assert _MARGIN_RE.search(title) is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Freshness: two books, two clocks
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPriceFreshness:
+    """
+    The legs are separate markets on separate books that update only when
+    someone trades or quotes them. Measured on a live related pair over 90 s:
+
+        median skew   5.6 s
+        p90          18.9 s
+        max          49.3 s
+
+    Seconds, not milliseconds. More than half the time a naive comparison
+    prices a fresh book against a stale one, and any violation it finds is an
+    artefact of the clock. It is the cheapest way for this strategy to lose:
+    the trade looks risk-free right until the stale leg catches up.
+    """
+
+    def _det(self, **kw):
+        reg = RelationRegistry()
+        reg.add(Implication("0xby5", "0xwin", 1.0, evidence="test"))
+        return CrossMarketDetector(reg, min_edge=0.02, min_confidence=0.90, **kw)
+
+    def test_synchronised_prices_produce_the_signal(self):
+        import time
+        d = self._det()
+        now = time.time()
+        d.update_price("0xwin", 0.60, ts=now)
+        assert d.update_price("0xby5", 0.70, ts=now)
+
+    def test_a_stale_leg_is_refused(self):
+        import time
+        d = self._det(max_age_s=30.0)
+        old = time.time() - 120.0
+        d.update_price("0xwin", 0.60, ts=old)
+        assert d.update_price("0xby5", 0.70, ts=time.time()) == []
+        assert d.rejected_stale == 1
+
+    def test_prices_observed_far_apart_are_refused(self):
+        """Both recent, but one moved 20 s after the other."""
+        import time
+        d = self._det(max_skew_s=5.0)
+        now = time.time()
+        d.update_price("0xwin", 0.60, ts=now - 20.0)
+        assert d.update_price("0xby5", 0.70, ts=now) == []
+        assert d.rejected_skew == 1
+
+    def test_checks_can_be_disabled(self):
+        import time
+        d = self._det(max_age_s=0.0, max_skew_s=0.0)
+        d.update_price("0xwin", 0.60, ts=time.time() - 9999.0)
+        assert d.update_price("0xby5", 0.70, ts=time.time())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Capital lockup: a cross-market pair cannot be merged
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCapitalLockup:
+    """
+    A single-market YES+NO pair merges back to collateral within seconds. A
+    cross-market pair cannot — the legs are different conditions, so there is no
+    complete set — and the capital sits until the later market resolves.
+
+    A 2% edge is excellent over two days and close to worthless over eight
+    months. Nothing upstream distinguished the two.
+    """
+
+    def _det(self, **kw):
+        reg = RelationRegistry()
+        reg.add(Implication("0xby5", "0xwin", 1.0, evidence="test"))
+        return CrossMarketDetector(reg, min_edge=0.02, min_confidence=0.90, **kw)
+
+    def test_short_lockup_gives_a_high_apr(self):
+        import time
+        d = self._det()
+        soon = time.time() + 2 * 86_400
+        d.set_resolution("0xwin", soon)
+        d.set_resolution("0xby5", soon)
+        d.update_price("0xwin", 0.60)
+        sig = d.update_price("0xby5", 0.70)[0]
+        assert 1.5 < sig.lockup_days < 2.5
+        assert sig.apr > 5.0, "10% over two days should annualise enormously"
+
+    def test_long_lockup_collapses_the_same_edge(self):
+        import time
+        d = self._det()
+        far = time.time() + 240 * 86_400
+        d.set_resolution("0xwin", far)
+        d.set_resolution("0xby5", far)
+        d.update_price("0xwin", 0.60)
+        sig = d.update_price("0xby5", 0.70)[0]
+        assert sig.lockup_days > 200
+        assert sig.apr < 0.25, "the same edge over 8 months is not the same trade"
+
+    def test_apr_floor_refuses_a_long_lockup(self):
+        import time
+        d = self._det(min_apr=0.50)
+        far = time.time() + 240 * 86_400
+        d.set_resolution("0xwin", far)
+        d.set_resolution("0xby5", far)
+        d.update_price("0xwin", 0.60)
+        assert d.update_price("0xby5", 0.70) == []
+        assert d.rejected_lockup == 1
+
+    def test_unknown_resolution_does_not_block(self):
+        """Absent dates must not be read as an infinite lockup."""
+        d = self._det(min_apr=0.50)
+        d.update_price("0xwin", 0.60)
+        sig = d.update_price("0xby5", 0.70)
+        assert sig and sig[0].lockup_days == 0.0
