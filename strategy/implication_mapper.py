@@ -235,9 +235,103 @@ def _event_id(market: dict) -> str:
     return str(market.get("eventId") or market.get("event_id") or "")
 
 
+def _exclusion_group(market: dict) -> str:
+    """
+    The NegRisk group id, or "" when the market belongs to none.
+
+    Markets sharing this id are alternative outcomes of one question — at most
+    one of them can resolve YES. That is enforced by the contract, not inferred
+    from wording, so no implication can hold between two of them and asking the
+    model about such a pair can only ever return NONE.
+
+    Measured over 2,000 resolved markets: of 405 sibling pairs where at least
+    one side resolved YES, ZERO had both resolve YES. They were 40% of the
+    same-event candidate pool.
+    """
+    return str(market.get("negRiskMarketID") or market.get("neg_risk_market_id") or "")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 1. Prefilter — keep the model bill proportional to real candidates
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# The sign is part of the token. Without it "Bitcoin -12% daily candle change"
+# and "Bitcoin 12% daily candle change" tokenise identically — two markets that
+# move in opposite directions, read as one.
+_WORD = re.compile(r"[+-]?[a-z0-9$%.']+")
+# Magnitude suffixes are ubiquitous in Polymarket titles — "$8M", "$1T", "700B".
+# Without them "FDV above $8M" against "above $5M" reads as a name swap and the
+# threshold ladder, one of only two shapes that carries implications, is ranked
+# last instead of second.
+_NUMERIC = re.compile(r"^[+-]?\$?[\d.,]+[kmbt]?%?$")
+
+# Shapes a pair of titles can take, best first. Measured over 2,000 resolved
+# markets by asking how often BOTH sides resolved YES — a necessary condition
+# for any implication to be testable rather than vacuous:
+#
+#   NEST     addition        4 pairs   75.0% both-YES
+#   LADDER   number swap  3,266 pairs   42.8%
+#   LOOSE    no skeleton    595 pairs   30.0%
+#   SIBLING  name swap  195,002 pairs   22.0%
+#
+# The rate is a floor, not the implication rate — two markets can both resolve
+# YES by coincidence — but a shape that never produces two YES can hold nothing
+# testable, and the ordering above is what the ranking encodes.
+#
+# SIBLING is 98% of the pool and is where the budget used to go: "Will Zoë
+# Kravitz be one of Taylor Swift's bridesmaids?" beside the same question about
+# Abigail Anderson. Same event, near-identical wording, no implication either
+# way — which is why the module ran for three days and asserted almost nothing.
+#
+# Note how thin NEST is: four genuine textual nestings in 2,000 resolved
+# markets. The relations this module was built to find are rare, and most of
+# what it can find are threshold ladders.
+SHAPE_NEST, SHAPE_LADDER, SHAPE_LOOSE, SHAPE_SIBLING, SHAPE_DUPLICATE = (
+    "nest", "ladder", "loose", "sibling", "duplicate")
+
+_SHAPE_RANK = {SHAPE_NEST: 3.0, SHAPE_LADDER: 2.0, SHAPE_LOOSE: 1.0, SHAPE_SIBLING: 0.0}
+
+
+def pair_shape(a_title: str, b_title: str) -> str:
+    """
+    Classify how two titles differ.
+
+    Strip the common prefix and suffix; what remains is what each title says
+    that the other does not.
+
+      • nothing left on either side -> DUPLICATE. The same question listed
+        twice. Not an implication, and string equality finds it without paying
+        a model to notice.
+      • one side left with nothing  -> NEST. The other title is this one plus a
+        qualifier: "Lakers win by 5+ points" against "Lakers win". This is the
+        implication shape — a strictly stronger claim about the same subject.
+      • both remainders numeric     -> LADDER. "FDV above $8M" against "$5M":
+        a threshold nesting, a real implication and usually a well-priced one.
+      • both remainders otherwise   -> SIBLING. A different subject substituted
+        into the same template. Two alternatives, not a nesting.
+      • no common prefix or suffix  -> LOOSE. Shared vocabulary only; the model
+        has to judge it.
+    """
+    x, y = _WORD.findall(a_title.lower()), _WORD.findall(b_title.lower())
+    if not x or not y:
+        return SHAPE_LOOSE
+    i = 0
+    while i < min(len(x), len(y)) and x[i] == y[i]:
+        i += 1
+    j = 0
+    while j < min(len(x), len(y)) - i and x[len(x) - 1 - j] == y[len(y) - 1 - j]:
+        j += 1
+    if i + j == 0:
+        return SHAPE_LOOSE
+    da, db = x[i:len(x) - j], y[i:len(y) - j]
+    if not da and not db:
+        return SHAPE_DUPLICATE
+    if not da or not db:
+        return SHAPE_NEST
+    if all(_NUMERIC.match(t) for t in da + db):
+        return SHAPE_LADDER
+    return SHAPE_SIBLING
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -248,6 +342,7 @@ class Candidate:
     overlap:    float            # Jaccard similarity of significant tokens
     same_event: bool
     event_id:   str = ""
+    shape:      str = SHAPE_LOOSE   # see pair_shape() — the strongest signal
 
 
 def build_candidates(
@@ -277,11 +372,20 @@ def build_candidates(
         cid   = str(m.get("conditionId") or m.get("condition_id") or "").strip()
         if not title or not cid:
             continue
-        rows.append((cid, title, _tokens(title), _event_id(m)))
+        rows.append((cid, title, _tokens(title), _event_id(m), _exclusion_group(m)))
 
     out: list[Candidate] = []
-    for (a_id, a_t, a_tok, a_ev), (b_id, b_t, b_tok, b_ev) in itertools.combinations(rows, 2):
+    excluded_siblings = 0
+    for (a_id, a_t, a_tok, a_ev, a_ng), (b_id, b_t, b_tok, b_ev, b_ng) in itertools.combinations(rows, 2):
         if a_id == b_id or not a_tok or not b_tok:
+            continue
+        # Alternative outcomes of one NegRisk question. Mutually exclusive by
+        # contract, so there is nothing here for an implication mapper to find —
+        # and where they ARE mispriced (Σ yes > 1) the main bot trades them
+        # directly through the NegRisk path. Skipped before scoring, because
+        # their titles are near-identical and they would otherwise dominate.
+        if a_ng and a_ng == b_ng:
+            excluded_siblings += 1
             continue
         union = a_tok | b_tok
         if not union:
@@ -293,10 +397,52 @@ def build_candidates(
             continue
         out.append(Candidate(
             a_id, b_id, a_t, b_t, overlap, same_event,
-            a_ev if same_event else "",
+            a_ev if same_event else "", pair_shape(a_t, b_t),
         ))
 
-    out.sort(key=lambda c: (c.same_event, c.overlap), reverse=True)
+    if excluded_siblings:
+        logger.info(
+            "implication mapper | skipped %d mutually exclusive NegRisk sibling "
+            "pair(s) — no implication can hold between them", excluded_siblings,
+        )
+
+    # Rank by SHAPE, not by similarity.
+    #
+    # Sorting on raw overlap sent the model 90% numeric ladders; sorting on
+    # proximity to a "typical" overlap replaced them with name-swap siblings.
+    # Both were guesses about what a promising pair looks like. The shape
+    # classes above are not a guess — they are measured against how the markets
+    # actually resolved, and they separate the ~1.6% of pairs whose shape can
+    # carry an implication from the 98% whose shape cannot.
+    #
+    # A shared event breaks ties within a shape: Polymarket groups genuinely
+    # related markets, so it is real evidence, but it is weaker than shape —
+    # the siblings we just demoted were overwhelmingly same-event.
+    def _score(c: Candidate) -> float:
+        return _SHAPE_RANK.get(c.shape, 0.0) + (0.5 if c.same_event else 0.0)
+
+    dupes = [c for c in out if c.shape == SHAPE_DUPLICATE]
+    if dupes:
+        out = [c for c in out if c.shape != SHAPE_DUPLICATE]
+        logger.info(
+            "implication mapper | %d identically worded pair(s) excluded — the "
+            "same question listed twice needs no model to recognise; example: %s",
+            len(dupes), dupes[0].a_title[:70],
+        )
+
+    out.sort(key=_score, reverse=True)
+
+    # There was a quota here capping how much of the budget threshold ladders
+    # could take. It was written when ladders looked like the problem; once the
+    # shape ranking put name-swap siblings last, the quota was handing 320 of
+    # 400 model calls to the one class that cannot contain an implication.
+    #
+    # It was also ordered wrongly: it truncated the ladder pool BEFORE the
+    # per-event cap, so the ladders it kept were concentrated in a few crypto
+    # events and the cap then culled them anyway — a 60% quota admitted 12
+    # ladders. Removing it moved the selected set from 22.9% to 37.3% expected
+    # both-YES. max_per_event already prevents any one event monopolising, and
+    # it does so after ranking, where it works.
 
     if max_per_event > 0:
         seen: dict[str, int] = {}

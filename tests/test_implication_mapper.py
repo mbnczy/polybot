@@ -19,6 +19,7 @@ from strategy.implication_mapper import (
     _MODEL_CONFIDENCE_CEILING,
     _to_implication,
     build_candidates,
+    pair_shape,
     classify_candidates,
     classify_one,
     parse_verdict,
@@ -121,8 +122,81 @@ def test_per_event_cap_stops_one_event_eating_the_budget():
 
 
 def test_global_cap_is_enforced():
-    markets = [_mkt(f"0x{i}", f"Will team alpha beta win match {i}?") for i in range(60)]
+    # Distinct names, not match numbers: titles differing only by a number are
+    # threshold ladders and hit the ladder quota long before the global cap, so
+    # a numbered fixture would silently test the wrong limit.
+    names = ("alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf",
+             "hotel", "india", "juliet", "kilo", "lima")
+    markets = [_mkt(f"0x{i}", f"Will the {n} team win the regional final?")
+               for i, n in enumerate(names)]
     assert len(build_candidates(markets, max_pairs=25, max_per_event=0)) == 25
+
+
+def test_shape_outranks_similarity():
+    """
+    A threshold ladder is a real implication; a name swap in the same template
+    is not. Ranking on wording put the siblings first because their titles are
+    just as alike — which is what the module actually did for three days.
+    """
+    markets = [
+        _mkt("0xL1", "Will Bitcoin reach $70,000 by December 31?"),
+        _mkt("0xL2", "Will Bitcoin reach $65,000 by December 31?"),
+        _mkt("0xS1", "Will Alice Smith be named to the committee?"),
+        _mkt("0xS2", "Will Bob Jones be named to the committee?"),
+    ]
+    cands = build_candidates(markets, max_per_event=0)
+    assert cands[0].shape == "ladder"
+
+
+def test_one_event_cannot_monopolise_the_budget():
+    """
+    A single crypto event lists dozens of strike prices, all ranked as ladders.
+    Concentration is held back by the per-event cap — applied after ranking, so
+    it thins each event rather than truncating a whole shape.
+    """
+    markets = [_mkt(f"0x{i}", f"Will Bitcoin reach ${i}0,000 by December 31?",
+                    event="btc") for i in range(20)]
+    cands = build_candidates(markets, max_pairs=50, max_per_event=3)
+    assert len(cands) == 3
+
+
+def test_negrisk_siblings_are_never_candidates():
+    """
+    Markets sharing a negRiskMarketID are alternative outcomes of one question:
+    at most one resolves YES, so no implication can hold between them. Measured
+    over 2,000 resolved markets, 405 sibling pairs had a YES and none had two.
+    """
+    markets = [
+        _mkt("0x1", "Will Andrew Bailey be the next Attorney General?", event="ag"),
+        _mkt("0x2", "Will Jane Doe be the next Attorney General?", event="ag"),
+    ]
+    for m in markets:
+        m["negRiskMarketID"] = "0xGROUP"
+    assert build_candidates(markets) == []
+
+
+def test_pair_shape_separates_implications_from_siblings():
+    # A qualifier added to the same claim — the implication shape.
+    assert pair_shape("Will the Lakers win by 5+ points?",
+                      "Will the Lakers win?") == "nest"
+    # A threshold moved — also a real implication.
+    assert pair_shape("Will FDV be above $8M one day after launch?",
+                      "Will FDV be above $5M one day after launch?") == "ladder"
+    # A different subject in the same template — not an implication.
+    assert pair_shape("Will Zoe Kravitz be one of the bridesmaids?",
+                      "Will Abigail Anderson be one of the bridesmaids?") == "sibling"
+    # The same question listed twice.
+    assert pair_shape("Will UNI reach $6.50 by December 31?",
+                      "Will UNI reach $6.50 by December 31?") == "duplicate"
+
+
+def test_pair_shape_keeps_the_sign():
+    """
+    A tokeniser that drops the minus reads "Bitcoin -12% daily candle" and
+    "Bitcoin 12% daily candle" as one market. They move in opposite directions.
+    """
+    assert pair_shape("Bitcoin -12% daily candle change in 2026?",
+                      "Bitcoin 12% daily candle change in 2026?") != "duplicate"
 
 
 # ── reply parsing: three providers, three habits ──────────────────────────────

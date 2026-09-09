@@ -50,20 +50,30 @@ import httpx  # noqa: E402
 # demo_cross_market imports it inside a function.
 
 GAMMA = "https://gamma-api.polymarket.com/markets"
+_GAMMA_PAGE = 100     # Gamma's hard ceiling; asking for more silently returns 100
 logger = logging.getLogger("backtest")
 
 
 def fetch_resolved(limit: int) -> list[dict]:
     """Closed markets with an unambiguous 0/1 outcome, newest first."""
+    # Gamma silently caps `limit` at 100 however much you ask for. Advancing the
+    # offset by the REQUESTED page size therefore skipped 400 markets per page:
+    # the sample was 20% of history with holes in it. Worse for this backtest
+    # than a plain shortfall — an endDate-ordered listing keeps an event's
+    # markets adjacent, so striding across it splits event clusters and leaves
+    # behind whatever pairs up within a single page, which is precisely the
+    # numeric ladders. Advance by what the page actually returned.
     out: list[dict] = []
     with httpx.Client(timeout=30.0) as c:
         offset = 0
-        while len(out) < limit and offset < 4000:
+        while len(out) < limit and offset < 20_000:
             r = c.get(GAMMA, params={
-                "closed": "true", "limit": 500, "offset": offset,
+                "closed": "true", "limit": _GAMMA_PAGE, "offset": offset,
                 "order": "endDate", "ascending": "false",
             })
             if r.status_code != 200:
+                logger.warning("gamma %s at offset %d — stopping with %d market(s)",
+                               r.status_code, offset, len(out))
                 break
             batch = r.json()
             if not batch:
@@ -71,7 +81,7 @@ def fetch_resolved(limit: int) -> list[dict]:
             for m in batch:
                 if _outcome(m) is not None and m.get("question"):
                     out.append(m)
-            offset += 500
+            offset += len(batch)
     return out[:limit]
 
 
