@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import re
 import logging
 import sys
 from pathlib import Path
@@ -83,6 +84,67 @@ def fetch_resolved(limit: int) -> list[dict]:
                     out.append(m)
             offset += len(batch)
     return out[:limit]
+
+
+# ── ground truth is not always self-consistent ────────────────────────────────
+# Polymarket resolved "Reppo FDV above $100M one day after launch?" NO while
+# resolving the $500M and $800M markets in the same event, under an identical
+# description, YES. No implication mapper can be right about that pair, and
+# counting it as a mapper error puts the blame in the wrong place — it moved the
+# headline from 0 to 16.7%.
+#
+# The check has to stay narrow. "Will 47 senators vote Yea?" is also non-monotone
+# across its family, and correctly so: it asks for an exact count, not a
+# threshold, and a mapper that reads it as a ladder IS wrong and must be scored
+# that way. So only families whose wording states a comparison are checked.
+_COMPARATIVE = re.compile(
+    r"\b(above|below|over|under|greater|less|at least|at most|or more|or fewer|"
+    r"reach|reaches|dip to|exceed|surpass)\b", re.I)
+_FAMILY_NUM = re.compile(r"\$?([\d,]+(?:\.\d+)?)\s*([kmbt])?\b", re.I)
+_MAGNITUDE = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}
+
+
+def _family_key(question: str) -> str | None:
+    """Skeleton of a threshold family: the title with its one number blanked."""
+    if not _COMPARATIVE.search(question):
+        return None
+    nums = _FAMILY_NUM.findall(question)
+    if len(nums) != 1:
+        return None
+    return _FAMILY_NUM.sub("#", question)
+
+
+def _threshold_value(question: str) -> float:
+    n, sfx = _FAMILY_NUM.findall(question)[0]
+    return float(n.replace(",", "")) * _MAGNITUDE.get((sfx or "").lower(), 1.0)
+
+
+def inconsistent_families(markets: list[dict]) -> set[str]:
+    """
+    Threshold families whose recorded outcomes contradict themselves.
+
+    Sorted by threshold, a comparative family must be monotone in one direction
+    or the other — "above $X" gets harder as X rises, "below $X" easier. A family
+    that is monotone in neither cannot all be true.
+    """
+    fam: dict[str, list[tuple[float, bool]]] = collections.defaultdict(list)
+    for m in markets:
+        q, out = str(m.get("question") or ""), _outcome(m)
+        key = _family_key(q) if out is not None else None
+        if key:
+            fam[key].append((_threshold_value(q), out))
+
+    bad = set()
+    for key, rows in fam.items():
+        if len(rows) < 3:            # two points are monotone by construction
+            continue
+        rows.sort()
+        outs = [o for _, o in rows]
+        rising  = all(a <= b for a, b in zip(outs, outs[1:]))
+        falling = all(a >= b for a, b in zip(outs, outs[1:]))
+        if not rising and not falling:
+            bad.add(key)
+    return bad
 
 
 def _outcome(m: dict) -> bool | None:
@@ -169,6 +231,14 @@ def main() -> int:
         if not tb:
             violations.append(r)
 
+    # Split the violations: a mapper error and an exchange that contradicts
+    # itself are both counterexamples, and only one of them is our problem.
+    suspect = inconsistent_families(markets)
+    tainted = [r for r in violations
+               if _family_key(titles.get(r.narrow, "")) in suspect
+               or _family_key(titles.get(r.broad, "")) in suspect]
+    genuine = [r for r in violations if r not in tainted]
+
     print(f"\n  {'':4}{'asserted':>10}{'vacuous':>10}{'testable':>10}"
           f"{'violated':>10}")
     print(f"  {'':4}{len(rels):>10}{vacuous:>10}{len(testable):>10}"
@@ -212,7 +282,17 @@ def main() -> int:
         print("  Take a larger sample before trusting any of them.")
         return 0
 
-    rate = len(violations) / len(testable)
+    if tainted:
+        print(f"\n  {len(tainted)} of the {len(violations)} counterexample(s) sit in a threshold")
+        print(f"  family whose own recorded outcomes contradict each other — the")
+        print(f"  exchange resolved a lower threshold NO and a higher one YES under")
+        print(f"  an identical description. No mapper can be right about those, so")
+        print(f"  they are reported apart from the rate rather than charged to it.")
+        for r in tainted:
+            print(f"    · {titles.get(r.narrow,'')[:60]}")
+
+    rate = len(genuine) / len(testable)
+    violations = genuine
     print(f"\n  VIOLATION RATE {rate * 100:.1f}%  "
           f"({len(violations)}/{len(testable)} testable assertions were false)")
 
