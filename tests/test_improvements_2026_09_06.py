@@ -1022,3 +1022,58 @@ class TestNegRiskStopInstrumentation:
 
     def test_summary_is_harmless_before_anything_runs(self):
         assert self._det().stop_summary() == "no evaluations"
+
+
+class TestFillLog:
+    """
+    The bot has never completed a bundle and the working theory is queue
+    position: 63% of live legs sit on a one-tick spread, where `ask - tick` IS
+    the best bid, so a post-only quote joins the back of a queue rather than
+    leading it. This records outcomes so a week of data can settle it.
+    """
+
+    def _rows(self, tmp_path, monkeypatch):
+        import telemetry.fill_log as fl
+        p = tmp_path / "fills.jsonl"
+        monkeypatch.setattr(fl, "FILL_LOG_PATH", str(p))
+        monkeypatch.setattr(fl, "FILL_LOG_ENABLED", True)
+        return fl, p
+
+    def test_a_quote_above_the_touch_is_marked_as_leading(self, tmp_path, monkeypatch):
+        import json
+        fl, p = self._rows(tmp_path, monkeypatch)
+        fl.record(path="pair", outcome="filled", price=0.86,
+                  best_bid=0.85, best_ask=0.90, tick=0.01)
+        row = json.loads(p.read_text().strip())
+        assert row["leads"] is True
+        assert row["spread_ticks"] == pytest.approx(5.0)
+
+    def test_a_quote_on_the_touch_is_marked_as_queued(self, tmp_path, monkeypatch):
+        """The one-tick case: ask - tick lands ON the best bid."""
+        import json
+        fl, p = self._rows(tmp_path, monkeypatch)
+        fl.record(path="pair", outcome="expired", price=0.84,
+                  best_bid=0.84, best_ask=0.85, tick=0.01)
+        row = json.loads(p.read_text().strip())
+        assert row["leads"] is False
+        assert row["spread_ticks"] == pytest.approx(1.0)
+
+    def test_missing_book_data_is_unknown_not_a_guess(self, tmp_path, monkeypatch):
+        import json
+        fl, p = self._rows(tmp_path, monkeypatch)
+        fl.record(path="negrisk", outcome="expired", price=0.50)
+        row = json.loads(p.read_text().strip())
+        assert row["leads"] is None and row["spread_ticks"] is None
+
+    def test_a_write_failure_never_reaches_the_caller(self, tmp_path, monkeypatch):
+        """Telemetry must not be able to interrupt trading."""
+        import telemetry.fill_log as fl
+        monkeypatch.setattr(fl, "FILL_LOG_PATH", "/nonexistent-dir/x.jsonl")
+        monkeypatch.setattr(fl, "FILL_LOG_ENABLED", True)
+        fl.record(path="pair", outcome="filled", price=0.5)   # must not raise
+
+    def test_disabling_it_writes_nothing(self, tmp_path, monkeypatch):
+        fl, p = self._rows(tmp_path, monkeypatch)
+        monkeypatch.setattr(fl, "FILL_LOG_ENABLED", False)
+        fl.record(path="pair", outcome="filled", price=0.5)
+        assert not p.exists()

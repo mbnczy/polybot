@@ -61,6 +61,7 @@ from typing import TYPE_CHECKING
 
 from risk.circuit_breaker import CircuitBreakerTripped
 from strategy.arbitrage import DEFAULT_TAKER_FEE
+from telemetry import fill_log
 from telemetry.metrics import ARB_HALF_FILLS, ARB_UNWIND_FAILURES
 
 if TYPE_CHECKING:
@@ -462,6 +463,21 @@ class MakerPairGuard:
         self._pairs.pop(pair.pair_id, None)
 
         yes, no = pair.yes, pair.no
+
+        # Record what happened to each leg, with the conditions it faced. The
+        # bot has never completed a bundle and the working theory is queue
+        # position; a week of these settles it with data instead of argument.
+        rested = time.monotonic() - pair.created_at
+        for leg in pair.legs:
+            fill_log.record(
+                path="pair", condition_id=pair.condition_id,
+                outcome=("filled"   if leg.matched >= leg.size - _SHARE_EPS else
+                         "partial"  if leg.matched > _SHARE_EPS else
+                         "cancelled" if leg.cancel_requested else "expired"),
+                price=leg.bid, size=leg.size, matched=leg.matched,
+                rested_s=rested,
+            )
+
         # Make sure nothing is left resting on the book.
         for leg in pair.legs:
             if leg.open:

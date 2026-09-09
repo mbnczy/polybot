@@ -68,6 +68,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from strategy.arbitrage import effective_taker_fee
+from telemetry import fill_log
 from telemetry.metrics import ARB_HALF_FILLS, ARB_UNWIND_FAILURES
 
 if TYPE_CHECKING:
@@ -705,6 +706,18 @@ class NegRiskBundleGuard:
         """
         bundle.finalizing = True
         self._bundles.pop(bundle.bundle_id, None)
+
+        # Same record as the pair path: what each leg faced and how it ended.
+        rested = time.monotonic() - bundle.created_at
+        for leg in bundle.legs:
+            fill_log.record(
+                path="negrisk", condition_id=bundle.condition_id,
+                outcome=("filled"   if leg.matched >= leg.size - _SHARE_EPS else
+                         "partial"  if leg.matched > _SHARE_EPS else
+                         "cancelled" if leg.cancel_requested else "expired"),
+                price=leg.bid, size=leg.size, matched=leg.matched,
+                rested_s=rested,
+            )
 
         # Nothing may be left resting on the book.
         for leg in bundle.legs:
