@@ -57,7 +57,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING
 
 import aiohttp
 from web3 import Web3
@@ -68,6 +68,8 @@ from eth_account import Account
 if TYPE_CHECKING:
     from core.scanner import FeedRegistry
     from telemetry.telegram import TelegramNotifier
+
+from core import market_titles
 
 logger = logging.getLogger(__name__)
 
@@ -201,12 +203,14 @@ class AutoRedeemer:
         feed_registry: "FeedRegistry",
         notifier:      "TelegramNotifier",
         clob_client:   "object | None" = None,
+        on_redeemed:   "Callable[[str], None] | None" = None,
     ) -> None:
         self._registry  = feed_registry
         self._notifier  = notifier
         # V2 SDK route (PolyClient.redeem_positions) — post-pUSD-migration the
         # raw CTF redeemPositions path below is a legacy fallback only.
         self._client    = clob_client
+        self._on_redeemed = on_redeemed
 
         # Web3 setup — blocking but done at init time before the event loop
         rpc_url           = os.environ.get("POLYGON_RPC_URL", "")
@@ -530,6 +534,17 @@ class AutoRedeemer:
             return
 
         self._redeemed.add(condition_id)
+        # Tell the reconciler, so a settlement is not mistaken for an order that
+        # escaped supervision. Announcing beats inferring: a payout alongside an
+        # unrelated purchase nets to a figure that matches neither.
+        if self._on_redeemed is not None:
+            try:
+                self._on_redeemed(
+                    market_titles.title(condition_id) or condition_id[:20]
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("AutoRedeemer | redemption notice failed: %s", exc)
+
         msg = (
             f"CTF REDEEMED\n"
             f"condition={condition_id[:20]}...\n"

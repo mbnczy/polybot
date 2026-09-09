@@ -886,3 +886,80 @@ class TestEpisodeWaitsForTheOutcome:
         n.arb_execution_started("0xe")
         n.send_arb_summary("0xe", 5.0, 300.0, 4, True, still_open=True)
         assert len(n._sent) == 1
+
+
+class TestUnwindNeverExceedsTheWallet:
+    """
+    Regression for 2026-09-08 17:46.
+
+        one-leg imbalance: yes=0.00 no=10.30
+        unwind FAILED: not enough balance -> balance: 10000000,
+                       order amount: 10300000
+
+    The guard's `matched` said 10.30; the chain held 10.00. The sell was
+    rejected outright and the position was left stranded — still sitting there
+    a day later, because nothing retries a failed unwind.
+
+    Sizing a sale is the one question the chain answers better than any
+    bookkeeping: you cannot sell what you do not have.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _live_mode(self, monkeypatch):
+        """unwind_leg short-circuits in paper mode before it sizes anything."""
+        import core.clob_client as cc
+        monkeypatch.setattr(cc, "_PAPER_TRADE", False)
+
+    def _client(self, held):
+        from core.clob_client import PolyClient
+        c = PolyClient.__new__(PolyClient)
+        c._sold = []
+
+        async def _share_balance(token_id):
+            return held
+        c.share_balance = _share_balance
+
+        async def _get_orderbook(token_id):
+            return {"bids": [{"price": "0.80", "size": "500"}], "asks": []}
+        c.get_orderbook = _get_orderbook
+
+        # _run_with_retry(self._create_market, ...) — record the size asked for
+        async def _run_with_retry(fn, *a, **kw):
+            c._sold.append(float(kw.get("shares", 0.0)))
+            return "signed"
+        c._run_with_retry = _run_with_retry
+        c._create_market = lambda **kw: kw
+
+        async def _post_once(signed):
+            size = c._sold[-1] if c._sold else 0.0
+            return {"status": "matched", "making_amount": size,
+                    "taking_amount": size * 0.80}
+        c._post_once = _post_once
+        return c
+
+    @pytest.mark.asyncio
+    async def test_sell_is_capped_at_the_on_chain_balance(self):
+        c = self._client(held=10.00)
+        await c.unwind_leg("T", 10.30, 0.0)
+        assert c._sold, "nothing was attempted"
+        assert max(c._sold) <= 10.00 + 1e-9, f"tried to sell {max(c._sold)} of 10.00"
+
+    @pytest.mark.asyncio
+    async def test_a_sufficient_balance_is_left_alone(self):
+        c = self._client(held=50.0)
+        await c.unwind_leg("T", 10.30, 0.0)
+        assert abs(max(c._sold) - 10.30) < 0.011
+
+    @pytest.mark.asyncio
+    async def test_unreadable_balance_does_not_block_the_unwind(self):
+        """A failed chain read must not strand a position it could have sold."""
+        c = self._client(held=None)
+        await c.unwind_leg("T", 10.30, 0.0)
+        assert c._sold, "an unreadable balance stopped the sale entirely"
+
+    @pytest.mark.asyncio
+    async def test_an_empty_wallet_reports_rather_than_selling(self):
+        c = self._client(held=0.0)
+        resp = await c.unwind_leg("T", 10.30, 0.0)
+        assert c._sold == []
+        assert resp["status"] == "error"

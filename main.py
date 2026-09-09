@@ -1139,10 +1139,18 @@ async def main() -> None:
     )
 
     # ── auto redeemer ─────────────────────────────────────────────────────
+    # ── wallet reconciler: the only check that does not trust the bot's own
+    #    account of events. Every serious fault on 2026-09-05/06 was invisible
+    #    in the logs and plain in the wallet, so compare against the chain.
+    reconciler = WalletReconciler(client, breaker, notifier)
+
+    # Redemptions are announced to the reconciler so a settlement is never
+    # mistaken for an order that escaped supervision.
     redeemer = AutoRedeemer(
         feed_registry=feed_registry,
         notifier=notifier,
         clob_client=client,   # V2 SDK redemption routing (post-pUSD migration)
+        on_redeemed=lambda title: reconciler.note_redemption(title),
     )
 
     # ── inventory manager: recycles paired-fill collateral via mergePositions
@@ -1167,10 +1175,6 @@ async def main() -> None:
         if _negrisk_exec_mode == "clob" else None
     )
 
-    # ── wallet reconciler: the only check that does not trust the bot's own
-    #    account of events. Every serious fault on 2026-09-05/06 was invisible
-    #    in the logs and plain in the wallet, so compare against the chain.
-    reconciler = WalletReconciler(client, breaker, notifier)
 
     await notifier.notify(
         f"Polymarket ARB Bot v7 online\n"

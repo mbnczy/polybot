@@ -164,3 +164,83 @@ async def test_a_clean_start_says_nothing():
     r, _, _, n = _rig([])
     await r.check_once()
     assert n.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_redemption_is_not_reported_as_an_escape():
+    """
+    Regression for 2026-09-08 07:43.
+
+        RECONCILE | inventory moved with NOTHING open — an order escaped
+        supervision | cash +20.2900 | Will Maura Sullivan ... |No -20.29
+
+    Nothing escaped. The market resolved and AutoRedeemer redeemed the winning
+    position: shares to zero, cash up by their face value. This check is the
+    only thing that catches a real leak, and one that cries wolf stops being
+    read — so a settlement must not look like a fault.
+    """
+    r, c, _, n = _rig([_row("Will Maura Sullivan be the Democratic nominee for NH-01?", "No", 20.29)], cash=57.23)
+    await r.check_once()
+    n.sent.clear()
+    r.note_redemption("Will Maura Sullivan be the Democratic nominee for NH-01?")   # as market_titles reports it  # AutoRedeemer says so
+    c.rows = []                      # redeemed away
+    c.cash = 57.23 + 20.29           # paid out at 1.00/share
+    assert await r.check_once() is None
+    assert n.sent == [], "a settlement was reported as an escaped order"
+
+
+@pytest.mark.asyncio
+async def test_a_real_escape_is_still_caught_alongside_a_redemption():
+    """One leg settling must not mask another leg being bought unsupervised."""
+    r, c, _, n = _rig([_row("Will Maura Sullivan be the Democratic nominee for NH-01?", "No", 20.29)], cash=57.23)
+    await r.check_once()
+    n.sent.clear()
+    r.note_redemption("Will Maura Sullivan be the Democratic nominee for NH-01?")   # as market_titles reports it
+    c.rows = [_row("Sabalenka", "No", 10.0)]      # appeared from nowhere
+    c.cash = 57.23 + 20.29 - 6.96
+    report = await r.check_once()
+    assert report is not None
+    assert any("Sabalenka" in k for k in report["moves"])
+    assert not any("Sullivan" in k for k in report["moves"])
+
+
+@pytest.mark.asyncio
+async def test_shares_vanishing_without_cash_is_still_an_alert():
+    """Position gone and no money arrived is not a redemption — it is a loss."""
+    r, c, _, n = _rig([_row("A", "No", 20.0)], cash=50.0)
+    await r.check_once()
+    n.sent.clear()
+    c.rows = []
+    c.cash = 50.0                    # nothing came back
+    assert await r.check_once() is not None
+    assert n.sent
+
+
+@pytest.mark.asyncio
+async def test_an_unannounced_disappearance_still_alerts():
+    """
+    Only AutoRedeemer can vouch for a settlement. A position that vanishes with
+    no announcement is exactly the leak this check exists for, whatever the cash
+    happens to have done.
+    """
+    r, c, _, n = _rig([_row("A", "No", 20.0)], cash=50.0)
+    await r.check_once()
+    n.sent.clear()
+    c.rows = []
+    c.cash = 70.0                    # looks like a payout, but nobody said so
+    assert await r.check_once() is not None
+    assert n.sent
+
+
+@pytest.mark.asyncio
+async def test_an_announcement_is_consumed_not_reusable():
+    """A second disappearance must not ride on the first one's notice."""
+    r, c, _, n = _rig([_row("A", "No", 20.0), _row("B", "No", 5.0)], cash=50.0)
+    await r.check_once()
+    n.sent.clear()
+    r.note_redemption("A")
+    c.rows = []                      # BOTH vanished, only one was announced
+    c.cash = 75.0
+    report = await r.check_once()
+    assert report is not None, "the unannounced one must still be reported"
+    assert any("B" in k for k in report["moves"])

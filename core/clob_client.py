@@ -1694,6 +1694,29 @@ class PolyClient:
         # Floor to 2 d.p. — never round UP, or the sell exceeds the on-chain
         # balance ("not enough balance / allowance").
         sell_size = math.floor(size * 100) / 100.0
+
+        # And cap at what the wallet ACTUALLY holds. A guard's `matched` is
+        # assembled from order statuses and the trade feed, and on 2026-09-08 it
+        # read 10.30 while the chain held 10.00: the sell was rejected outright
+        # ("balance: 10000000, order amount: 10300000") and the position was
+        # left stranded, still sitting there a day later.
+        #
+        # This is the one question the chain answers better than any bookkeeping
+        # we can do — you cannot sell what you do not have — so ask it before
+        # sizing a sale. Note this is sizing, NOT fill attribution: a wallet
+        # balance is still the wrong number for deciding whether an order
+        # filled, which is why share_balance stays out of that path.
+        held = await self.share_balance(token_id)
+        if held is not None:
+            capped = math.floor(held * 100) / 100.0
+            if capped < sell_size - 1e-9:
+                logger.warning(
+                    "UNWIND | asked for %.2f but the wallet holds %.2f — "
+                    "selling what is there",
+                    sell_size, capped,
+                )
+                sell_size = capped
+
         if sell_size < 0.01:
             logger.warning("UNWIND skipped | size %.4f below minimum", size)
             return {"status": "error", "error": "size below minimum"}

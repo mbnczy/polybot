@@ -56,6 +56,8 @@ RECONCILE_POLL_S: float = float(os.environ.get("RECONCILE_POLL_S", 120.0))
 _SHARE_EPS: float = 0.01
 
 
+
+
 class WalletReconciler:
     """
     Periodically checks that on-chain inventory only moves when the bot thinks
@@ -76,9 +78,31 @@ class WalletReconciler:
         self._prev: dict[str, float] | None = None
         self._prev_cash: float | None = None
         self.unexplained_events: int = 0
+        # Settlements AutoRedeemer has announced but the snapshot has not yet
+        # seen. Consumed on match, so a second unexplained move still alerts.
+        self._redeemed: list[str] = []
         logger.info("WalletReconciler init | poll=%.0fs", self._poll)
 
     # ──────────────────────────────────────────────────────────────────────────
+
+    def note_redemption(self, title: str) -> None:
+        """
+        AutoRedeemer announcing a settlement it has just performed.
+
+        Titles are matched loosely because the reconciler keys positions by a
+        truncated title while the redeemer works in condition IDs; a prefix
+        match is enough to tell a settlement from a mystery.
+        """
+        self._redeemed.append(str(title)[:40])
+
+    def _claim_redemption(self, key: str) -> bool:
+        """Consume a pending announcement matching this position, if any."""
+        head = key.split("|")[0].strip()[:40]
+        for i, t in enumerate(self._redeemed):
+            if t and (t.startswith(head[:24]) or head.startswith(t[:24])):
+                del self._redeemed[i]
+                return True
+        return False
 
     async def _snapshot(self) -> "tuple[dict[str, float], float] | None":
         rows = await self._client.open_positions_detail()
@@ -144,6 +168,36 @@ class WalletReconciler:
         cash_delta = round(cash - (self._prev_cash or cash), 4)
         self._prev, self._prev_cash = held, cash
 
+        if not moves:
+            return None
+
+        # A resolution is not an escape. When a market settles, AutoRedeemer
+        # redeems the position: the shares go to zero and the cash rises. That
+        # is the system working, and on 2026-09-08 it was reported as a fault —
+        #
+        #   RECONCILE | inventory moved with NOTHING open — an order escaped
+        #   supervision | cash +20.2900 | Will Maura Sullivan ... |No -20.29
+        #
+        # A false alarm here is expensive in a way that is easy to miss: this is
+        # the only check that catches a real leak, and an alert that cries wolf
+        # stops being read.
+        #
+        # Redemptions are ANNOUNCED rather than inferred. Inferring them from
+        # the cash delta works only when nothing else happened in the window: a
+        # settlement of +20.29 alongside a purchase of -6.96 nets to +13.33 and
+        # matches neither, so the real escape and the expected settlement would
+        # both be misread. AutoRedeemer knows exactly what it redeemed.
+        for title in list(moves):
+            if moves[title] >= 0:
+                continue
+            if not self._claim_redemption(title):
+                continue
+            logger.info(
+                "WalletReconciler | %s settled and was redeemed "
+                "(%+.2f shares) — expected",
+                title, moves[title],
+            )
+            del moves[title]
         if not moves:
             return None
 
