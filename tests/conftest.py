@@ -162,3 +162,24 @@ def _isolate_daily_state(tmp_path, monkeypatch):
         cb, "_DAILY_STATE_PATH", str(tmp_path / "daily_state.json"), raising=False
     )
     yield
+
+
+@_pytest.fixture(autouse=True)
+def _isolate_fill_log(tmp_path, monkeypatch):
+    """
+    Never let a test write the live fill_log.jsonl.
+
+    Same failure as the daily-state one above, caught later: FILL_LOG_PATH
+    defaults to a RELATIVE "fill_log.jsonl", pytest runs from the repo root, so
+    every guard test appended to the production log. On 2026-09-09 that left 28
+    of its 95 rows carrying the fixture condition id "0xcond" — 29% of the
+    evidence for "why do maker legs not fill" was invented by the test suite.
+
+    Nothing here moves money, which is exactly why it went unnoticed: it
+    corrupts the measurement rather than the wallet.
+    """
+    import telemetry.fill_log as fl
+    monkeypatch.setenv("FILL_LOG_PATH", str(tmp_path / "fill_log.jsonl"))
+    monkeypatch.setattr(fl, "FILL_LOG_PATH", str(tmp_path / "fill_log.jsonl"),
+                        raising=False)
+    yield
