@@ -1316,9 +1316,29 @@ class NegRiskArbDetector:
         # Counters so the filter's effect is measurable rather than assumed.
         self.completable_checks  = 0
         self.completable_rejects = 0
+        # Where evaluation stops, so a silent pipeline can be diagnosed rather
+        # than guessed at. On 2026-09-09 this path produced 0 signals in 24
+        # hours with 11 groups registered and not one rejection logged at any
+        # stage — which told us nothing about whether ticks were arriving, legs
+        # were being dropped, or the edge simply never cleared.
+        self.stops: dict[str, int] = {}
         self._min_rel_edge     = min_relative_edge
         self._min_leg_shares   = min_leg_shares
         self._extreme_hi       = extreme_hi
+
+    def _stop(self, reason: str) -> None:
+        self.stops[reason] = self.stops.get(reason, 0) + 1
+
+    def stop_summary(self) -> str:
+        """One line naming where evaluation ended, commonest first."""
+        if not self.stops:
+            return "no evaluations"
+        total = sum(self.stops.values())
+        parts = ", ".join(
+            f"{k} {v} ({v / total * 100:.0f}%)"
+            for k, v in sorted(self.stops.items(), key=lambda kv: -kv[1])
+        )
+        return f"{total} evaluated | {parts}"
 
     def evaluate_neg_risk(
         self,
@@ -1378,6 +1398,7 @@ class NegRiskArbDetector:
                 "NegRiskArbDetector | token_ids length %d ≠ no_asks length %d",
                 n, len(no_asks),
             )
+            self._stop("token_ids_mismatch")
             return None
 
         if no_ask_sizes is not None and len(no_ask_sizes) != n:
@@ -1391,6 +1412,7 @@ class NegRiskArbDetector:
             logger.debug(
                 "NegRiskArbDetector | need ≥ 2 outcomes; got %d — skip", n
             )
+            self._stop("fewer_than_two_outcomes")
             return None
 
         # ── 2. Candidate legs — drop unusable quotes ──────────────────────────
@@ -1424,6 +1446,7 @@ class NegRiskArbDetector:
             candidates.append((token_id, ask, 1.0 - ask, depth, leg_bid, leg_tick))
 
         if len(candidates) < 2:
+            self._stop("under_two_usable_quotes")
             return None
 
         # ── 3. Near-resolved guard (paper §6) ─────────────────────────────────
@@ -1438,6 +1461,7 @@ class NegRiskArbDetector:
                 "— group effectively resolved, skip",
                 condition_id[:16], top_prob, self._extreme_hi,
             )
+            self._stop("group_resolved")
             return None
 
         # ── 4. Outcome selection (paper §6.2 + §5.1) ──────────────────────────
@@ -1449,6 +1473,7 @@ class NegRiskArbDetector:
                 "%.0f%% probability floor — skip",
                 condition_id[:16], len(selected), self._min_outcome_prob * 100,
             )
+            self._stop("below_probability_floor")
             return None
 
         selected.sort(key=lambda c: c[2], reverse=True)
@@ -1494,6 +1519,7 @@ class NegRiskArbDetector:
         relative_edge  = round(net_edge / payout, 6)
 
         if relative_edge <= self._net_margin:
+            self._stop("edge_below_margin")
             logger.debug(
                 "NegRiskArbDetector | no edge — legs=%d/%d combined=%.6f "
                 "payout=%.1f rebate=%.4f(%.2f%%) effective=%.6f "
@@ -1506,6 +1532,7 @@ class NegRiskArbDetector:
         # Paper §6: only opportunities worth ≥ $0.05 on the dollar are worth the
         # non-atomic multi-leg risk.
         if relative_edge < self._min_rel_edge:
+            self._stop("edge_below_floor")
             logger.debug(
                 "NegRiskArbDetector | condition=%s relative_edge=%.6f below the "
                 "%.4f on-the-dollar floor — skip",
@@ -1549,6 +1576,7 @@ class NegRiskArbDetector:
             self.completable_checks += 1
             if realistic_edge < self._min_completable_edge:
                 self.completable_rejects += 1
+                self._stop("not_completable")
                 logger.info(
                     "NegRiskArbDetector | condition=%s clears all-maker "
                     "(%.4f) but not at completion prices (%.4f < %.4f) — skip "
@@ -1590,6 +1618,7 @@ class NegRiskArbDetector:
         )
 
         spread_bps = round(relative_edge * 10_000, 1)
+        self._stop("SIGNAL")
         signal = NegRiskSignal(
             condition_id=condition_id,
             n_outcomes=m,

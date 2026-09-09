@@ -963,3 +963,62 @@ class TestUnwindNeverExceedsTheWallet:
         resp = await c.unwind_leg("T", 10.30, 0.0)
         assert c._sold == []
         assert resp["status"] == "error"
+
+
+class TestNegRiskStopInstrumentation:
+    """
+    On 2026-09-09 the NegRisk path produced 0 signals in 24 hours with 11 groups
+    registered and not one rejection logged at any stage. That said nothing
+    about WHY: ticks may not have arrived, legs may have been dropped, or the
+    edge may simply never have cleared. A silent pipeline is a diagnosis problem
+    before it is a tuning problem.
+    """
+
+    def _det(self, **kw):
+        from strategy.arbitrage import NegRiskArbDetector
+        return NegRiskArbDetector(
+            desired_net_margin=0.015, min_outcome_prob=0.02, max_legs=4,
+            default_rebate_rate=0.0, min_relative_edge=0.02, **kw
+        )
+
+    def _call(self, det, asks, **kw):
+        return det.evaluate_neg_risk(
+            condition_id="0xg",
+            outcome_token_ids=[f"T{i}" for i in range(len(asks))],
+            no_asks=asks, max_position_usdc=10.0, tick_size=0.01,
+            no_ask_sizes=[500.0] * len(asks), **kw
+        )
+
+    def test_a_single_outcome_is_recorded_as_such(self):
+        det = self._det()
+        self._call(det, [0.50])
+        assert det.stops.get("fewer_than_two_outcomes") == 1
+
+    def test_a_resolved_group_is_named(self):
+        det = self._det()
+        self._call(det, [0.995, 0.99])      # one outcome effectively certain
+        assert "group_resolved" in det.stops or "under_two_usable_quotes" in det.stops
+
+    def test_an_edge_that_misses_the_floor_is_named(self):
+        det = self._det()
+        # two legs summing to nearly the payout: real quotes, no edge
+        self._call(det, [0.60, 0.60])
+        assert any(k.startswith("edge_below") for k in det.stops), det.stops
+
+    def test_a_successful_signal_is_counted_too(self):
+        """Without the success arm the summary cannot show a conversion rate."""
+        det = self._det()
+        self._call(det, [0.30, 0.30, 0.30])
+        assert det.stops.get("SIGNAL") == 1, det.stops
+
+    def test_summary_names_the_commonest_stop_first(self):
+        det = self._det()
+        for _ in range(3):
+            self._call(det, [0.50])
+        self._call(det, [0.30, 0.30, 0.30])
+        text = det.stop_summary()
+        assert "4 evaluated" in text
+        assert text.index("fewer_than_two_outcomes") < text.index("SIGNAL")
+
+    def test_summary_is_harmless_before_anything_runs(self):
+        assert self._det().stop_summary() == "no evaluations"

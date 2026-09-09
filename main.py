@@ -853,6 +853,7 @@ async def heartbeat_loop(
     feed_registry: FeedRegistry,
     client:        "PolyClient | None"   = None,
     detector:      "ArbDetector | None"  = None,
+    neg_risk_det:  "NegRiskArbDetector | None" = None,
 ) -> None:
     """
     Refresh metrics every HEARTBEAT_INTERVAL (60 s) and send a Telegram health
@@ -871,6 +872,13 @@ async def heartbeat_loop(
             await asyncio.sleep(HEARTBEAT_INTERVAL)
             status = breaker.status_dict()
             logger.info("Heartbeat | %s", status)
+
+            # Where NegRisk evaluation stops. A silent pipeline is a diagnosis
+            # problem before it is a tuning problem: on 2026-09-09 this path
+            # produced 0 signals in 24 hours with 11 groups registered and not
+            # one rejection logged anywhere, which said nothing about why.
+            if neg_risk_det is not None and neg_risk_det.stops:
+                logger.info("NegRisk stops | %s", neg_risk_det.stop_summary())
 
             now = time.monotonic()
             if (
@@ -1236,7 +1244,8 @@ async def main() -> None:
         asyncio.create_task(pair_guard.run(),                                  name="pair_guard"),
         *([asyncio.create_task(negrisk_guard.run(), name="negrisk_guard")]
           if negrisk_guard is not None else []),
-        asyncio.create_task(heartbeat_loop(breaker, notifier, feed_registry, client, detector), name="heartbeat"),
+        asyncio.create_task(heartbeat_loop(breaker, notifier, feed_registry, client, detector,
+                                           neg_risk_det=neg_risk_det), name="heartbeat"),
         asyncio.create_task(telegram_loop(notifier),                           name="telegram"),
         asyncio.create_task(sig_logger.run(),                                  name="sig_logger"),
         asyncio.create_task(metrics_server(),                                  name="metrics"),
