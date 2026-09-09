@@ -195,9 +195,21 @@ def discover(markets: list[dict], args) -> list:
     if not cands:
         return []
     print(f"  classifying on {provider.name}/{model}…")
-    rels = im.classify_candidates(
-        cands, provider=provider, model=model, concurrency=args.concurrency,
-    )
+    # Build the client here and close it here. Left to classify_candidates it
+    # would make a fresh one per discovery round, each with its own connection
+    # pool that nobody closes: 12 hours of running left 30 sockets to the model
+    # endpoint in CLOSE-WAIT. The reader's file-descriptor limit is 1024, so a
+    # long-lived process eventually runs out.
+    client = im.build_client(provider)
+    try:
+        rels = im.classify_candidates(
+            cands, provider=provider, model=model, client=client,
+            concurrency=args.concurrency,
+        )
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
     strong = [r for r in rels if r.confidence >= args.threshold]
     print(f"    {len(rels)} asserted · {len(strong)} at/above {args.threshold}")
     return strong
