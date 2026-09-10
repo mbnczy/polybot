@@ -253,6 +253,106 @@ def maker_quote_is_hopeless(
     return queue_ahead > limit * max(our_size, 1e-9)
 
 
+# Below this, the maker path is not worth its non-fill risk: resting saves too
+# little per share to justify the chance of ending up naked on the legs that DID
+# fill. Expressed as a fraction of the ask, because ticks are not comparable —
+# half the live universe trades on a 0.001 grid where one tick is 0.1%, and the
+# other half on 0.01 where it is ten times that. A filter written in ticks means
+# two different things depending on which market it lands on.
+MAKER_MIN_SAVING_FRAC: float = float(
+    os.environ.get("MAKER_MIN_SAVING_FRAC", 0.004)
+)
+
+# Cross the legs that cannot fill as makers at submission, instead of resting
+# them and waiting for the guard to cross them later. OFF by default: it moves
+# risk rather than removing it (see plan_bundle_execution), and the fill log
+# has to show that the reachability call is accurate before it is worth taking.
+NEGRISK_EARLY_CROSS: bool = os.environ.get(
+    "NEGRISK_EARLY_CROSS", "false"
+).strip().lower() in ("1", "true", "yes", "on")
+
+
+def spread_fraction(ask: float, bid: "float | None") -> "float | None":
+    """
+    Spread as a fraction of the ask, or None when the book is one-sided.
+
+    Tick counts do not compare across the universe: a two-tick spread is 0.2%
+    on the 0.001 grid and 2% on the 0.01 grid, and half of live markets are on
+    each. Anything that ranks or filters on "wide spread" has to say wide in
+    price.
+    """
+    if bid is None or bid <= 0.0 or ask <= 0.0:
+        return None
+    return (ask - bid) / ask
+
+
+def maker_saving(ask: float, quote: float, rate: "float | None" = None) -> float:
+    """
+    What resting at `quote` saves per share against crossing at `ask`.
+
+    Two components, and the smaller one is the spread: not paying the taker fee
+    is worth rate x p x (1-p), up to 1.25% at p=0.5 on a 5% market, while one
+    tick of spread on the fine grid is 0.1%. So on a thin book the fee is nearly
+    the whole reason to rest — which is why this is measured in money rather
+    than in ticks.
+    """
+    if ask <= 0.0:
+        return 0.0
+    return (ask - quote) + ask * effective_taker_fee(ask, rate)
+
+
+def plan_bundle_execution(
+    legs,
+    *,
+    early_cross: "bool | None" = None,
+    min_saving_frac: "float | None" = None,
+) -> "tuple[list, list]":
+    """
+    Split a bundle's legs into (rest as maker, cross as taker now).
+
+    A leg is crossed at submission when resting it cannot work — the quote joins
+    a queue far deeper than our order — or when resting saves too little per
+    share to be worth the chance of not filling.
+
+    The safety rule is the important part. Crossing early does not remove
+    execution risk, it MOVES it: the crossed leg is certainly owned, so if the
+    resting legs then fail the bundle is naked on what we bought, which is the
+    -0.20 USDC unwind we already pay for. It is only an improvement when the
+    remaining legs are ones we expect to fill. So if ANY leg we would rest is
+    itself unreachable, nothing is crossed early and the whole bundle rests as
+    before, leaving the guard's completion path to resolve it.
+
+    Off by default. It is a real change in where risk sits, and the fill log
+    has to show the reachability call is accurate before it earns being on.
+    """
+    on = NEGRISK_EARLY_CROSS if early_cross is None else early_cross
+    floor = MAKER_MIN_SAVING_FRAC if min_saving_frac is None else min_saving_frac
+    if not on or not legs:
+        return list(legs), []
+
+    def _worth_resting(leg) -> bool:
+        if not getattr(leg, "reachable", True):
+            return False
+        ask = float(getattr(leg, "no_ask", 0.0) or 0.0)
+        if ask <= 0.0:
+            return True
+        return maker_saving(ask, float(leg.no_bid)) >= floor * ask
+
+    rest = [l for l in legs if _worth_resting(l)]
+    cross = [l for l in legs if l not in rest]
+    if not cross:
+        return rest, []
+    # Every leg left resting must be one we expect to fill, or crossing now
+    # just builds a naked position more cheaply.
+    if any(not getattr(l, "reachable", True) for l in rest):
+        return list(legs), []
+    if not rest:
+        # Nothing can rest — the bundle is a taker play in full, and that is a
+        # decision for the edge test, not for this split.
+        return list(legs), []
+    return rest, cross
+
+
 def quote_opens_new_level(quote: float, bid: "float | None", tick: float) -> bool:
     """
     True when a post-only quote at `quote` creates its own price level.
