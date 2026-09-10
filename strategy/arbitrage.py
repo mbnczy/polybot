@@ -211,6 +211,39 @@ MAKER_MAX_QUEUE_MULTIPLE: float = float(
 )
 
 
+# A queue this many times our own order will not drain inside a bundle's TTL.
+# Deliberately far above MAKER_MAX_QUEUE_MULTIPLE: that one decides whether a
+# quote is worth placing, this one decides whether to stop waiting on an order
+# already placed, and giving up early on a stale reading forfeits a real fill.
+# A 250-share queue can clear in a minute; 10,558 cannot.
+MAKER_HOPELESS_QUEUE_MULTIPLE: float = float(
+    os.environ.get("MAKER_HOPELESS_QUEUE_MULTIPLE", 100.0)
+)
+
+
+def maker_quote_is_hopeless(
+    queue_ahead: "float | None",
+    our_size:    float,
+    *,
+    leads:        bool = False,
+    max_multiple: "float | None" = None,
+) -> bool:
+    """
+    Is this quote so far back that waiting out the timer cannot help?
+
+    Only ever true on a KNOWN, very deep queue. `reachable` is a judgement made
+    before placing an order; this is a judgement about an order already resting,
+    where being wrong costs a fill that would have happened. So it demands a
+    measured queue (never None), and a much larger one.
+    """
+    if leads or queue_ahead is None:
+        return False
+    limit = MAKER_HOPELESS_QUEUE_MULTIPLE if max_multiple is None else max_multiple
+    if limit <= 0:
+        return False
+    return queue_ahead > limit * max(our_size, 1e-9)
+
+
 def quote_opens_new_level(quote: float, bid: "float | None", tick: float) -> bool:
     """
     True when a post-only quote at `quote` creates its own price level.

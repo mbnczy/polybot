@@ -259,3 +259,151 @@ class TestGuardPassesTheBookThrough:
         leg = _BundleLegState(0, "tok", "oid", 0.85, 10.0)
         assert leg.queue_ahead is None
         assert leg.reachable is True
+
+
+# ── the timers ───────────────────────────────────────────────────────────────
+
+class TestHopelessThreshold:
+    """
+    `reachable` is a judgement made BEFORE placing an order; `hopeless` is a
+    judgement about one already resting, where being wrong forfeits a fill that
+    would have happened. So it is deliberately far stricter, and it refuses to
+    act on a reading it does not have.
+    """
+
+    def test_the_median_one_tick_queue_is_hopeless(self):
+        from strategy.arbitrage import maker_quote_is_hopeless
+        assert maker_quote_is_hopeless(10_558, 10) is True
+
+    def test_a_queue_that_could_drain_is_not(self):
+        """250 shares can clear inside a 45-second TTL. 10,558 cannot."""
+        from strategy.arbitrage import maker_quote_is_hopeless
+        assert maker_quote_is_hopeless(250, 10) is False
+
+    def test_it_is_stricter_than_reachability(self):
+        """
+        A leg can be not-worth-placing and still worth waiting on once placed.
+        Collapsing the two thresholds would cancel orders that fill.
+        """
+        from strategy.arbitrage import maker_quote_is_hopeless
+        assert maker_quote_is_reachable(0.85, 0.85, 0.01, 500, 10) is False
+        assert maker_quote_is_hopeless(500, 10) is False
+
+    def test_an_unmeasured_queue_never_cuts_a_wait_short(self):
+        from strategy.arbitrage import maker_quote_is_hopeless
+        assert maker_quote_is_hopeless(None, 10) is False
+
+    def test_a_leg_leading_the_book_is_never_hopeless(self):
+        """It is alone at its own price; there is no queue to clear."""
+        from strategy.arbitrage import maker_quote_is_hopeless
+        assert maker_quote_is_hopeless(999_999, 10, leads=True) is False
+
+
+@pytest.mark.asyncio
+class TestGuardStopsWaitingOnQueuesThatCannotDrain:
+    """
+    The TTL and the imbalance clock exist to give a maker quote its chance.
+    Where the book says there is no chance, waiting only delays the outcome —
+    and on an exposed bundle every second of delay is a second the price can
+    move against legs we already own.
+    """
+
+    def _sig(self, queue, size=10.0, n_legs=3):
+        from strategy.arbitrage import ArbLeg, NegRiskSignal
+        legs = tuple(
+            ArbLeg(token_id=f"T{i}", no_ask=0.31, no_bid=0.30, size=size,
+                   book_bid=0.30, queue_ahead=queue, tick=0.01,
+                   leads=False, reachable=False)
+            for i in range(n_legs)
+        )
+        combined, payout = 0.30 * n_legs, float(n_legs - 1)
+        return NegRiskSignal(
+            condition_id="0xgroup", n_outcomes=n_legs, legs=legs,
+            combined_bid=combined, payout=payout, maker_rebate=0.0,
+            effective_cost=combined, net_edge=payout - combined,
+            relative_edge=(payout - combined) / payout, n_bundles=size,
+        )
+
+    async def test_an_untouched_bundle_is_released_before_its_ttl(self):
+        from tests.test_negrisk_pipeline import (
+            _acks, _StubBreaker, _StubClient, _StubNotifier,
+        )
+        from execution.negrisk_guard import NegRiskBundleGuard
+
+        client = _StubClient({f"o{i}": {"status": "live", "size_matched": 0.0}
+                              for i in range(3)})
+        guard = NegRiskBundleGuard(client, _StubBreaker(), _StubNotifier(),
+                                   order_ttl=45.0)
+        guard.watch_bundle(self._sig(queue=10_558), _acks())
+        await guard.poll_once()
+
+        # Without the queue reading this bundle would hold its market lock and
+        # its capital for the full 45 seconds.
+        assert guard.watched_count == 0
+        assert sorted(client.cancelled) == ["o0", "o1", "o2"]
+
+    async def test_a_drainable_queue_still_gets_its_full_ttl(self):
+        from tests.test_negrisk_pipeline import (
+            _acks, _StubBreaker, _StubClient, _StubNotifier,
+        )
+        from execution.negrisk_guard import NegRiskBundleGuard
+
+        client = _StubClient({f"o{i}": {"status": "live", "size_matched": 0.0}
+                              for i in range(3)})
+        guard = NegRiskBundleGuard(client, _StubBreaker(), _StubNotifier(),
+                                   order_ttl=45.0)
+        guard.watch_bundle(self._sig(queue=250), _acks())
+        await guard.poll_once()
+
+        assert guard.watched_count == 1, "250 shares can clear — keep waiting"
+
+    async def test_an_unmeasured_queue_still_gets_its_full_ttl(self):
+        """A batched price_change states a price without its depth. Missing
+        data must never be read as a verdict."""
+        from tests.test_negrisk_pipeline import (
+            _acks, _StubBreaker, _StubClient, _StubNotifier,
+        )
+        from execution.negrisk_guard import NegRiskBundleGuard
+
+        client = _StubClient({f"o{i}": {"status": "live", "size_matched": 0.0}
+                              for i in range(3)})
+        guard = NegRiskBundleGuard(client, _StubBreaker(), _StubNotifier(),
+                                   order_ttl=45.0)
+        guard.watch_bundle(self._sig(queue=None), _acks())
+        await guard.poll_once()
+
+        assert guard.watched_count == 1
+
+    async def test_one_drainable_leg_holds_the_whole_bundle(self):
+        """
+        The early exit requires EVERY open leg to be stuck. One leg that can
+        still fill is a reason to wait — completing early would cross a leg the
+        book was about to give us for free.
+        """
+        from strategy.arbitrage import ArbLeg, NegRiskSignal
+        from tests.test_negrisk_pipeline import (
+            _acks, _StubBreaker, _StubClient, _StubNotifier,
+        )
+        from execution.negrisk_guard import NegRiskBundleGuard
+
+        queues = [10_558, 10_558, 120]         # the third can clear
+        legs = tuple(
+            ArbLeg(token_id=f"T{i}", no_ask=0.31, no_bid=0.30, size=10.0,
+                   book_bid=0.30, queue_ahead=q, tick=0.01,
+                   leads=False, reachable=False)
+            for i, q in enumerate(queues)
+        )
+        sig = NegRiskSignal(
+            condition_id="0xgroup", n_outcomes=3, legs=legs,
+            combined_bid=0.90, payout=2.0, maker_rebate=0.0,
+            effective_cost=0.90, net_edge=1.10,
+            relative_edge=0.55, n_bundles=10.0,
+        )
+        client = _StubClient({f"o{i}": {"status": "live", "size_matched": 0.0}
+                              for i in range(3)})
+        guard = NegRiskBundleGuard(client, _StubBreaker(), _StubNotifier(),
+                                   order_ttl=45.0)
+        guard.watch_bundle(sig, _acks())
+        await guard.poll_once()
+
+        assert guard.watched_count == 1
