@@ -42,6 +42,7 @@ from strategy.arbitrage import (  # noqa: E402
     lead_book_bid,
     maker_quote_is_reachable,
     quote_opens_new_level,
+    spread_fraction,
 )
 
 GAMMA = "https://gamma-api.polymarket.com/markets"
@@ -145,15 +146,28 @@ def main() -> int:
             print(f"    p{pct:<3}{v:>12,.0f} shares  ({v / a.size:>9,.0f}x our order)")
         print(f"    median {st.median(one):,.0f}")
 
+    # Ticks do not compare across the universe. Half of live markets trade on a
+    # 0.001 grid where one tick is 0.1%, the other half on 0.01 where it is ten
+    # times that — so ten ticks on the fine grid is a THINNER spread than one
+    # tick on the coarse. Ranking "wide spread" targets in ticks picks the wrong
+    # markets.
+    print("\n  SPREAD IN PRICE, not ticks")
+    fr = sorted(
+        (spread_fraction(b["ask"], b["bid"]) or 0.0) for b in books)
+    for pct in (50, 75, 90, 99):
+        v = fr[min(int(len(fr) * pct / 100), len(fr) - 1)]
+        print(f"    p{pct:<3}{v * 100:>8.2f}%")
+
     print("\n  BEST MAKER TARGETS — reachable, busiest first")
     tgt = sorted((b for b in books if b["ok"]), key=lambda b: -b["vol"])[:10]
     if not tgt:
         print("    none — every book in this sample is behind a wall")
     for b in tgt:
         kind = "new level" if b["leads"] else "thin queue"
+        frac = (spread_fraction(b["ask"], b["bid"]) or 0.0) * 100
         print(f"    {b['q']:<44} quote {b['quote']:.3f}  "
-              f"{round((b['ask'] - b['bid']) / b['tick']):>2}t  "
-              f"queue {b['queue']:>8,.0f}  {kind}")
+              f"{round((b['ask'] - b['bid']) / b['tick']):>2}t "
+              f"({frac:>4.1f}%)  queue {b['queue']:>8,.0f}  {kind}")
     print()
     return 0
 

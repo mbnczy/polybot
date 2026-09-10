@@ -407,3 +407,47 @@ class TestGuardStopsWaitingOnQueuesThatCannotDrain:
         await guard.poll_once()
 
         assert guard.watched_count == 1
+
+
+# ── the pair path, which had none of this ────────────────────────────────────
+
+class TestPairGuardCarriesTheBookToo:
+    """
+    The NegRisk path learned to carry book state; the binary pair path was left
+    without it. Two of the fill log's 67 real rows are pair legs and both record
+    null for tick, best_bid and best_ask — so that half of the strategy could
+    say a leg missed but never why.
+    """
+
+    def _leg(self, **kw):
+        from execution.pair_guard import MakerPairGuard
+        return MakerPairGuard._leg_from_resp(
+            "YES", "tok", 0.49, 10.0, {"status": "live", "order_id": "o1"}, **kw)
+
+    def test_the_queue_survives_into_the_leg(self):
+        leg = self._leg(book_bid=0.49, book_ask=0.50, tick=0.01,
+                        queue_ahead=10_558)
+        assert leg.queue_ahead == 10_558
+        assert leg.book_ask == 0.50
+
+    def test_joining_the_touch_is_recorded_as_not_leading(self):
+        """Quote 0.49 against a best bid of 0.49 — the back of the queue."""
+        leg = self._leg(book_bid=0.49, book_ask=0.50, tick=0.01, queue_ahead=90)
+        assert leg.leads is False
+
+    def test_opening_a_level_is_recorded_as_leading(self):
+        leg = self._leg(book_bid=0.45, book_ask=0.52, tick=0.01, queue_ahead=90)
+        assert leg.leads is True
+
+    def test_a_leg_filled_at_ack_still_carries_its_book(self):
+        """The early-return path is easy to leave behind when adding fields."""
+        from execution.pair_guard import MakerPairGuard
+        leg = MakerPairGuard._leg_from_resp(
+            "NO", "tok", 0.49, 10.0, {"status": "matched", "order_id": "o1"},
+            book_bid=0.49, book_ask=0.50, tick=0.01, queue_ahead=7_000)
+        assert leg.open is False and leg.matched == 10.0
+        assert leg.queue_ahead == 7_000
+
+    def test_no_book_data_leaves_the_old_behaviour_intact(self):
+        leg = self._leg()
+        assert leg.queue_ahead is None and leg.book_bid is None

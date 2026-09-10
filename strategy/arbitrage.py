@@ -1656,6 +1656,7 @@ class NegRiskArbDetector:
         min_leg_shares:      float = NEGRISK_MIN_LEG_SHARES,
         extreme_hi:          float = EXTREME_PRICE_HI,
         subset_search:       bool  = NEGRISK_SUBSET_SEARCH,
+        early_rest_p:        "float | None" = None,
     ) -> None:
         if not (0.0 < desired_net_margin < 1.0):
             raise ValueError(
@@ -1678,6 +1679,14 @@ class NegRiskArbDetector:
         self._min_outcome_prob = min_outcome_prob
         self._max_legs         = max_legs
         self._subset_search    = bool(subset_search)
+        # Completion rate used to price bidding above the cheapest leading
+        # quote. Held on the detector rather than read from the module at call
+        # time, so a caller can supply a measured value — and so the feature
+        # cannot be half-enabled, with the flag on and the rate still absent.
+        self._early_rest_p     = (
+            NEGRISK_EARLY_REST_P if early_rest_p is None else early_rest_p
+        )
+        self._early_rest       = self._early_rest_p is not None
         self._require_completable  = NEGRISK_REQUIRE_COMPLETABLE
         self._min_completable_edge = NEGRISK_MIN_COMPLETABLE_EDGE
         # Counters so the filter's effect is measurable rather than assumed.
@@ -1706,6 +1715,55 @@ class NegRiskArbDetector:
             for k, v in sorted(self.stops.items(), key=lambda kv: -kv[1])
         )
         return f"{total} evaluated | {parts}"
+
+    def _early_rest_quotes(
+        self,
+        combo,
+        group_tick: "float | None",
+    ) -> "list[float | None]":
+        """
+        Per leg, the price to rest at when the arbitrage does not exist yet.
+
+        The shape that makes this safe is one leg at a time. Resting the whole
+        bundle speculatively means every leg is exposed; resting ONE at a price
+        that already pays means: if it fills, cross the others at today's asks
+        and the bundle still clears. The only thing that can go wrong is the
+        other legs moving between our fill and our crossing, which is a much
+        smaller window than waiting for k legs to fill independently.
+
+        So leg i may rest at (k-1) minus what crossing everything else costs,
+        minus the edge we insist on keeping. Returns None for a leg where no
+        such price exists — either it is below the resting best bid, where we
+        would join a queue and gain nothing, or above the ask, where it is not
+        a maker order at all.
+        """
+        k = len(combo)
+        realistic = [
+            ask * (1.0 + effective_taker_fee(ask))
+            for _tid, ask, _p, _d, _b, _t, _q in combo
+        ]
+        out: "list[float | None]" = []
+        for i, (_tid, ask, _p, _d, bid, tick, _q) in enumerate(combo):
+            t = tick if tick is not None else (group_tick or DEFAULT_TICK_SIZE)
+            others = sum(realistic) - realistic[i]
+            # Reserve whichever floor is higher. Bidding up to the relative-edge
+            # floor alone left bundles a fraction under section 7b's separate
+            # completable floor, so the raised quote was computed and then the
+            # bundle refused — the feature defeating itself one step later.
+            reserve = max(
+                self._min_rel_edge * float(k - 1),
+                self._min_completable_edge,
+            )
+            limit = arb_limit_price(others, k, reserve)
+            limit = math.floor(limit / t) * t          # onto this leg's grid
+            limit = round(limit, 6)
+            if limit <= 0.0 or limit >= ask:
+                out.append(None)                        # not a maker price
+            elif not quote_opens_new_level(limit, bid, t):
+                out.append(None)                        # would join a queue
+            else:
+                out.append(limit)
+        return out
 
     def _subset_return(self, combo, group_tick: "float | None") -> float:
         """
@@ -1949,6 +2007,53 @@ class NegRiskArbDetector:
             lead_book_bid(ask, bid, t)
             for ask, bid, t in zip(sel_asks, sel_bids, sel_ticks)
         ]
+
+        # ── 5b. Bid as high as profitability allows ───────────────────────────
+        # lead_book_bid returns the CHEAPEST price that leads the book, on the
+        # reasoning that the extra ticks up to the ask "buy no position, only
+        # cost". That is true of queue position and false of fill probability.
+        # A bid at 0.51 on a 0.50/0.70 book is hit only by a seller willing to
+        # take 0.51; a bid at 0.69 is hit by every seller willing to take 0.69
+        # or less. Same queue — alone at its own level either way — but far more
+        # of the flow reaches it.
+        #
+        # So where a leg can rest higher and the bundle still clears (cross
+        # everything else at today's asks and keep the edge floor), rest higher.
+        # This is what early positioning actually amounts to on this exchange:
+        # not jumping a queue, which the tick grid forbids, but standing where
+        # the selling flow arrives while the arbitrage is still absent.
+        #
+        # Note what this cannot do. On a one-tick book the limit price is below
+        # the touch by construction — it has to sit under the ask, and the only
+        # price under the ask IS the best bid — so the quote would join a queue
+        # and is refused. 79% of live markets are in that state, and no amount
+        # of prediction changes it.
+        #
+        # Off unless a completion rate has been measured: see should_rest_early.
+        early_rested = 0
+        if self._early_rest:
+            limits = self._early_rest_quotes(selected, tick_size)
+            for i, limit in enumerate(limits):
+                if limit is None or limit <= no_bids[i]:
+                    continue        # never bid less than we already would
+                edge_at_limit = float(m - 1) - (
+                    sum(a * (1.0 + effective_taker_fee(a)) for a in sel_asks)
+                    - sel_asks[i] * (1.0 + effective_taker_fee(sel_asks[i]))
+                    + limit
+                )
+                if not should_rest_early(edge_at_limit, self._early_rest_p):
+                    continue
+                logger.info(
+                    "NegRiskArbDetector | %s leg %d bidding %.4f instead of "
+                    "%.4f — same queue position, more of the selling flow, "
+                    "still pays %.4f/bundle (needs %.0f%% completion to break "
+                    "even; assuming %.0f%%)",
+                    condition_id[:16], i, limit, no_bids[i], edge_at_limit,
+                    break_even_completion_rate(edge_at_limit) * 100.0,
+                    (self._early_rest_p or 0.0) * 100.0,
+                )
+                no_bids[i] = limit
+                early_rested += 1
 
         # ── 6. Resolve maker rebate ───────────────────────────────────────────
         rebate = (

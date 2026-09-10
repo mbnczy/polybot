@@ -360,7 +360,16 @@ async def strategy_loop(
                     # HEDGE_TIMEOUT_S — the strategy loop must NOT release or
                     # unwind here, or a later lone fill would go unnoticed.
                     notifier.arb_execution_started(condition_id)
-                    pair_guard.watch_pair(arb_signal, n_shares, yes_resp, no_resp)
+                    pair_guard.watch_pair(
+                        arb_signal, n_shares, yes_resp, no_resp,
+                        book={
+                            "yes_best_bid": tick.get("yes_best_bid"),
+                            "no_best_bid":  tick.get("no_best_bid"),
+                            "yes_bid_size": tick.get("yes_bid_size"),
+                            "no_bid_size":  tick.get("no_bid_size"),
+                            "tick_size":    tick.get("tick_size"),
+                        },
+                    )
                     logger.info(
                         "Maker orders resting for %s (%s) — PairGuard watching.",
                         condition_id[:16], fill_state,

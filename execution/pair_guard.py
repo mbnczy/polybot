@@ -60,7 +60,11 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from risk.circuit_breaker import CircuitBreakerTripped
-from strategy.arbitrage import DEFAULT_TAKER_FEE
+from strategy.arbitrage import (
+    DEFAULT_TAKER_FEE,
+    DEFAULT_TICK_SIZE,
+    quote_opens_new_level,
+)
 from telemetry import fill_log
 from telemetry.metrics import ARB_HALF_FILLS, ARB_UNWIND_FAILURES
 
@@ -106,6 +110,16 @@ class _Leg:
     # monotonic clock at submission — an order cannot be judged before the
     # exchange has had time to index it.
     placed_at:        float = field(default_factory=time.monotonic)
+
+    # ── Book state at quote time ──────────────────────────────────────────────
+    # The NegRisk path learned to carry this; the pair path was left without it,
+    # so the fill log could record that a leg missed but never why. Two of its
+    # 67 real rows are pair legs and both say null.
+    book_bid:    "float | None" = None
+    book_ask:    "float | None" = None
+    tick:        "float | None" = None
+    queue_ahead: "float | None" = None
+    leads:       bool = False
 
     @property
     def fully_matched(self) -> bool:
@@ -184,6 +198,7 @@ class MakerPairGuard:
         n_shares: float,
         yes_resp: dict | None,
         no_resp:  dict | None,
+        book:     "dict | None" = None,
     ) -> None:
         """
         Start watching a maker pair whose legs were NOT both confirmed filled
@@ -192,10 +207,19 @@ class MakerPairGuard:
         The caller must NOT release the circuit-breaker reservation — the guard
         owns it from this point (on_fill / release_open at finalisation).
         """
+        b = book or {}
         yes = self._leg_from_resp("YES", signal.yes_token_id, signal.yes_bid,
-                                  n_shares, yes_resp)
+                                  n_shares, yes_resp,
+                                  book_bid=b.get("yes_best_bid"),
+                                  book_ask=signal.yes_ask,
+                                  tick=b.get("tick_size"),
+                                  queue_ahead=b.get("yes_bid_size"))
         no  = self._leg_from_resp("NO",  signal.no_token_id,  signal.no_bid,
-                                  n_shares, no_resp)
+                                  n_shares, no_resp,
+                                  book_bid=b.get("no_best_bid"),
+                                  book_ask=signal.no_ask,
+                                  tick=b.get("tick_size"),
+                                  queue_ahead=b.get("no_bid_size"))
         # Unique key: NEVER key by condition_id alone — a second watch on the
         # same market would silently overwrite (and orphan) the first pair.
         pair_id = f"{signal.condition_id[:16]}-{time.monotonic_ns()}"
@@ -218,16 +242,27 @@ class MakerPairGuard:
 
     @staticmethod
     def _leg_from_resp(
-        label: str, token_id: str, bid: float, size: float, resp: dict | None
+        label: str, token_id: str, bid: float, size: float, resp: dict | None,
+        *,
+        book_bid:    "float | None" = None,
+        book_ask:    "float | None" = None,
+        tick:        "float | None" = None,
+        queue_ahead: "float | None" = None,
     ) -> _Leg:
         """Seed a leg's state from the submission-ack response."""
         order_id = str((resp or {}).get("order_id") or (resp or {}).get("orderID") or "")
         status   = str((resp or {}).get("status", "")).strip().lower()
+        t = tick if (tick and tick > 0) else DEFAULT_TICK_SIZE
+        extra = dict(
+            book_bid=book_bid, book_ask=book_ask, tick=tick,
+            queue_ahead=queue_ahead,
+            leads=quote_opens_new_level(bid, book_bid, t),
+        )
         if status in _FILLED_STATUSES:
             # Leg crossed at submission (rare for post-only bids, but possible).
             return _Leg(label, token_id, order_id, bid, size,
-                        matched=size, open=False)
-        return _Leg(label, token_id, order_id, bid, size)
+                        matched=size, open=False, **extra)
+        return _Leg(label, token_id, order_id, bid, size, **extra)
 
     @property
     def watched_count(self) -> int:
@@ -476,6 +511,8 @@ class MakerPairGuard:
                          "cancelled" if leg.cancel_requested else "expired"),
                 price=leg.bid, size=leg.size, matched=leg.matched,
                 rested_s=rested,
+                tick=leg.tick, best_bid=leg.book_bid, best_ask=leg.book_ask,
+                queue_ahead=leg.queue_ahead,
             )
 
         # Make sure nothing is left resting on the book.

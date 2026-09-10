@@ -228,6 +228,12 @@ class _MarketState:
         self._best_bid: dict[str, Optional[float]] = {
             yes_token_id: None, no_token_id: None,
         }
+        # Shares resting at the best bid — the queue our post-only quote joins.
+        # The group feed learned to keep this; the binary path was left without
+        # it, so half the fill log could say a leg missed but not why.
+        self._bid_size: dict[str, Optional[float]] = {
+            yes_token_id: None, no_token_id: None,
+        }
         self._tick_size: dict[str, Optional[float]] = {
             yes_token_id: None, no_token_id: None,
         }
@@ -240,6 +246,7 @@ class _MarketState:
         """Invalidate best-asks (called on reconnect → await fresh snapshot)."""
         self._best_ask = {self.yes_token_id: None, self.no_token_id: None}
         self._best_bid = {self.yes_token_id: None, self.no_token_id: None}
+        self._bid_size = {self.yes_token_id: None, self.no_token_id: None}
         self._last_pushed = (None, None)
 
     def idle_seconds(self, now: Optional[float] = None) -> float:
@@ -268,17 +275,12 @@ class _MarketState:
             except (TypeError, ValueError):
                 pass
 
-        # Best bid from the snapshot. Explicit max rather than bids[0] so it is
-        # correct whichever way the exchange orders the array.
-        bids = event.get("bids", [])
-        if bids:
-            try:
-                _p = [float(e["price"] if isinstance(e, dict) else e) for e in bids]
-                _p = [x for x in _p if x > 0.0]
-                if _p:
-                    self._best_bid[asset_id] = max(_p)
-            except (KeyError, TypeError, ValueError):
-                pass
+        # Best bid AND the size resting there, via the same reader the group
+        # feed uses — the exchange sends bids ascending, so bids[0] is the worst.
+        bid_level = _best_bid_level(event.get("bids", []))
+        if bid_level is not None:
+            self._best_bid[asset_id] = bid_level[0]
+            self._bid_size[asset_id] = bid_level[1]
 
         best = _best_ask_level(event.get("asks", []))
         if best is None:
@@ -297,6 +299,10 @@ class _MarketState:
         _bb = event.get("best_bid")
         if _bb is not None:
             try:
+                if float(_bb) != self._best_bid[asset_id]:
+                    # A stated price carries no depth. None = unknown, which is
+                    # not the same as an empty level.
+                    self._bid_size[asset_id] = None
                 self._best_bid[asset_id] = float(_bb)
             except (TypeError, ValueError):
                 pass
@@ -377,6 +383,8 @@ class _MarketState:
             "no_ask":       no_ask,
             "yes_best_bid": self._best_bid.get(self.yes_token_id),
             "no_best_bid":  self._best_bid.get(self.no_token_id),
+            "yes_bid_size": self._bid_size.get(self.yes_token_id),
+            "no_bid_size":  self._bid_size.get(self.no_token_id),
             "tick_size":    max(_ticks) if _ticks else None,
             "ts":           now,
         }
