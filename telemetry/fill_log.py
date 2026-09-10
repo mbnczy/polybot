@@ -50,6 +50,7 @@ def record(
     condition_id: str = "",
     queue_ahead: float | None = None,
     reachable:   bool | None = None,
+    expected_fill_s: float | None = None,
 ) -> None:
     """
     Record one maker leg's outcome. Never raises: a telemetry failure must not
@@ -90,6 +91,13 @@ def record(
         # `outcome` is the whole point: it is how we find out whether the
         # reachability rule is any good.
         "reachable":   reachable,
+        # Seconds the queue was predicted to take. Recorded beside rested_s and
+        # the outcome so the prediction can be scored against what happened.
+        "expected_fill_s": (
+            None if expected_fill_s is None
+            else (None if expected_fill_s == float("inf")
+                  else round(expected_fill_s, 1))
+        ),
         "size":      round(size, 2),
         "matched":   round(matched, 2),
         "rested_s":  round(rested_s, 1),

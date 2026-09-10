@@ -101,7 +101,7 @@ from config import BotConfig                                       # noqa: E402
 from core.clob_client import (                                     # noqa: E402
     PolyClient, classify_fills, prime_market_meta,
 )
-from core import market_titles                                  # noqa: E402
+from core import market_flow, market_titles                                  # noqa: E402
 from core.scanner import FeedRegistry, MarketScanner               # noqa: E402
 from execution.auto_redeem import AutoRedeemer                     # noqa: E402
 from execution.inventory_manager import InventoryManager           # noqa: E402
@@ -457,6 +457,7 @@ async def strategy_loop(
                     no_ask_sizes=tick.get("no_ask_sizes"),
                     no_best_bids=tick.get("no_best_bids"),
                     no_bid_sizes=tick.get("no_bid_sizes"),
+                    group_volume_24h=market_flow.get(condition_id),
                     leg_tick_sizes=tick.get("leg_tick_sizes"),
                 )
                 if nr_signal is None:

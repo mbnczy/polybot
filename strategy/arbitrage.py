@@ -236,6 +236,8 @@ def maker_quote_is_hopeless(
     *,
     leads:        bool = False,
     max_multiple: "float | None" = None,
+    expected_s:   "float | None" = None,
+    ttl_s:        "float | None" = None,
 ) -> bool:
     """
     Is this quote so far back that waiting out the timer cannot help?
@@ -244,9 +246,18 @@ def maker_quote_is_hopeless(
     before placing an order; this is a judgement about an order already resting,
     where being wrong costs a fill that would have happened. So it demands a
     measured queue (never None), and a much larger one.
+
+    When a fill-time estimate is available it decides instead, because the
+    queue multiple is wrong in a way that matters. A queue is counted in SHARES,
+    and at an extreme price shares are cheap: the Fed market holding 93,756
+    shares at 0.007 is 656 dollars of book against a two-million-dollar day, and
+    it clears in about a minute. The multiple calls that hopeless at 9,376x our
+    order. Where the flow says otherwise, the flow wins.
     """
     if leads or queue_ahead is None:
         return False
+    if expected_s is not None and ttl_s and ttl_s > 0.0:
+        return expected_s > ttl_s
     limit = MAKER_HOPELESS_QUEUE_MULTIPLE if max_multiple is None else max_multiple
     if limit <= 0:
         return False
@@ -270,6 +281,55 @@ MAKER_MIN_SAVING_FRAC: float = float(
 NEGRISK_EARLY_CROSS: bool = os.environ.get(
     "NEGRISK_EARLY_CROSS", "false"
 ).strip().lower() in ("1", "true", "yes", "on")
+
+
+# Fraction of a market's traded volume that consumes the resting bid queue.
+# Two corrections that happen to pull against each other: only BUY flow eats a
+# bid, which halves it, while most volume executes at the touch rather than
+# deep in the book, which does not. 0.5 is the honest middle and the knob is
+# here so a measured number can replace the guess.
+MAKER_TOUCH_FLOW_FRAC: float = float(
+    os.environ.get("MAKER_TOUCH_FLOW_FRAC", 0.5)
+)
+
+
+def expected_fill_seconds(
+    queue_ahead: "float | None",
+    volume_24h:  "float | None",
+    price:       float,
+    *,
+    touch_frac: "float | None" = None,
+) -> "float | None":
+    """
+    Roughly how long a quote joining this queue would wait, in seconds.
+
+    queue_ahead shares have to trade before ours is touched, and the market
+    turns over volume_24h USDC a day. At `price` per share that is
+    volume_24h / price shares a day, of which some fraction hits the touch on
+    the side that consumes our queue.
+
+    Returns None when either input is missing — a missing estimate must never
+    read as "fills instantly". 0.0 means we open our own price level and there
+    is no queue at all.
+
+    This is an ESTIMATE and the caller must treat it as one. A day of volume
+    says nothing about the next five minutes, and the bot has no trade tape to
+    do better with: the WS feed carries `book` and `price_change` only, and a
+    level shrinking in a price_change is a cancel and a fill alike. It is the
+    right order of magnitude for "will this fill inside a 45-second TTL", and
+    nothing finer than that.
+    """
+    if queue_ahead is None or volume_24h is None or price <= 0.0:
+        return None
+    if queue_ahead <= 0.0:
+        return 0.0
+    if volume_24h <= 0.0:
+        return math.inf
+    frac = MAKER_TOUCH_FLOW_FRAC if touch_frac is None else touch_frac
+    shares_per_day = (volume_24h / price) * max(frac, 0.0)
+    if shares_per_day <= 0.0:
+        return math.inf
+    return queue_ahead / (shares_per_day / 86_400.0)
 
 
 def spread_fraction(ask: float, bid: "float | None") -> "float | None":
@@ -744,6 +804,10 @@ class ArbLeg:
     tick:        "float | None" = None   # this leg's own grid
     leads:       bool = False            # quote opens its own price level
     reachable:   bool = True             # can realistically fill as a maker
+    # Estimated seconds until the queue ahead clears. None when the market's
+    # traded volume was never scanned — a missing estimate must not read as
+    # "fills instantly".
+    expected_fill_s: "float | None" = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1601,6 +1665,7 @@ class NegRiskArbDetector:
         no_ask_sizes:       list[float] | None = None,
         no_best_bids:       list[float | None] | None = None,
         no_bid_sizes:       list[float | None] | None = None,
+        group_volume_24h:   float | None = None,
         leg_tick_sizes:     list[float | None] | None = None,
     ) -> Optional[NegRiskSignal]:
         """
@@ -1916,6 +1981,10 @@ class NegRiskArbDetector:
                 leads=quote_opens_new_level(bid, book_bid, t),
                 reachable=maker_quote_is_reachable(
                     bid, book_bid, t, queue, n_bundles
+                ),
+                expected_fill_s=(
+                    0.0 if quote_opens_new_level(bid, book_bid, t)
+                    else expected_fill_seconds(queue, group_volume_24h, bid)
                 ),
             )
             for token_id, ask, bid, book_bid, t, queue in zip(

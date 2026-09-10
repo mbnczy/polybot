@@ -168,6 +168,10 @@ class _BundleLegState:
     queue_ahead: "float | None" = None
     leads:       bool = False
     reachable:   bool = True
+    expected_fill_s: "float | None" = None
+    # Set from the guard's own order_ttl so the estimate is compared against
+    # the time this leg actually has, not a constant guessed here.
+    ttl_s:       "float | None" = None
 
     @property
     def fully_matched(self) -> bool:
@@ -177,7 +181,8 @@ class _BundleLegState:
     def hopeless(self) -> bool:
         """Resting behind a queue that cannot drain inside the bundle's TTL."""
         return maker_quote_is_hopeless(
-            self.queue_ahead, self.size, leads=self.leads
+            self.queue_ahead, self.size, leads=self.leads,
+            expected_s=self.expected_fill_s, ttl_s=self.ttl_s,
         )
 
 
@@ -292,6 +297,8 @@ class NegRiskBundleGuard:
                 queue_ahead=getattr(leg, "queue_ahead", None),
                 leads=bool(getattr(leg, "leads", False)),
                 reachable=bool(getattr(leg, "reachable", True)),
+                expected_fill_s=getattr(leg, "expected_fill_s", None),
+                ttl_s=self._ttl,
             ))
 
         bundle_id = f"{signal.condition_id[:16]}-{time.monotonic_ns()}"
@@ -771,6 +778,7 @@ class NegRiskBundleGuard:
                 rested_s=rested,
                 tick=leg.tick, best_bid=leg.book_bid, best_ask=leg.book_ask,
                 queue_ahead=leg.queue_ahead, reachable=leg.reachable,
+                expected_fill_s=leg.expected_fill_s,
             )
 
         # Nothing may be left resting on the book.
