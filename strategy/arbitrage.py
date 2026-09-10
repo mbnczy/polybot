@@ -652,17 +652,80 @@ NEGRISK_MIN_RELATIVE_EDGE: float = 0.05   # paper §6   — $0.05 on the dollar
 NEGRISK_MIN_LEG_SHARES:    float = 5.0    # Gamma orderMinSize on live markets
 
 
+# Coarsest price grid a market may have, as a fraction of its cheap side,
+# before quoting it becomes pointless. Above this, one tick moves the price by
+# more than the threshold — the minimum spread is that wide by construction, so
+# no maker quote can be a fine concession.
+#
+# Measured across 600 live markets on 2026-09-10; 20% separates cleanly, with
+# no market in 0.05-0.95 anywhere near it.
+MAX_TICK_FRACTION: float = float(os.environ.get("MAX_TICK_FRACTION", 0.20))
+
+
+def price_resolution(price: float, tick: "float | None") -> "float | None":
+    """
+    The tick as a fraction of the cheap side of the market.
+
+    This is what "extreme" actually costs us. A price band alone cannot say:
+    Polymarket drops the grid from 0.01 to 0.001 as a market moves to the edges,
+    so the same 0.02 price is a 50% grid on the coarse tick and a 5% grid on the
+    fine one. The cheap side is the relevant one because that is the leg a
+    NegRisk bundle buys.
+    """
+    if tick is None or tick <= 0.0 or not (0.0 < price < 1.0):
+        return None
+    return tick / min(price, 1.0 - price)
+
+
+def has_usable_resolution(
+    price: float,
+    tick:  "float | None",
+    max_fraction: "float | None" = None,
+) -> bool:
+    """
+    Can this market be quoted finely enough to be worth quoting?
+
+    Unknown tick returns True: the flat price band still applies as the
+    fallback, and refusing on missing metadata would be a worse error than the
+    one this replaces.
+    """
+    r = price_resolution(price, tick)
+    if r is None:
+        return True
+    return r <= (MAX_TICK_FRACTION if max_fraction is None else max_fraction)
+
+
 def _within_quality_band(
     yes_ask: float,
     no_ask:  float,
     lo:      float,
     hi:      float,
+    tick:    "float | None" = None,
 ) -> bool:
     """
     True iff BOTH legs' asks sit inside [lo, hi] — i.e. the market is genuinely
     contested rather than near-resolved.  Shared by the taker (ArbDetector) and
     maker (DutchBookPricer) paths so the quality rule lives in exactly one place.
     """
+    if tick is not None:
+        # Judge by what the grid can express, not by where the price sits.
+        #
+        # The flat band excluded everything outside [0.05, 0.95] as
+        # near-resolved. On 600 live markets that discarded 129 markets — 21% of
+        # the universe — whose grid is perfectly fine: Polymarket drops the tick
+        # to 0.001 as a market moves to the edges, so 0.01-0.05 and 0.95-0.99
+        # resolve to 4-5% of their cheap side, better than the 0.25-0.75 band
+        # manages on the coarse grid. Their 24h volume is no lower either; the
+        # band below 0.01 is the genuinely unquotable one, at 67%, and above
+        # 0.99 at 200%.
+        #
+        # A decided market is also the CHEAPER place to be wrong: the taker fee
+        # is rate x p x (1-p), so unwinding a naked leg at 0.02 costs about
+        # 0.001 a share against 0.0125 at 0.50.
+        return (
+            has_usable_resolution(yes_ask, tick)
+            and has_usable_resolution(no_ask, tick)
+        )
     return lo <= yes_ask <= hi and lo <= no_ask <= hi
 
 
@@ -1032,7 +1095,9 @@ class DutchBookPricer:
         # ── 1a. Signal-quality guards ─────────────────────────────────────────
         # Reject near-resolved / extreme markets: their edge is rebate-driven on
         # thin books that rarely fill, not a durable price gap.
-        if not _within_quality_band(yes_ask, no_ask, self._extreme_lo, self._extreme_hi):
+        if not _within_quality_band(
+            yes_ask, no_ask, self._extreme_lo, self._extreme_hi, tick_size,
+        ):
             logger.debug(
                 "DutchBookPricer | extreme/near-resolved yes=%.4f no=%.4f "
                 "(band [%.3f, %.3f]) — skip",
@@ -1519,6 +1584,7 @@ class ArbDetector:
         no_ask:            float,
         max_position_usdc: float = 50.0,
         fee_rate:          float | None = None,
+        tick_size:         float | None = None,   # market tick (0.01 / 0.001)
     ) -> Optional[ArbSignal]:
         """
         Evaluate whether a YES/NO best-ask pair offers a taker fee-adjusted edge.
@@ -1534,7 +1600,9 @@ class ArbDetector:
             return None
 
         # Signal-quality guard: skip near-resolved / extreme markets.
-        if not _within_quality_band(yes_ask, no_ask, self._extreme_lo, self._extreme_hi):
+        if not _within_quality_band(
+            yes_ask, no_ask, self._extreme_lo, self._extreme_hi, tick_size,
+        ):
             logger.debug(
                 "ArbDetector | extreme/near-resolved yes=%.4f no=%.4f — skip",
                 yes_ask, no_ask,
@@ -1921,8 +1989,25 @@ class NegRiskArbDetector:
         # $0.95, i.e. the group is still genuinely contested.  An implied YES
         # above the band means the group is decided and the remaining "edge" is
         # rebate noise on a book nobody fills.
+        # A lopsided group is not automatically a dead one. Polymarket drops the
+        # tick to 0.001 as a market moves to the edges, so an outcome implied at
+        # 0.97 on the fine grid resolves to 3% of its cheap side — finer than a
+        # coin-flip market manages on the coarse grid, and its 24h volume is no
+        # lower. Measured on 600 live markets, the flat band discarded 129 of
+        # them (21% of the universe) on price alone.
+        #
+        # What stays excluded is the band the grid genuinely cannot express:
+        # below 0.01 the fine tick is still 67% of the price, above 0.99 it is
+        # 200%. The resolution test says so directly; the flat band is the
+        # fallback when no tick is known.
         top_prob = max(c[2] for c in candidates)
-        if top_prob > self._extreme_hi:
+        top_leg = max(candidates, key=lambda c: c[2])
+        top_tick = top_leg[5] if top_leg[5] is not None else tick_size
+        if top_tick is not None:
+            group_dead = not has_usable_resolution(1.0 - top_prob, top_tick)
+        else:
+            group_dead = top_prob > self._extreme_hi
+        if group_dead:
             logger.debug(
                 "NegRiskArbDetector | condition=%s top outcome implied %.4f > %.2f "
                 "— group effectively resolved, skip",

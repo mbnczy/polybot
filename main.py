@@ -695,6 +695,7 @@ async def strategy_loop(
                 no_ask=no_ask,
                 max_position_usdc=MAX_ARB_PAIR_USDC,
                 fee_rate=fee_rate,
+                tick_size=tick.get("tick_size"),
             )
 
             # ── 2b. Maker arb fallback (DutchBookPricer) ──────────────────────
