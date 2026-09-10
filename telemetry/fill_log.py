@@ -48,12 +48,21 @@ def record(
     matched:   float = 0.0,
     rested_s:  float = 0.0,
     condition_id: str = "",
+    queue_ahead: float | None = None,
+    reachable:   bool | None = None,
 ) -> None:
     """
     Record one maker leg's outcome. Never raises: a telemetry failure must not
     interrupt trading.
 
     `outcome` is one of filled / partial / expired / cancelled.
+
+    `queue_ahead` is the shares already resting at the price we joined, and it
+    is the number this file was written for. Leading the book is not the same
+    question as being reachable: a quote can lead by a tick on a book so thick
+    behind it that nothing trades, and a quote can join a queue of forty and
+    fill in a minute. `leads` records the price relationship; `queue_ahead`
+    records the wait.
     """
     if not FILL_LOG_ENABLED:
         return
@@ -73,6 +82,14 @@ def record(
             None if (best_bid is None or best_ask is None or not tick)
             else round((best_ask - best_bid) / tick, 1)
         ),
+        # Shares resting at the price we joined. None = the exchange stated a
+        # price without its depth (a batched price_change), which is distinct
+        # from 0 — an empty level.
+        "queue_ahead": queue_ahead,
+        # What the detector predicted at quote time. Comparing this against
+        # `outcome` is the whole point: it is how we find out whether the
+        # reachability rule is any good.
+        "reachable":   reachable,
         "size":      round(size, 2),
         "matched":   round(matched, 2),
         "rested_s":  round(rested_s, 1),

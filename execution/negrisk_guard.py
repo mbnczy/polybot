@@ -158,6 +158,17 @@ class _BundleLegState:
     # exchange has had time to index it.
     placed_at:        float = field(default_factory=time.monotonic)
 
+    # ── Book state at quote time, carried from the signal ─────────────────────
+    # The fill log recorded these as null on all 67 of its real rows, which made
+    # the one question it was written to answer — do we miss because of queue
+    # position? — unanswerable from its own data.
+    book_bid:    "float | None" = None
+    book_ask:    "float | None" = None
+    tick:        "float | None" = None
+    queue_ahead: "float | None" = None
+    leads:       bool = False
+    reachable:   bool = True
+
     @property
     def fully_matched(self) -> bool:
         return self.matched >= self.size - _SHARE_EPS
@@ -268,6 +279,12 @@ class NegRiskBundleGuard:
             legs.append(_BundleLegState(
                 i, leg.token_id, order_id, leg.no_bid, leg.size,
                 matched=matched, open=status not in _FILLED_STATUSES,
+                book_bid=getattr(leg, "book_bid", None),
+                book_ask=getattr(leg, "no_ask", None),
+                tick=getattr(leg, "tick", None),
+                queue_ahead=getattr(leg, "queue_ahead", None),
+                leads=bool(getattr(leg, "leads", False)),
+                reachable=bool(getattr(leg, "reachable", True)),
             ))
 
         bundle_id = f"{signal.condition_id[:16]}-{time.monotonic_ns()}"
@@ -717,6 +734,8 @@ class NegRiskBundleGuard:
                          "cancelled" if leg.cancel_requested else "expired"),
                 price=leg.bid, size=leg.size, matched=leg.matched,
                 rested_s=rested,
+                tick=leg.tick, best_bid=leg.book_bid, best_ask=leg.book_ask,
+                queue_ahead=leg.queue_ahead, reachable=leg.reachable,
             )
 
         # Nothing may be left resting on the book.

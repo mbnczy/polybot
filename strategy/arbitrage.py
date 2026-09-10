@@ -199,6 +199,65 @@ NEGRISK_MIN_COMPLETABLE_EDGE: float = float(
 )
 
 
+# Largest queue, as a multiple of our own order, that a post-only quote may
+# join and still be considered fillable. Measured across 257 live books on
+# 2026-09-10: 79% of active markets have a one-tick spread, and the median
+# one-tick book holds 10,558 shares at the touch against our ten — 1,056x.
+# Those quotes do not fill slowly, they do not fill. A multiple of 20 admits
+# roughly the thinnest tenth of one-tick books plus every book wide enough to
+# hold a price level of our own.
+MAKER_MAX_QUEUE_MULTIPLE: float = float(
+    os.environ.get("MAKER_MAX_QUEUE_MULTIPLE", 20.0)
+)
+
+
+def quote_opens_new_level(quote: float, bid: "float | None", tick: float) -> bool:
+    """
+    True when a post-only quote at `quote` creates its own price level.
+
+    A new level is alone, so it is first in queue by construction. Joining the
+    existing best bid instead puts us behind everything already resting there.
+    """
+    if bid is None or bid <= 0.0:
+        return True
+    return quote > bid + tick / 2.0
+
+
+def maker_quote_is_reachable(
+    quote:       float,
+    bid:         "float | None",
+    tick:        float,
+    queue_ahead: "float | None",
+    our_size:    float,
+    *,
+    max_multiple: "float | None" = None,
+) -> bool:
+    """
+    Can a post-only quote at this price realistically fill?
+
+    Two cases, and only one of them is a queue at all:
+
+      • the quote opens its own price level -> first by construction, reachable.
+      • the quote joins the resting best bid -> it sits behind `queue_ahead`
+        shares, every one of which must be consumed before ours is touched.
+        Reachable only while that queue is small relative to our own order.
+
+    An unknown queue (`None`) is treated as reachable. A batched price_change
+    states a price without its depth, and refusing to quote on missing data
+    would silence the bot on exactly the fast-moving books worth quoting. The
+    fill log records which case each leg was in, so the cost of that permissive
+    choice is measurable rather than assumed.
+    """
+    if quote_opens_new_level(quote, bid, tick):
+        return True
+    if queue_ahead is None:
+        return True
+    limit = MAKER_MAX_QUEUE_MULTIPLE if max_multiple is None else max_multiple
+    if limit <= 0:
+        return True
+    return queue_ahead <= limit * max(our_size, 1e-9)
+
+
 def lead_book_bid(
     ask:  float,
     bid:  "float | None",
@@ -533,6 +592,16 @@ class ArbLeg:
     no_ask:   float   # best ask from WS feed
     no_bid:   float   # synthetic post-only bid (no_ask − TICK_SIZE)
     size:     float   # shares per bundle (= n_bundles)
+
+    # ── Book state at quote time ──────────────────────────────────────────────
+    # Carried so execution can route each leg and the fill log can explain,
+    # afterwards, why it did or did not fill. Defaults keep every existing
+    # construction site valid.
+    book_bid:    "float | None" = None   # best bid our quote is measured against
+    queue_ahead: "float | None" = None   # shares resting there; None = unknown
+    tick:        "float | None" = None   # this leg's own grid
+    leads:       bool = False            # quote opens its own price level
+    reachable:   bool = True             # can realistically fill as a maker
 
 
 @dataclass(frozen=True, slots=True)
@@ -1350,6 +1419,7 @@ class NegRiskArbDetector:
         tick_size:          float | None = None,
         no_ask_sizes:       list[float] | None = None,
         no_best_bids:       list[float | None] | None = None,
+        no_bid_sizes:       list[float | None] | None = None,
         leg_tick_sizes:     list[float | None] | None = None,
     ) -> Optional[NegRiskSignal]:
         """
@@ -1418,8 +1488,9 @@ class NegRiskArbDetector:
         # ── 2. Candidate legs — drop unusable quotes ──────────────────────────
         # A malformed/absent quote only costs us that outcome's contribution to
         # the edge (subset lemma), so drop the leg instead of the whole group.
-        # id, ask, implied prob, ask depth, best bid, tick
-        candidates: list[tuple[str, float, float, float, "float|None", "float|None"]] = []
+        # id, ask, implied prob, ask depth, best bid, tick, bid queue
+        candidates: list[tuple[str, float, float, float, "float|None", "float|None",
+                              "float|None"]] = []
         for i, (token_id, ask) in enumerate(zip(outcome_token_ids, no_asks)):
             if not (0.01 <= ask <= 0.99):
                 logger.debug(
@@ -1443,7 +1514,9 @@ class NegRiskArbDetector:
                     continue
             leg_bid  = no_best_bids[i] if no_best_bids else None
             leg_tick = leg_tick_sizes[i] if leg_tick_sizes else None
-            candidates.append((token_id, ask, 1.0 - ask, depth, leg_bid, leg_tick))
+            leg_queue = no_bid_sizes[i] if no_bid_sizes else None
+            candidates.append((token_id, ask, 1.0 - ask, depth, leg_bid, leg_tick,
+                               leg_queue))
 
         if len(candidates) < 2:
             self._stop("under_two_usable_quotes")
@@ -1486,6 +1559,7 @@ class NegRiskArbDetector:
         sel_depth = [c[3] for c in selected]
         sel_bids  = [c[4] for c in selected]
         sel_ticks = [c[5] if c[5] is not None else tick_size for c in selected]
+        sel_queues = [c[6] for c in selected]
 
         # ── 5. Synthetic post-only NO bids ────────────────────────────────────
         # One tick under each leg's OWN ask. Previously every leg was snapped to
@@ -1607,14 +1681,29 @@ class NegRiskArbDetector:
             return None
 
         # ── 9. Build per-outcome leg tuple ────────────────────────────────────
+        # Each leg carries the book it was quoted against, and what that implies
+        # for execution. `reachable` is the routing signal: a quote that joins a
+        # queue far deeper than our own order does not fill slowly, it does not
+        # fill, so resting it only burns the TTL before the guard crosses the leg
+        # anyway. Section 7b has already priced that crossing; this says which
+        # legs it applies to.
         legs = tuple(
             ArbLeg(
                 token_id=token_id,
                 no_ask=ask,
                 no_bid=bid,
                 size=n_bundles,
+                book_bid=book_bid,
+                queue_ahead=queue,
+                tick=t,
+                leads=quote_opens_new_level(bid, book_bid, t),
+                reachable=maker_quote_is_reachable(
+                    bid, book_bid, t, queue, n_bundles
+                ),
             )
-            for token_id, ask, bid in zip(sel_ids, sel_asks, no_bids)
+            for token_id, ask, bid, book_bid, t, queue in zip(
+                sel_ids, sel_asks, no_bids, sel_bids, sel_ticks, sel_queues
+            )
         )
 
         spread_bps = round(relative_edge * 10_000, 1)

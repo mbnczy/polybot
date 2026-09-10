@@ -455,6 +455,7 @@ async def strategy_loop(
                     tick_size=tick.get("tick_size"),
                     no_ask_sizes=tick.get("no_ask_sizes"),
                     no_best_bids=tick.get("no_best_bids"),
+                    no_bid_sizes=tick.get("no_bid_sizes"),
                     leg_tick_sizes=tick.get("leg_tick_sizes"),
                 )
                 if nr_signal is None:
