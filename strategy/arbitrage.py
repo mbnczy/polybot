@@ -661,6 +661,15 @@ NEGRISK_MIN_LEG_SHARES:    float = 5.0    # Gamma orderMinSize on live markets
 # no market in 0.05-0.95 anywhere near it.
 MAX_TICK_FRACTION: float = float(os.environ.get("MAX_TICK_FRACTION", 0.20))
 
+# Kill switch back to the flat [EXTREME_PRICE_LO, EXTREME_PRICE_HI] band.
+# The resolution test widens admission by roughly 40% of the universe, which is
+# the largest live behaviour change on this branch and the one most likely to
+# need undoing in a hurry. Setting MAX_TICK_FRACTION low does NOT undo it — a
+# small fraction rejects everything — so the revert needs its own switch.
+QUALITY_BAND_USE_RESOLUTION: bool = os.environ.get(
+    "QUALITY_BAND_USE_RESOLUTION", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+
 
 def price_resolution(price: float, tick: "float | None") -> "float | None":
     """
@@ -707,7 +716,7 @@ def _within_quality_band(
     contested rather than near-resolved.  Shared by the taker (ArbDetector) and
     maker (DutchBookPricer) paths so the quality rule lives in exactly one place.
     """
-    if tick is not None:
+    if tick is not None and QUALITY_BAND_USE_RESOLUTION:
         # Judge by what the grid can express, not by where the price sits.
         #
         # The flat band excluded everything outside [0.05, 0.95] as
@@ -2003,7 +2012,7 @@ class NegRiskArbDetector:
         top_prob = max(c[2] for c in candidates)
         top_leg = max(candidates, key=lambda c: c[2])
         top_tick = top_leg[5] if top_leg[5] is not None else tick_size
-        if top_tick is not None:
+        if top_tick is not None and QUALITY_BAND_USE_RESOLUTION:
             group_dead = not has_usable_resolution(1.0 - top_prob, top_tick)
         else:
             group_dead = top_prob > self._extreme_hi

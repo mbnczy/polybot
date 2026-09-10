@@ -104,3 +104,22 @@ class TestUnwindingIsCheaperOutThere:
         at_edge = 0.02 * effective_taker_fee(0.02)
         at_coin = 0.50 * effective_taker_fee(0.50)
         assert at_edge < at_coin / 10
+
+
+class TestTheRevertSwitch:
+    """
+    Widening admission by ~40% of the universe is the largest live change on
+    this branch, so it needs an undo that does not require a deploy. Lowering
+    MAX_TICK_FRACTION is not that undo — a small fraction rejects everything,
+    including the coin-flip markets the bot has always traded.
+    """
+
+    def test_the_switch_restores_the_flat_band(self, monkeypatch):
+        import strategy.arbitrage as A
+        monkeypatch.setattr(A, "QUALITY_BAND_USE_RESOLUTION", False)
+        assert A._within_quality_band(0.97, 0.03, 0.05, 0.95, tick=0.001) is False
+        assert A._within_quality_band(0.52, 0.48, 0.05, 0.95, tick=0.01) is True
+
+    def test_lowering_the_fraction_is_not_a_revert(self):
+        """It rejects the balanced markets too, which is not what anyone wants."""
+        assert has_usable_resolution(0.50, 0.01, max_fraction=0.001) is False
