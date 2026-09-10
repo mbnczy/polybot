@@ -161,35 +161,6 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 
-# Also keep a log on disk.
-#
-# stdout alone is whatever the launcher happened to attach. Started from a
-# terminal or a background task, that is a socket: when the peer goes away the
-# log goes with it, and there is no history at all. On 2026-09-09 the bot had
-# run 6 hours with no on-disk trace, so "why did nothing trade since 05:19?"
-# could only be answered from the exchange's own records.
-#
-# Rotating, so it cannot fill the disk. Failure to open it is not fatal —
-# trading must not depend on a log file being writable.
-_LOG_DIR = os.environ.get("LOG_DIR", os.path.join(os.path.dirname(__file__), "logs"))
-try:
-    from logging.handlers import RotatingFileHandler      # noqa: PLC0415
-
-    os.makedirs(_LOG_DIR, exist_ok=True)
-    _file_handler = RotatingFileHandler(
-        os.path.join(_LOG_DIR, "polybot.log"),
-        maxBytes=int(os.environ.get("LOG_MAX_BYTES", 20 * 1024 * 1024)),
-        backupCount=int(os.environ.get("LOG_BACKUPS", 5)),
-    )
-    _file_handler.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s — %(message)s"))
-    logging.getLogger().addHandler(_file_handler)
-except OSError as exc:                                    # noqa: BLE001
-    logging.getLogger("main").warning(
-        "no on-disk log (%s: %s) — continuing with stdout only",
-        type(exc).__name__, exc,
-    )
-
 logger = logging.getLogger("main")
 
 # Telegram bot token leaks into logs via httpx's INFO-level request URLs.
@@ -1327,5 +1298,44 @@ async def main() -> None:
         logger.info("=== Bot shutdown complete ===")
 
 
+def _attach_disk_log() -> None:
+    """
+    Add a rotating file handler to the root logger.
+
+    stdout alone is whatever the launcher happened to attach. Started from a
+    terminal or a background task that is a socket: when the peer goes away the
+    log goes with it, and no history survives. On 2026-09-09 the bot had run six
+    hours with no on-disk trace, so "why has nothing traded since 05:19?" was
+    answerable only from the exchange's own records.
+
+    Called from __main__, NOT at import. Attached at import it also caught the
+    test suite — tests/integration/test_main_mock.py imports this module, so
+    pytest put 146 lines of fixture output into the production log, including
+    ERROR lines reading "an order escaped supervision | cash +25.0000" about
+    markets that do not exist. A log nobody can trust is worse than no log.
+
+    Rotating, so it cannot fill the disk. Failure to open it is not fatal:
+    trading must not depend on a log file being writable.
+    """
+    log_dir = os.environ.get("LOG_DIR", os.path.join(os.path.dirname(__file__), "logs"))
+    try:
+        from logging.handlers import RotatingFileHandler      # noqa: PLC0415
+
+        os.makedirs(log_dir, exist_ok=True)
+        handler = RotatingFileHandler(
+            os.path.join(log_dir, "polybot.log"),
+            maxBytes=int(os.environ.get("LOG_MAX_BYTES", 20 * 1024 * 1024)),
+            backupCount=int(os.environ.get("LOG_BACKUPS", 5)),
+        )
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s — %(message)s"))
+        logging.getLogger().addHandler(handler)
+    except OSError as exc:                                    # noqa: BLE001
+        logging.getLogger("main").warning(
+            "no on-disk log (%s: %s) — continuing with stdout only",
+            type(exc).__name__, exc,
+        )
+
 if __name__ == "__main__":
+    _attach_disk_log()
     asyncio.run(main())
