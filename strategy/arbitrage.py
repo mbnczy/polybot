@@ -117,6 +117,7 @@ Public contract
 
 from __future__ import annotations
 
+import itertools
 import logging
 import math
 import os
@@ -206,6 +207,14 @@ NEGRISK_MIN_COMPLETABLE_EDGE: float = float(
 # Those quotes do not fill slowly, they do not fill. A multiple of 20 admits
 # roughly the thinnest tenth of one-tick books plus every book wide enough to
 # hold a price level of our own.
+# Search subsets for the best return on capital instead of ranking legs by
+# implied probability. Switchable so the two can be compared on live data
+# rather than argued about.
+NEGRISK_SUBSET_SEARCH: bool = os.environ.get(
+    "NEGRISK_SUBSET_SEARCH", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+
+
 MAKER_MAX_QUEUE_MULTIPLE: float = float(
     os.environ.get("MAKER_MAX_QUEUE_MULTIPLE", 20.0)
 )
@@ -1392,6 +1401,7 @@ class NegRiskArbDetector:
         min_relative_edge:   float = NEGRISK_MIN_RELATIVE_EDGE,
         min_leg_shares:      float = NEGRISK_MIN_LEG_SHARES,
         extreme_hi:          float = EXTREME_PRICE_HI,
+        subset_search:       bool  = NEGRISK_SUBSET_SEARCH,
     ) -> None:
         if not (0.0 < desired_net_margin < 1.0):
             raise ValueError(
@@ -1413,6 +1423,7 @@ class NegRiskArbDetector:
         self._default_rebate   = max(0.0, min(default_rebate_rate, MAX_MAKER_REBATE))
         self._min_outcome_prob = min_outcome_prob
         self._max_legs         = max_legs
+        self._subset_search    = bool(subset_search)
         self._require_completable  = NEGRISK_REQUIRE_COMPLETABLE
         self._min_completable_edge = NEGRISK_MIN_COMPLETABLE_EDGE
         # Counters so the filter's effect is measurable rather than assumed.
@@ -1441,6 +1452,43 @@ class NegRiskArbDetector:
             for k, v in sorted(self.stops.items(), key=lambda kv: -kv[1])
         )
         return f"{total} evaluated | {parts}"
+
+    def _subset_return(self, combo, group_tick: "float | None") -> float:
+        """
+        What a subset earns per USDC of capital tied up in it.
+
+        Prices each leg the way section 7b does — a leg whose post-only quote
+        leads the book costs its quote and pays no fee, a leg that has to be
+        crossed costs the ask plus the taker fee — so selection and admission
+        cannot drift apart.
+
+        The RATIO matters, not the difference. Scoring absolute edge always
+        picks the largest allowed bundle, because adding any leg raises the
+        payout by 1 and the cost by less than 1, so the choice collapses. But
+        capital is the binding constraint: n_bundles is max_position_usdc over
+        the combined bid, so a cheaper subset buys more bundles out of the same
+        money. Worked on a live-shaped group at 5% taker rate:
+
+            legs                  edge/bundle   capital   return
+            0.06/0.50/0.52/0.90      +0.988      1.94      51%
+            0.06/0.50                +0.425      0.54      79%
+
+        Same wallet, half the legs, half again the profit.
+        """
+        payout = float(len(combo) - 1)
+        cost = 0.0      # what completion realistically costs, fees included
+        spend = 0.0     # capital actually committed at the quoted prices
+        for _tid, ask, _prob, _depth, bid, tick, _queue in combo:
+            t = tick if tick is not None else (group_tick or DEFAULT_TICK_SIZE)
+            quote = lead_book_bid(ask, bid, t)
+            spend += quote
+            if bid is None or quote > bid + 1e-12:
+                cost += quote
+            else:
+                cost += ask * (1.0 + effective_taker_fee(ask))
+        if spend <= 0.0:
+            return -math.inf
+        return (payout - cost) / spend
 
     def evaluate_neg_risk(
         self,
@@ -1582,9 +1630,45 @@ class NegRiskArbDetector:
             self._stop("below_probability_floor")
             return None
 
-        selected.sort(key=lambda c: c[2], reverse=True)
-        dropped_tail = max(0, len(selected) - self._max_legs)
-        selected = selected[:self._max_legs]
+        # Which k of the N outcomes to buy is a choice, and ranking them by
+        # implied probability ignores what they cost to complete.
+        #
+        # The taker fee is rate x p x (1-p) x size, so its burden per leg follows
+        # a bell that peaks at p=0.5 and vanishes at the extremes. Over a bundle
+        # that is rate x SUM yes_i(1 - yes_i), which moves the break-even from
+        # SUM yes > 1.0071 on an extreme-priced group to > 1.0394 on a flat one —
+        # a factor of five in how large a Dutch book has to be before it pays.
+        #
+        # So search the subsets instead of sorting. The objective is the same
+        # realistic price section 7b already charges: a leg whose quote leads
+        # the book costs its quote, a leg that must be crossed costs the ask
+        # plus the fee on it. Ranking by probability optimises the gross edge;
+        # this optimises the one we actually collect.
+        dropped_tail = 0
+        if self._subset_search and len(selected) > 2:
+            # Bound the combinatorics — beyond the strongest handful the legs
+            # are too cheap to change the answer. C(8,4)+C(8,3)+C(8,2) = 154.
+            selected.sort(key=lambda c: c[2], reverse=True)
+            pool = selected[:min(len(selected), self._max_legs + 4)]
+            best, best_edge = None, -math.inf
+            for k in range(2, min(self._max_legs, len(pool)) + 1):
+                for combo in itertools.combinations(pool, k):
+                    edge = self._subset_return(combo, tick_size)
+                    # Ties go to the larger bundle: the same return spread over
+                    # more of the group's liquidity absorbs a bigger position.
+                    if edge > best_edge + 1e-12 or (
+                        best is not None
+                        and abs(edge - best_edge) <= 1e-12
+                        and len(combo) > len(best)
+                    ):
+                        best, best_edge = combo, edge
+            if best is not None:
+                dropped_tail = len(selected) - len(best)
+                selected = list(best)
+        else:
+            selected.sort(key=lambda c: c[2], reverse=True)
+            dropped_tail = max(0, len(selected) - self._max_legs)
+            selected = selected[:self._max_legs]
 
         m = len(selected)
         sel_ids   = [c[0] for c in selected]
