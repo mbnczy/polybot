@@ -293,6 +293,96 @@ MAKER_TOUCH_FLOW_FRAC: float = float(
 )
 
 
+# What a naked leg costs to unwind when its bundle never completes. Measured
+# over the four round trips visible in the account on 2026-09-08/09: buy 0.270
+# sell 0.251, buy 0.200 sell 0.180, buy 0.830 sell 0.820, buy 0.610 sell 0.620
+# — three losses and one small gain, averaging -0.20 USDC per leg unwound.
+#
+# It is an average of four, not a distribution, and early resting is priced off
+# it. That is why the feature below refuses to run on a default.
+NAKED_UNWIND_COST: float = float(os.environ.get("NAKED_UNWIND_COST", 0.20))
+
+# Probability that a bundle whose legs were rested ahead of the arbitrage
+# actually completes. There is no measured value yet, so there is no default:
+# unset means the feature stays off rather than running on a guess.
+_early_p = os.environ.get("NEGRISK_EARLY_REST_P", "").strip()
+NEGRISK_EARLY_REST_P: "float | None" = float(_early_p) if _early_p else None
+
+
+def arb_limit_price(
+    others_cost: float,
+    n_legs:      int,
+    target_edge: float = 0.0,
+) -> float:
+    """
+    The most this leg may cost while the bundle still clears `target_edge`.
+
+    A bundle of k legs pays k-1. If the other legs cost `others_cost` between
+    them, this one can cost up to (k-1) - others_cost - target_edge before the
+    arbitrage stops being one.
+
+    This is the price to rest at when the arbitrage does not exist YET. Under
+    price-time priority a queue cannot be jumped, but it can be joined early: an
+    order resting at the limit price fills only if someone sells into it, and at
+    that moment the bundle is profitable by construction. The prediction turns
+    into patience.
+    """
+    return float(n_legs - 1) - others_cost - target_edge
+
+
+def early_rest_expected_value(
+    edge:        float,
+    p_complete:  float,
+    naked_cost:  "float | None" = None,
+) -> float:
+    """
+    USDC per bundle from resting ahead of the arbitrage.
+
+    Completing pays `edge`; failing leaves legs to unwind at `naked_cost` each.
+    Your rule, stated as arithmetic: worth doing when p*edge exceeds (1-p)*cost.
+    """
+    cost = NAKED_UNWIND_COST if naked_cost is None else naked_cost
+    p = min(max(p_complete, 0.0), 1.0)
+    return p * edge - (1.0 - p) * cost
+
+
+def should_rest_early(
+    edge:       float,
+    p_complete: "float | None" = None,
+    naked_cost: "float | None" = None,
+) -> bool:
+    """
+    Refuses without a completion probability.
+
+    The alternative would be a default, and a default here is a number nobody
+    measured deciding how much money to risk. The fill log now records what was
+    predicted beside what happened; when it has a week of legs, p comes from
+    there and this turns on.
+    """
+    p = NEGRISK_EARLY_REST_P if p_complete is None else p_complete
+    if p is None:
+        return False
+    return early_rest_expected_value(edge, p, naked_cost) > 0.0
+
+
+def break_even_completion_rate(
+    edge:       float,
+    naked_cost: "float | None" = None,
+) -> float:
+    """
+    How often a bundle has to complete for early resting to pay.
+
+    Solving p*edge = (1-p)*cost gives cost / (edge + cost). Worth stating
+    plainly, because the answer is uncomfortable: at the 0.02-0.03 edge these
+    bundles actually carry, and a 0.20 unwind, the bundles have to complete
+    87-91% of the time. Nothing observed so far suggests they do.
+    """
+    cost = NAKED_UNWIND_COST if naked_cost is None else naked_cost
+    if edge + cost <= 0.0:
+        return 1.0
+    return cost / (edge + cost)
+
+
 def expected_fill_seconds(
     queue_ahead: "float | None",
     volume_24h:  "float | None",
