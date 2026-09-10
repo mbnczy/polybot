@@ -1409,12 +1409,17 @@ class PolyClient:
         this said it had one; with a real resting order it would still have
         said one, blank.
 
-        That is not cosmetic. InventoryManager._poll_fills treats "order id
-        absent from open_orders" as proof the order filled, so a blank set made
-        every PENDING leg look filled — at fill_price 0.0 — and promoted the
-        position to PAIRED, which schedules an on-chain mergePositions for
-        shares the wallet may not hold. It is the same phantom-fill failure the
-        guards were fixed for; this path was missed.
+        Its one consumer is InventoryManager._poll_fills, which treats "order
+        id absent from open_orders" as proof the order filled — so a
+        permanently blank set would mark every PENDING leg filled at
+        fill_price 0.0 and promote the position to PAIRED, scheduling an
+        on-chain mergePositions for shares the wallet may not hold.
+
+        That cannot fire today: both Position construction sites pass
+        status="PAIRED" explicitly, so the PENDING default is never used and
+        the branch is unreachable. The hazard is latent, not live. Fixed
+        anyway, because a function that fabricates an order is wrong on its own
+        terms and the branch is one recovery path away from mattering.
 
         iter_items() flattens the pages.
         """

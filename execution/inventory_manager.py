@@ -430,6 +430,14 @@ class InventoryManager:
         For matchOrders positions, both legs are marked PAIRED at registration
         time.  This poll primarily handles any wallet-monitor-recovered
         positions that start in PENDING state.
+
+        As of 2026-09-10 no such path exists: both Position construction sites
+        pass status="PAIRED", so the PENDING default is never used and the loop
+        below never runs. Before wiring recovery in, note what this does with an
+        empty open-order set — it books BOTH legs as filled at fill_price 0.0
+        and schedules mergePositions. Absence from the open-order list means
+        "filled or cancelled", and only the chain can tell those apart; the
+        guards learned that on 2026-09-07 and use order_filled_size for it.
         """
         async with self._lock:
             if not self._positions:
