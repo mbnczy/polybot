@@ -117,6 +117,7 @@ Public contract
 
 from __future__ import annotations
 
+import itertools
 import logging
 import math
 import os
@@ -197,6 +198,356 @@ NEGRISK_REQUIRE_COMPLETABLE: bool = os.environ.get(
 NEGRISK_MIN_COMPLETABLE_EDGE: float = float(
     os.environ.get("NEGRISK_MIN_COMPLETABLE_EDGE", 0.002)
 )
+
+
+# Largest queue, as a multiple of our own order, that a post-only quote may
+# join and still be considered fillable. Measured across 257 live books on
+# 2026-09-10: 79% of active markets have a one-tick spread, and the median
+# one-tick book holds 10,558 shares at the touch against our ten — 1,056x.
+# Those quotes do not fill slowly, they do not fill. A multiple of 20 admits
+# roughly the thinnest tenth of one-tick books plus every book wide enough to
+# hold a price level of our own.
+# Search subsets for the best return on capital instead of ranking legs by
+# implied probability. Switchable so the two can be compared on live data
+# rather than argued about.
+NEGRISK_SUBSET_SEARCH: bool = os.environ.get(
+    "NEGRISK_SUBSET_SEARCH", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+
+
+MAKER_MAX_QUEUE_MULTIPLE: float = float(
+    os.environ.get("MAKER_MAX_QUEUE_MULTIPLE", 20.0)
+)
+
+
+# A queue this many times our own order will not drain inside a bundle's TTL.
+# Deliberately far above MAKER_MAX_QUEUE_MULTIPLE: that one decides whether a
+# quote is worth placing, this one decides whether to stop waiting on an order
+# already placed, and giving up early on a stale reading forfeits a real fill.
+# A 250-share queue can clear in a minute; 10,558 cannot.
+MAKER_HOPELESS_QUEUE_MULTIPLE: float = float(
+    os.environ.get("MAKER_HOPELESS_QUEUE_MULTIPLE", 100.0)
+)
+
+
+def maker_quote_is_hopeless(
+    queue_ahead: "float | None",
+    our_size:    float,
+    *,
+    leads:        bool = False,
+    max_multiple: "float | None" = None,
+    expected_s:   "float | None" = None,
+    ttl_s:        "float | None" = None,
+) -> bool:
+    """
+    Is this quote so far back that waiting out the timer cannot help?
+
+    Only ever true on a KNOWN, very deep queue. `reachable` is a judgement made
+    before placing an order; this is a judgement about an order already resting,
+    where being wrong costs a fill that would have happened. So it demands a
+    measured queue (never None), and a much larger one.
+
+    When a fill-time estimate is available it decides instead, because the
+    queue multiple is wrong in a way that matters. A queue is counted in SHARES,
+    and at an extreme price shares are cheap: the Fed market holding 93,756
+    shares at 0.007 is 656 dollars of book against a two-million-dollar day, and
+    it clears in about a minute. The multiple calls that hopeless at 9,376x our
+    order. Where the flow says otherwise, the flow wins.
+    """
+    if leads or queue_ahead is None:
+        return False
+    if expected_s is not None and ttl_s and ttl_s > 0.0:
+        return expected_s > ttl_s
+    limit = MAKER_HOPELESS_QUEUE_MULTIPLE if max_multiple is None else max_multiple
+    if limit <= 0:
+        return False
+    return queue_ahead > limit * max(our_size, 1e-9)
+
+
+# Below this, the maker path is not worth its non-fill risk: resting saves too
+# little per share to justify the chance of ending up naked on the legs that DID
+# fill. Expressed as a fraction of the ask, because ticks are not comparable —
+# half the live universe trades on a 0.001 grid where one tick is 0.1%, and the
+# other half on 0.01 where it is ten times that. A filter written in ticks means
+# two different things depending on which market it lands on.
+MAKER_MIN_SAVING_FRAC: float = float(
+    os.environ.get("MAKER_MIN_SAVING_FRAC", 0.004)
+)
+
+# Cross the legs that cannot fill as makers at submission, instead of resting
+# them and waiting for the guard to cross them later. OFF by default: it moves
+# risk rather than removing it (see plan_bundle_execution), and the fill log
+# has to show that the reachability call is accurate before it is worth taking.
+NEGRISK_EARLY_CROSS: bool = os.environ.get(
+    "NEGRISK_EARLY_CROSS", "false"
+).strip().lower() in ("1", "true", "yes", "on")
+
+
+# Fraction of a market's traded volume that consumes the resting bid queue.
+# Two corrections that happen to pull against each other: only BUY flow eats a
+# bid, which halves it, while most volume executes at the touch rather than
+# deep in the book, which does not. 0.5 is the honest middle and the knob is
+# here so a measured number can replace the guess.
+MAKER_TOUCH_FLOW_FRAC: float = float(
+    os.environ.get("MAKER_TOUCH_FLOW_FRAC", 0.5)
+)
+
+
+# What a naked leg costs to unwind when its bundle never completes. Measured
+# over the four round trips visible in the account on 2026-09-08/09: buy 0.270
+# sell 0.251, buy 0.200 sell 0.180, buy 0.830 sell 0.820, buy 0.610 sell 0.620
+# — three losses and one small gain, averaging -0.20 USDC per leg unwound.
+#
+# It is an average of four, not a distribution, and early resting is priced off
+# it. That is why the feature below refuses to run on a default.
+NAKED_UNWIND_COST: float = float(os.environ.get("NAKED_UNWIND_COST", 0.20))
+
+# Probability that a bundle whose legs were rested ahead of the arbitrage
+# actually completes. There is no measured value yet, so there is no default:
+# unset means the feature stays off rather than running on a guess.
+_early_p = os.environ.get("NEGRISK_EARLY_REST_P", "").strip()
+NEGRISK_EARLY_REST_P: "float | None" = float(_early_p) if _early_p else None
+
+
+def arb_limit_price(
+    others_cost: float,
+    n_legs:      int,
+    target_edge: float = 0.0,
+) -> float:
+    """
+    The most this leg may cost while the bundle still clears `target_edge`.
+
+    A bundle of k legs pays k-1. If the other legs cost `others_cost` between
+    them, this one can cost up to (k-1) - others_cost - target_edge before the
+    arbitrage stops being one.
+
+    This is the price to rest at when the arbitrage does not exist YET. Under
+    price-time priority a queue cannot be jumped, but it can be joined early: an
+    order resting at the limit price fills only if someone sells into it, and at
+    that moment the bundle is profitable by construction. The prediction turns
+    into patience.
+    """
+    return float(n_legs - 1) - others_cost - target_edge
+
+
+def early_rest_expected_value(
+    edge:        float,
+    p_complete:  float,
+    naked_cost:  "float | None" = None,
+) -> float:
+    """
+    USDC per bundle from resting ahead of the arbitrage.
+
+    Completing pays `edge`; failing leaves legs to unwind at `naked_cost` each.
+    Your rule, stated as arithmetic: worth doing when p*edge exceeds (1-p)*cost.
+    """
+    cost = NAKED_UNWIND_COST if naked_cost is None else naked_cost
+    p = min(max(p_complete, 0.0), 1.0)
+    return p * edge - (1.0 - p) * cost
+
+
+def should_rest_early(
+    edge:       float,
+    p_complete: "float | None" = None,
+    naked_cost: "float | None" = None,
+) -> bool:
+    """
+    Refuses without a completion probability.
+
+    The alternative would be a default, and a default here is a number nobody
+    measured deciding how much money to risk. The fill log now records what was
+    predicted beside what happened; when it has a week of legs, p comes from
+    there and this turns on.
+    """
+    p = NEGRISK_EARLY_REST_P if p_complete is None else p_complete
+    if p is None:
+        return False
+    return early_rest_expected_value(edge, p, naked_cost) > 0.0
+
+
+def break_even_completion_rate(
+    edge:       float,
+    naked_cost: "float | None" = None,
+) -> float:
+    """
+    How often a bundle has to complete for early resting to pay.
+
+    Solving p*edge = (1-p)*cost gives cost / (edge + cost). Worth stating
+    plainly, because the answer is uncomfortable: at the 0.02-0.03 edge these
+    bundles actually carry, and a 0.20 unwind, the bundles have to complete
+    87-91% of the time. Nothing observed so far suggests they do.
+    """
+    cost = NAKED_UNWIND_COST if naked_cost is None else naked_cost
+    if edge + cost <= 0.0:
+        return 1.0
+    return cost / (edge + cost)
+
+
+def expected_fill_seconds(
+    queue_ahead: "float | None",
+    volume_24h:  "float | None",
+    price:       float,
+    *,
+    touch_frac: "float | None" = None,
+) -> "float | None":
+    """
+    Roughly how long a quote joining this queue would wait, in seconds.
+
+    queue_ahead shares have to trade before ours is touched, and the market
+    turns over volume_24h USDC a day. At `price` per share that is
+    volume_24h / price shares a day, of which some fraction hits the touch on
+    the side that consumes our queue.
+
+    Returns None when either input is missing — a missing estimate must never
+    read as "fills instantly". 0.0 means we open our own price level and there
+    is no queue at all.
+
+    This is an ESTIMATE and the caller must treat it as one. A day of volume
+    says nothing about the next five minutes, and the bot has no trade tape to
+    do better with: the WS feed carries `book` and `price_change` only, and a
+    level shrinking in a price_change is a cancel and a fill alike. It is the
+    right order of magnitude for "will this fill inside a 45-second TTL", and
+    nothing finer than that.
+    """
+    if queue_ahead is None or volume_24h is None or price <= 0.0:
+        return None
+    if queue_ahead <= 0.0:
+        return 0.0
+    if volume_24h <= 0.0:
+        return math.inf
+    frac = MAKER_TOUCH_FLOW_FRAC if touch_frac is None else touch_frac
+    shares_per_day = (volume_24h / price) * max(frac, 0.0)
+    if shares_per_day <= 0.0:
+        return math.inf
+    return queue_ahead / (shares_per_day / 86_400.0)
+
+
+def spread_fraction(ask: float, bid: "float | None") -> "float | None":
+    """
+    Spread as a fraction of the ask, or None when the book is one-sided.
+
+    Tick counts do not compare across the universe: a two-tick spread is 0.2%
+    on the 0.001 grid and 2% on the 0.01 grid, and half of live markets are on
+    each. Anything that ranks or filters on "wide spread" has to say wide in
+    price.
+    """
+    if bid is None or bid <= 0.0 or ask <= 0.0:
+        return None
+    return (ask - bid) / ask
+
+
+def maker_saving(ask: float, quote: float, rate: "float | None" = None) -> float:
+    """
+    What resting at `quote` saves per share against crossing at `ask`.
+
+    Two components, and the smaller one is the spread: not paying the taker fee
+    is worth rate x p x (1-p), up to 1.25% at p=0.5 on a 5% market, while one
+    tick of spread on the fine grid is 0.1%. So on a thin book the fee is nearly
+    the whole reason to rest — which is why this is measured in money rather
+    than in ticks.
+    """
+    if ask <= 0.0:
+        return 0.0
+    return (ask - quote) + ask * effective_taker_fee(ask, rate)
+
+
+def plan_bundle_execution(
+    legs,
+    *,
+    early_cross: "bool | None" = None,
+    min_saving_frac: "float | None" = None,
+) -> "tuple[list, list]":
+    """
+    Split a bundle's legs into (rest as maker, cross as taker now).
+
+    A leg is crossed at submission when resting it cannot work — the quote joins
+    a queue far deeper than our order — or when resting saves too little per
+    share to be worth the chance of not filling.
+
+    The safety rule is the important part. Crossing early does not remove
+    execution risk, it MOVES it: the crossed leg is certainly owned, so if the
+    resting legs then fail the bundle is naked on what we bought, which is the
+    -0.20 USDC unwind we already pay for. It is only an improvement when the
+    remaining legs are ones we expect to fill. So if ANY leg we would rest is
+    itself unreachable, nothing is crossed early and the whole bundle rests as
+    before, leaving the guard's completion path to resolve it.
+
+    Off by default. It is a real change in where risk sits, and the fill log
+    has to show the reachability call is accurate before it earns being on.
+    """
+    on = NEGRISK_EARLY_CROSS if early_cross is None else early_cross
+    floor = MAKER_MIN_SAVING_FRAC if min_saving_frac is None else min_saving_frac
+    if not on or not legs:
+        return list(legs), []
+
+    def _worth_resting(leg) -> bool:
+        if not getattr(leg, "reachable", True):
+            return False
+        ask = float(getattr(leg, "no_ask", 0.0) or 0.0)
+        if ask <= 0.0:
+            return True
+        return maker_saving(ask, float(leg.no_bid)) >= floor * ask
+
+    rest = [l for l in legs if _worth_resting(l)]
+    cross = [l for l in legs if l not in rest]
+    if not cross:
+        return rest, []
+    # Every leg left resting must be one we expect to fill, or crossing now
+    # just builds a naked position more cheaply.
+    if any(not getattr(l, "reachable", True) for l in rest):
+        return list(legs), []
+    if not rest:
+        # Nothing can rest — the bundle is a taker play in full, and that is a
+        # decision for the edge test, not for this split.
+        return list(legs), []
+    return rest, cross
+
+
+def quote_opens_new_level(quote: float, bid: "float | None", tick: float) -> bool:
+    """
+    True when a post-only quote at `quote` creates its own price level.
+
+    A new level is alone, so it is first in queue by construction. Joining the
+    existing best bid instead puts us behind everything already resting there.
+    """
+    if bid is None or bid <= 0.0:
+        return True
+    return quote > bid + tick / 2.0
+
+
+def maker_quote_is_reachable(
+    quote:       float,
+    bid:         "float | None",
+    tick:        float,
+    queue_ahead: "float | None",
+    our_size:    float,
+    *,
+    max_multiple: "float | None" = None,
+) -> bool:
+    """
+    Can a post-only quote at this price realistically fill?
+
+    Two cases, and only one of them is a queue at all:
+
+      • the quote opens its own price level -> first by construction, reachable.
+      • the quote joins the resting best bid -> it sits behind `queue_ahead`
+        shares, every one of which must be consumed before ours is touched.
+        Reachable only while that queue is small relative to our own order.
+
+    An unknown queue (`None`) is treated as reachable. A batched price_change
+    states a price without its depth, and refusing to quote on missing data
+    would silence the bot on exactly the fast-moving books worth quoting. The
+    fill log records which case each leg was in, so the cost of that permissive
+    choice is measurable rather than assumed.
+    """
+    if quote_opens_new_level(quote, bid, tick):
+        return True
+    if queue_ahead is None:
+        return True
+    limit = MAKER_MAX_QUEUE_MULTIPLE if max_multiple is None else max_multiple
+    if limit <= 0:
+        return True
+    return queue_ahead <= limit * max(our_size, 1e-9)
 
 
 def lead_book_bid(
@@ -301,17 +652,89 @@ NEGRISK_MIN_RELATIVE_EDGE: float = 0.05   # paper §6   — $0.05 on the dollar
 NEGRISK_MIN_LEG_SHARES:    float = 5.0    # Gamma orderMinSize on live markets
 
 
+# Coarsest price grid a market may have, as a fraction of its cheap side,
+# before quoting it becomes pointless. Above this, one tick moves the price by
+# more than the threshold — the minimum spread is that wide by construction, so
+# no maker quote can be a fine concession.
+#
+# Measured across 600 live markets on 2026-09-10; 20% separates cleanly, with
+# no market in 0.05-0.95 anywhere near it.
+MAX_TICK_FRACTION: float = float(os.environ.get("MAX_TICK_FRACTION", 0.20))
+
+# Kill switch back to the flat [EXTREME_PRICE_LO, EXTREME_PRICE_HI] band.
+# The resolution test widens admission by roughly 40% of the universe, which is
+# the largest live behaviour change on this branch and the one most likely to
+# need undoing in a hurry. Setting MAX_TICK_FRACTION low does NOT undo it — a
+# small fraction rejects everything — so the revert needs its own switch.
+QUALITY_BAND_USE_RESOLUTION: bool = os.environ.get(
+    "QUALITY_BAND_USE_RESOLUTION", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+
+
+def price_resolution(price: float, tick: "float | None") -> "float | None":
+    """
+    The tick as a fraction of the cheap side of the market.
+
+    This is what "extreme" actually costs us. A price band alone cannot say:
+    Polymarket drops the grid from 0.01 to 0.001 as a market moves to the edges,
+    so the same 0.02 price is a 50% grid on the coarse tick and a 5% grid on the
+    fine one. The cheap side is the relevant one because that is the leg a
+    NegRisk bundle buys.
+    """
+    if tick is None or tick <= 0.0 or not (0.0 < price < 1.0):
+        return None
+    return tick / min(price, 1.0 - price)
+
+
+def has_usable_resolution(
+    price: float,
+    tick:  "float | None",
+    max_fraction: "float | None" = None,
+) -> bool:
+    """
+    Can this market be quoted finely enough to be worth quoting?
+
+    Unknown tick returns True: the flat price band still applies as the
+    fallback, and refusing on missing metadata would be a worse error than the
+    one this replaces.
+    """
+    r = price_resolution(price, tick)
+    if r is None:
+        return True
+    return r <= (MAX_TICK_FRACTION if max_fraction is None else max_fraction)
+
+
 def _within_quality_band(
     yes_ask: float,
     no_ask:  float,
     lo:      float,
     hi:      float,
+    tick:    "float | None" = None,
 ) -> bool:
     """
     True iff BOTH legs' asks sit inside [lo, hi] — i.e. the market is genuinely
     contested rather than near-resolved.  Shared by the taker (ArbDetector) and
     maker (DutchBookPricer) paths so the quality rule lives in exactly one place.
     """
+    if tick is not None and QUALITY_BAND_USE_RESOLUTION:
+        # Judge by what the grid can express, not by where the price sits.
+        #
+        # The flat band excluded everything outside [0.05, 0.95] as
+        # near-resolved. On 600 live markets that discarded 129 markets — 21% of
+        # the universe — whose grid is perfectly fine: Polymarket drops the tick
+        # to 0.001 as a market moves to the edges, so 0.01-0.05 and 0.95-0.99
+        # resolve to 4-5% of their cheap side, better than the 0.25-0.75 band
+        # manages on the coarse grid. Their 24h volume is no lower either; the
+        # band below 0.01 is the genuinely unquotable one, at 67%, and above
+        # 0.99 at 200%.
+        #
+        # A decided market is also the CHEAPER place to be wrong: the taker fee
+        # is rate x p x (1-p), so unwinding a naked leg at 0.02 costs about
+        # 0.001 a share against 0.0125 at 0.50.
+        return (
+            has_usable_resolution(yes_ask, tick)
+            and has_usable_resolution(no_ask, tick)
+        )
     return lo <= yes_ask <= hi and lo <= no_ask <= hi
 
 
@@ -534,6 +957,20 @@ class ArbLeg:
     no_bid:   float   # synthetic post-only bid (no_ask − TICK_SIZE)
     size:     float   # shares per bundle (= n_bundles)
 
+    # ── Book state at quote time ──────────────────────────────────────────────
+    # Carried so execution can route each leg and the fill log can explain,
+    # afterwards, why it did or did not fill. Defaults keep every existing
+    # construction site valid.
+    book_bid:    "float | None" = None   # best bid our quote is measured against
+    queue_ahead: "float | None" = None   # shares resting there; None = unknown
+    tick:        "float | None" = None   # this leg's own grid
+    leads:       bool = False            # quote opens its own price level
+    reachable:   bool = True             # can realistically fill as a maker
+    # Estimated seconds until the queue ahead clears. None when the market's
+    # traded volume was never scanned — a missing estimate must not read as
+    # "fills instantly".
+    expected_fill_s: "float | None" = None
+
 
 @dataclass(frozen=True, slots=True)
 class NegRiskSignal:
@@ -667,7 +1104,9 @@ class DutchBookPricer:
         # ── 1a. Signal-quality guards ─────────────────────────────────────────
         # Reject near-resolved / extreme markets: their edge is rebate-driven on
         # thin books that rarely fill, not a durable price gap.
-        if not _within_quality_band(yes_ask, no_ask, self._extreme_lo, self._extreme_hi):
+        if not _within_quality_band(
+            yes_ask, no_ask, self._extreme_lo, self._extreme_hi, tick_size,
+        ):
             logger.debug(
                 "DutchBookPricer | extreme/near-resolved yes=%.4f no=%.4f "
                 "(band [%.3f, %.3f]) — skip",
@@ -1154,6 +1593,7 @@ class ArbDetector:
         no_ask:            float,
         max_position_usdc: float = 50.0,
         fee_rate:          float | None = None,
+        tick_size:         float | None = None,   # market tick (0.01 / 0.001)
     ) -> Optional[ArbSignal]:
         """
         Evaluate whether a YES/NO best-ask pair offers a taker fee-adjusted edge.
@@ -1169,7 +1609,9 @@ class ArbDetector:
             return None
 
         # Signal-quality guard: skip near-resolved / extreme markets.
-        if not _within_quality_band(yes_ask, no_ask, self._extreme_lo, self._extreme_hi):
+        if not _within_quality_band(
+            yes_ask, no_ask, self._extreme_lo, self._extreme_hi, tick_size,
+        ):
             logger.debug(
                 "ArbDetector | extreme/near-resolved yes=%.4f no=%.4f — skip",
                 yes_ask, no_ask,
@@ -1290,6 +1732,8 @@ class NegRiskArbDetector:
         min_relative_edge:   float = NEGRISK_MIN_RELATIVE_EDGE,
         min_leg_shares:      float = NEGRISK_MIN_LEG_SHARES,
         extreme_hi:          float = EXTREME_PRICE_HI,
+        subset_search:       bool  = NEGRISK_SUBSET_SEARCH,
+        early_rest_p:        "float | None" = None,
     ) -> None:
         if not (0.0 < desired_net_margin < 1.0):
             raise ValueError(
@@ -1311,6 +1755,15 @@ class NegRiskArbDetector:
         self._default_rebate   = max(0.0, min(default_rebate_rate, MAX_MAKER_REBATE))
         self._min_outcome_prob = min_outcome_prob
         self._max_legs         = max_legs
+        self._subset_search    = bool(subset_search)
+        # Completion rate used to price bidding above the cheapest leading
+        # quote. Held on the detector rather than read from the module at call
+        # time, so a caller can supply a measured value — and so the feature
+        # cannot be half-enabled, with the flag on and the rate still absent.
+        self._early_rest_p     = (
+            NEGRISK_EARLY_REST_P if early_rest_p is None else early_rest_p
+        )
+        self._early_rest       = self._early_rest_p is not None
         self._require_completable  = NEGRISK_REQUIRE_COMPLETABLE
         self._min_completable_edge = NEGRISK_MIN_COMPLETABLE_EDGE
         # Counters so the filter's effect is measurable rather than assumed.
@@ -1340,6 +1793,92 @@ class NegRiskArbDetector:
         )
         return f"{total} evaluated | {parts}"
 
+    def _early_rest_quotes(
+        self,
+        combo,
+        group_tick: "float | None",
+    ) -> "list[float | None]":
+        """
+        Per leg, the price to rest at when the arbitrage does not exist yet.
+
+        The shape that makes this safe is one leg at a time. Resting the whole
+        bundle speculatively means every leg is exposed; resting ONE at a price
+        that already pays means: if it fills, cross the others at today's asks
+        and the bundle still clears. The only thing that can go wrong is the
+        other legs moving between our fill and our crossing, which is a much
+        smaller window than waiting for k legs to fill independently.
+
+        So leg i may rest at (k-1) minus what crossing everything else costs,
+        minus the edge we insist on keeping. Returns None for a leg where no
+        such price exists — either it is below the resting best bid, where we
+        would join a queue and gain nothing, or above the ask, where it is not
+        a maker order at all.
+        """
+        k = len(combo)
+        realistic = [
+            ask * (1.0 + effective_taker_fee(ask))
+            for _tid, ask, _p, _d, _b, _t, _q in combo
+        ]
+        out: "list[float | None]" = []
+        for i, (_tid, ask, _p, _d, bid, tick, _q) in enumerate(combo):
+            t = tick if tick is not None else (group_tick or DEFAULT_TICK_SIZE)
+            others = sum(realistic) - realistic[i]
+            # Reserve whichever floor is higher. Bidding up to the relative-edge
+            # floor alone left bundles a fraction under section 7b's separate
+            # completable floor, so the raised quote was computed and then the
+            # bundle refused — the feature defeating itself one step later.
+            reserve = max(
+                self._min_rel_edge * float(k - 1),
+                self._min_completable_edge,
+            )
+            limit = arb_limit_price(others, k, reserve)
+            limit = math.floor(limit / t) * t          # onto this leg's grid
+            limit = round(limit, 6)
+            if limit <= 0.0 or limit >= ask:
+                out.append(None)                        # not a maker price
+            elif not quote_opens_new_level(limit, bid, t):
+                out.append(None)                        # would join a queue
+            else:
+                out.append(limit)
+        return out
+
+    def _subset_return(self, combo, group_tick: "float | None") -> float:
+        """
+        What a subset earns per USDC of capital tied up in it.
+
+        Prices each leg the way section 7b does — a leg whose post-only quote
+        leads the book costs its quote and pays no fee, a leg that has to be
+        crossed costs the ask plus the taker fee — so selection and admission
+        cannot drift apart.
+
+        The RATIO matters, not the difference. Scoring absolute edge always
+        picks the largest allowed bundle, because adding any leg raises the
+        payout by 1 and the cost by less than 1, so the choice collapses. But
+        capital is the binding constraint: n_bundles is max_position_usdc over
+        the combined bid, so a cheaper subset buys more bundles out of the same
+        money. Worked on a live-shaped group at 5% taker rate:
+
+            legs                  edge/bundle   capital   return
+            0.06/0.50/0.52/0.90      +0.988      1.94      51%
+            0.06/0.50                +0.425      0.54      79%
+
+        Same wallet, half the legs, half again the profit.
+        """
+        payout = float(len(combo) - 1)
+        cost = 0.0      # what completion realistically costs, fees included
+        spend = 0.0     # capital actually committed at the quoted prices
+        for _tid, ask, _prob, _depth, bid, tick, _queue in combo:
+            t = tick if tick is not None else (group_tick or DEFAULT_TICK_SIZE)
+            quote = lead_book_bid(ask, bid, t)
+            spend += quote
+            if bid is None or quote > bid + 1e-12:
+                cost += quote
+            else:
+                cost += ask * (1.0 + effective_taker_fee(ask))
+        if spend <= 0.0:
+            return -math.inf
+        return (payout - cost) / spend
+
     def evaluate_neg_risk(
         self,
         condition_id:       str,
@@ -1350,6 +1889,8 @@ class NegRiskArbDetector:
         tick_size:          float | None = None,
         no_ask_sizes:       list[float] | None = None,
         no_best_bids:       list[float | None] | None = None,
+        no_bid_sizes:       list[float | None] | None = None,
+        group_volume_24h:   float | None = None,
         leg_tick_sizes:     list[float | None] | None = None,
     ) -> Optional[NegRiskSignal]:
         """
@@ -1418,8 +1959,9 @@ class NegRiskArbDetector:
         # ── 2. Candidate legs — drop unusable quotes ──────────────────────────
         # A malformed/absent quote only costs us that outcome's contribution to
         # the edge (subset lemma), so drop the leg instead of the whole group.
-        # id, ask, implied prob, ask depth, best bid, tick
-        candidates: list[tuple[str, float, float, float, "float|None", "float|None"]] = []
+        # id, ask, implied prob, ask depth, best bid, tick, bid queue
+        candidates: list[tuple[str, float, float, float, "float|None", "float|None",
+                              "float|None"]] = []
         for i, (token_id, ask) in enumerate(zip(outcome_token_ids, no_asks)):
             if not (0.01 <= ask <= 0.99):
                 logger.debug(
@@ -1443,7 +1985,9 @@ class NegRiskArbDetector:
                     continue
             leg_bid  = no_best_bids[i] if no_best_bids else None
             leg_tick = leg_tick_sizes[i] if leg_tick_sizes else None
-            candidates.append((token_id, ask, 1.0 - ask, depth, leg_bid, leg_tick))
+            leg_queue = no_bid_sizes[i] if no_bid_sizes else None
+            candidates.append((token_id, ask, 1.0 - ask, depth, leg_bid, leg_tick,
+                               leg_queue))
 
         if len(candidates) < 2:
             self._stop("under_two_usable_quotes")
@@ -1454,8 +1998,25 @@ class NegRiskArbDetector:
         # $0.95, i.e. the group is still genuinely contested.  An implied YES
         # above the band means the group is decided and the remaining "edge" is
         # rebate noise on a book nobody fills.
+        # A lopsided group is not automatically a dead one. Polymarket drops the
+        # tick to 0.001 as a market moves to the edges, so an outcome implied at
+        # 0.97 on the fine grid resolves to 3% of its cheap side — finer than a
+        # coin-flip market manages on the coarse grid, and its 24h volume is no
+        # lower. Measured on 600 live markets, the flat band discarded 129 of
+        # them (21% of the universe) on price alone.
+        #
+        # What stays excluded is the band the grid genuinely cannot express:
+        # below 0.01 the fine tick is still 67% of the price, above 0.99 it is
+        # 200%. The resolution test says so directly; the flat band is the
+        # fallback when no tick is known.
         top_prob = max(c[2] for c in candidates)
-        if top_prob > self._extreme_hi:
+        top_leg = max(candidates, key=lambda c: c[2])
+        top_tick = top_leg[5] if top_leg[5] is not None else tick_size
+        if top_tick is not None and QUALITY_BAND_USE_RESOLUTION:
+            group_dead = not has_usable_resolution(1.0 - top_prob, top_tick)
+        else:
+            group_dead = top_prob > self._extreme_hi
+        if group_dead:
             logger.debug(
                 "NegRiskArbDetector | condition=%s top outcome implied %.4f > %.2f "
                 "— group effectively resolved, skip",
@@ -1476,9 +2037,45 @@ class NegRiskArbDetector:
             self._stop("below_probability_floor")
             return None
 
-        selected.sort(key=lambda c: c[2], reverse=True)
-        dropped_tail = max(0, len(selected) - self._max_legs)
-        selected = selected[:self._max_legs]
+        # Which k of the N outcomes to buy is a choice, and ranking them by
+        # implied probability ignores what they cost to complete.
+        #
+        # The taker fee is rate x p x (1-p) x size, so its burden per leg follows
+        # a bell that peaks at p=0.5 and vanishes at the extremes. Over a bundle
+        # that is rate x SUM yes_i(1 - yes_i), which moves the break-even from
+        # SUM yes > 1.0071 on an extreme-priced group to > 1.0394 on a flat one —
+        # a factor of five in how large a Dutch book has to be before it pays.
+        #
+        # So search the subsets instead of sorting. The objective is the same
+        # realistic price section 7b already charges: a leg whose quote leads
+        # the book costs its quote, a leg that must be crossed costs the ask
+        # plus the fee on it. Ranking by probability optimises the gross edge;
+        # this optimises the one we actually collect.
+        dropped_tail = 0
+        if self._subset_search and len(selected) > 2:
+            # Bound the combinatorics — beyond the strongest handful the legs
+            # are too cheap to change the answer. C(8,4)+C(8,3)+C(8,2) = 154.
+            selected.sort(key=lambda c: c[2], reverse=True)
+            pool = selected[:min(len(selected), self._max_legs + 4)]
+            best, best_edge = None, -math.inf
+            for k in range(2, min(self._max_legs, len(pool)) + 1):
+                for combo in itertools.combinations(pool, k):
+                    edge = self._subset_return(combo, tick_size)
+                    # Ties go to the larger bundle: the same return spread over
+                    # more of the group's liquidity absorbs a bigger position.
+                    if edge > best_edge + 1e-12 or (
+                        best is not None
+                        and abs(edge - best_edge) <= 1e-12
+                        and len(combo) > len(best)
+                    ):
+                        best, best_edge = combo, edge
+            if best is not None:
+                dropped_tail = len(selected) - len(best)
+                selected = list(best)
+        else:
+            selected.sort(key=lambda c: c[2], reverse=True)
+            dropped_tail = max(0, len(selected) - self._max_legs)
+            selected = selected[:self._max_legs]
 
         m = len(selected)
         sel_ids   = [c[0] for c in selected]
@@ -1486,6 +2083,7 @@ class NegRiskArbDetector:
         sel_depth = [c[3] for c in selected]
         sel_bids  = [c[4] for c in selected]
         sel_ticks = [c[5] if c[5] is not None else tick_size for c in selected]
+        sel_queues = [c[6] for c in selected]
 
         # ── 5. Synthetic post-only NO bids ────────────────────────────────────
         # One tick under each leg's OWN ask. Previously every leg was snapped to
@@ -1503,6 +2101,53 @@ class NegRiskArbDetector:
             lead_book_bid(ask, bid, t)
             for ask, bid, t in zip(sel_asks, sel_bids, sel_ticks)
         ]
+
+        # ── 5b. Bid as high as profitability allows ───────────────────────────
+        # lead_book_bid returns the CHEAPEST price that leads the book, on the
+        # reasoning that the extra ticks up to the ask "buy no position, only
+        # cost". That is true of queue position and false of fill probability.
+        # A bid at 0.51 on a 0.50/0.70 book is hit only by a seller willing to
+        # take 0.51; a bid at 0.69 is hit by every seller willing to take 0.69
+        # or less. Same queue — alone at its own level either way — but far more
+        # of the flow reaches it.
+        #
+        # So where a leg can rest higher and the bundle still clears (cross
+        # everything else at today's asks and keep the edge floor), rest higher.
+        # This is what early positioning actually amounts to on this exchange:
+        # not jumping a queue, which the tick grid forbids, but standing where
+        # the selling flow arrives while the arbitrage is still absent.
+        #
+        # Note what this cannot do. On a one-tick book the limit price is below
+        # the touch by construction — it has to sit under the ask, and the only
+        # price under the ask IS the best bid — so the quote would join a queue
+        # and is refused. 79% of live markets are in that state, and no amount
+        # of prediction changes it.
+        #
+        # Off unless a completion rate has been measured: see should_rest_early.
+        early_rested = 0
+        if self._early_rest:
+            limits = self._early_rest_quotes(selected, tick_size)
+            for i, limit in enumerate(limits):
+                if limit is None or limit <= no_bids[i]:
+                    continue        # never bid less than we already would
+                edge_at_limit = float(m - 1) - (
+                    sum(a * (1.0 + effective_taker_fee(a)) for a in sel_asks)
+                    - sel_asks[i] * (1.0 + effective_taker_fee(sel_asks[i]))
+                    + limit
+                )
+                if not should_rest_early(edge_at_limit, self._early_rest_p):
+                    continue
+                logger.info(
+                    "NegRiskArbDetector | %s leg %d bidding %.4f instead of "
+                    "%.4f — same queue position, more of the selling flow, "
+                    "still pays %.4f/bundle (needs %.0f%% completion to break "
+                    "even; assuming %.0f%%)",
+                    condition_id[:16], i, limit, no_bids[i], edge_at_limit,
+                    break_even_completion_rate(edge_at_limit) * 100.0,
+                    (self._early_rest_p or 0.0) * 100.0,
+                )
+                no_bids[i] = limit
+                early_rested += 1
 
         # ── 6. Resolve maker rebate ───────────────────────────────────────────
         rebate = (
@@ -1607,14 +2252,33 @@ class NegRiskArbDetector:
             return None
 
         # ── 9. Build per-outcome leg tuple ────────────────────────────────────
+        # Each leg carries the book it was quoted against, and what that implies
+        # for execution. `reachable` is the routing signal: a quote that joins a
+        # queue far deeper than our own order does not fill slowly, it does not
+        # fill, so resting it only burns the TTL before the guard crosses the leg
+        # anyway. Section 7b has already priced that crossing; this says which
+        # legs it applies to.
         legs = tuple(
             ArbLeg(
                 token_id=token_id,
                 no_ask=ask,
                 no_bid=bid,
                 size=n_bundles,
+                book_bid=book_bid,
+                queue_ahead=queue,
+                tick=t,
+                leads=quote_opens_new_level(bid, book_bid, t),
+                reachable=maker_quote_is_reachable(
+                    bid, book_bid, t, queue, n_bundles
+                ),
+                expected_fill_s=(
+                    0.0 if quote_opens_new_level(bid, book_bid, t)
+                    else expected_fill_seconds(queue, group_volume_24h, bid)
+                ),
             )
-            for token_id, ask, bid in zip(sel_ids, sel_asks, no_bids)
+            for token_id, ask, bid, book_bid, t, queue in zip(
+                sel_ids, sel_asks, no_bids, sel_bids, sel_ticks, sel_queues
+            )
         )
 
         spread_bps = round(relative_edge * 10_000, 1)

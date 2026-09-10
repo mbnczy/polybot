@@ -67,7 +67,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from strategy.arbitrage import effective_taker_fee
+from strategy.arbitrage import effective_taker_fee, maker_quote_is_hopeless
 from telemetry import fill_log
 from telemetry.metrics import ARB_HALF_FILLS, ARB_UNWIND_FAILURES
 
@@ -158,9 +158,32 @@ class _BundleLegState:
     # exchange has had time to index it.
     placed_at:        float = field(default_factory=time.monotonic)
 
+    # ── Book state at quote time, carried from the signal ─────────────────────
+    # The fill log recorded these as null on all 67 of its real rows, which made
+    # the one question it was written to answer — do we miss because of queue
+    # position? — unanswerable from its own data.
+    book_bid:    "float | None" = None
+    book_ask:    "float | None" = None
+    tick:        "float | None" = None
+    queue_ahead: "float | None" = None
+    leads:       bool = False
+    reachable:   bool = True
+    expected_fill_s: "float | None" = None
+    # Set from the guard's own order_ttl so the estimate is compared against
+    # the time this leg actually has, not a constant guessed here.
+    ttl_s:       "float | None" = None
+
     @property
     def fully_matched(self) -> bool:
         return self.matched >= self.size - _SHARE_EPS
+
+    @property
+    def hopeless(self) -> bool:
+        """Resting behind a queue that cannot drain inside the bundle's TTL."""
+        return maker_quote_is_hopeless(
+            self.queue_ahead, self.size, leads=self.leads,
+            expected_s=self.expected_fill_s, ttl_s=self.ttl_s,
+        )
 
 
 @dataclass
@@ -268,6 +291,14 @@ class NegRiskBundleGuard:
             legs.append(_BundleLegState(
                 i, leg.token_id, order_id, leg.no_bid, leg.size,
                 matched=matched, open=status not in _FILLED_STATUSES,
+                book_bid=getattr(leg, "book_bid", None),
+                book_ask=getattr(leg, "no_ask", None),
+                tick=getattr(leg, "tick", None),
+                queue_ahead=getattr(leg, "queue_ahead", None),
+                leads=bool(getattr(leg, "leads", False)),
+                reachable=bool(getattr(leg, "reachable", True)),
+                expected_fill_s=getattr(leg, "expected_fill_s", None),
+                ttl_s=self._ttl,
             ))
 
         bundle_id = f"{signal.condition_id[:16]}-{time.monotonic_ns()}"
@@ -386,6 +417,14 @@ class NegRiskBundleGuard:
             await self._finalize(bundle, complete=True)
             return
 
+        # Legs still resting behind a queue that cannot drain in the time left.
+        # The clocks below exist to give a maker quote its chance; where there
+        # is no chance they only delay the outcome, and every second of delay is
+        # a second the price can move against a bundle we are already exposed
+        # on. Requires a MEASURED queue far deeper than our own order, so a
+        # stale or absent reading never cuts a wait short.
+        stuck = [l for l in bundle.legs if l.open and l.hopeless]
+
         if bundle.any_matched:
             # Incomplete bundle with real exposure — start (or continue) the
             # imbalance clock.
@@ -393,12 +432,32 @@ class NegRiskBundleGuard:
                 bundle.imbalance_since = now
             # Checked in the same pass that arms the clock, so a timeout of 0
             # means "tolerate no imbalance at all" rather than "one free poll".
-            if now - bundle.imbalance_since >= self._timeout:
+            waited = now - bundle.imbalance_since
+            if waited >= self._timeout:
+                await self._finalize(bundle, complete=False)
+            elif stuck and len(stuck) == sum(1 for l in bundle.legs if l.open):
+                logger.info(
+                    "NegRiskGuard | %s completing %.1fs early — every open leg "
+                    "sits behind a queue it cannot clear (deepest %.0f shares "
+                    "against %.2f)",
+                    bundle.condition_id[:16], self._timeout - waited,
+                    max(l.queue_ahead or 0.0 for l in stuck), stuck[0].size,
+                )
                 await self._finalize(bundle, complete=False)
             return
 
         # Nothing filled anywhere.
         if not bundle.any_open or age >= self._ttl:
+            await self._finalize(bundle, complete=False)
+        elif stuck and len(stuck) == sum(1 for l in bundle.legs if l.open):
+            # No exposure, so nothing to complete — but holding the capital and
+            # the market lock for the rest of the TTL buys nothing either.
+            logger.info(
+                "NegRiskGuard | %s releasing %.1fs early — no leg filled and "
+                "none can (deepest queue %.0f shares against %.2f)",
+                bundle.condition_id[:16], self._ttl - age,
+                max(l.queue_ahead or 0.0 for l in stuck), stuck[0].size,
+            )
             await self._finalize(bundle, complete=False)
 
     async def _refresh_leg(
@@ -717,6 +776,9 @@ class NegRiskBundleGuard:
                          "cancelled" if leg.cancel_requested else "expired"),
                 price=leg.bid, size=leg.size, matched=leg.matched,
                 rested_s=rested,
+                tick=leg.tick, best_bid=leg.book_bid, best_ask=leg.book_ask,
+                queue_ahead=leg.queue_ahead, reachable=leg.reachable,
+                expected_fill_s=leg.expected_fill_s,
             )
 
         # Nothing may be left resting on the book.

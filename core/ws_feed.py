@@ -64,6 +64,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import time
 from typing import Optional
 
@@ -129,6 +130,52 @@ def _best_ask_level(asks: "list | None") -> "tuple[float, float] | None":
     return None if best_p is None else (best_p, best_s)
 
 
+def _depth_bucket(size: "float | None") -> int:
+    """Order of magnitude of a queue, for change detection. -1 when unknown."""
+    if size is None:
+        return -1
+    if size <= 0.0:
+        return 0
+    return int(math.log10(size)) + 1
+
+
+def _best_bid_level(bids: "list | None") -> "tuple[float, float | None] | None":
+    """
+    Highest bid on the book AND the size resting at it, or None.
+
+    The size is the queue a post-only quote at that price would join. Measured
+    across 257 live books on 2026-09-10, the median one-tick book holds 10,558
+    shares at the touch — 1,056x a ten-share order — so whether a maker quote
+    can fill at all is decided here, by a number the feed used to discard.
+
+    Same trap as the ask side: the exchange sends bids ascending from 0.001, so
+    bids[0] is the WORST bid. Scan for the maximum.
+    """
+    best_p: float | None = None
+    best_s: float | None = None
+    for lvl in bids or []:
+        if isinstance(lvl, dict):
+            try:
+                price = float(lvl["price"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            try:
+                size = float(lvl.get("size"))
+            except (TypeError, ValueError):
+                size = None
+        else:
+            try:
+                price = float(lvl)
+            except (TypeError, ValueError):
+                continue
+            size = None
+        if price <= 0.0:
+            continue
+        if best_p is None or price > best_p:
+            best_p, best_s = price, size
+    return None if best_p is None else (best_p, best_s)
+
+
 def _best_bid_price(bids: "list | None") -> "float | None":
     """
     Highest bid on the book, or None.
@@ -181,6 +228,12 @@ class _MarketState:
         self._best_bid: dict[str, Optional[float]] = {
             yes_token_id: None, no_token_id: None,
         }
+        # Shares resting at the best bid — the queue our post-only quote joins.
+        # The group feed learned to keep this; the binary path was left without
+        # it, so half the fill log could say a leg missed but not why.
+        self._bid_size: dict[str, Optional[float]] = {
+            yes_token_id: None, no_token_id: None,
+        }
         self._tick_size: dict[str, Optional[float]] = {
             yes_token_id: None, no_token_id: None,
         }
@@ -193,6 +246,7 @@ class _MarketState:
         """Invalidate best-asks (called on reconnect → await fresh snapshot)."""
         self._best_ask = {self.yes_token_id: None, self.no_token_id: None}
         self._best_bid = {self.yes_token_id: None, self.no_token_id: None}
+        self._bid_size = {self.yes_token_id: None, self.no_token_id: None}
         self._last_pushed = (None, None)
 
     def idle_seconds(self, now: Optional[float] = None) -> float:
@@ -221,17 +275,12 @@ class _MarketState:
             except (TypeError, ValueError):
                 pass
 
-        # Best bid from the snapshot. Explicit max rather than bids[0] so it is
-        # correct whichever way the exchange orders the array.
-        bids = event.get("bids", [])
-        if bids:
-            try:
-                _p = [float(e["price"] if isinstance(e, dict) else e) for e in bids]
-                _p = [x for x in _p if x > 0.0]
-                if _p:
-                    self._best_bid[asset_id] = max(_p)
-            except (KeyError, TypeError, ValueError):
-                pass
+        # Best bid AND the size resting there, via the same reader the group
+        # feed uses — the exchange sends bids ascending, so bids[0] is the worst.
+        bid_level = _best_bid_level(event.get("bids", []))
+        if bid_level is not None:
+            self._best_bid[asset_id] = bid_level[0]
+            self._bid_size[asset_id] = bid_level[1]
 
         best = _best_ask_level(event.get("asks", []))
         if best is None:
@@ -250,6 +299,10 @@ class _MarketState:
         _bb = event.get("best_bid")
         if _bb is not None:
             try:
+                if float(_bb) != self._best_bid[asset_id]:
+                    # A stated price carries no depth. None = unknown, which is
+                    # not the same as an empty level.
+                    self._bid_size[asset_id] = None
                 self._best_bid[asset_id] = float(_bb)
             except (TypeError, ValueError):
                 pass
@@ -330,6 +383,8 @@ class _MarketState:
             "no_ask":       no_ask,
             "yes_best_bid": self._best_bid.get(self.yes_token_id),
             "no_best_bid":  self._best_bid.get(self.no_token_id),
+            "yes_bid_size": self._bid_size.get(self.yes_token_id),
+            "no_bid_size":  self._bid_size.get(self.no_token_id),
             "tick_size":    max(_ticks) if _ticks else None,
             "ts":           now,
         }
@@ -381,6 +436,11 @@ class _NegRiskGroupState:
         # the back of an existing queue. On a penny-tick book those are the
         # difference between filling and never filling.
         self._best_bid:  dict[str, Optional[float]] = {t: None for t in no_token_ids}
+        # Shares resting at the best bid — the queue a post-only quote joins.
+        # None means "unknown", not "empty": a batched price_change states a
+        # price without its depth, and the gate must not read that as a clear
+        # book. The next `book` snapshot restores a real reading.
+        self._bid_size:  dict[str, Optional[float]] = {t: None for t in no_token_ids}
         self._last_pushed: tuple = ()
 
     def owns(self, asset_id: str) -> bool:
@@ -391,6 +451,7 @@ class _NegRiskGroupState:
         for t in self.no_token_ids:
             self._best_ask[t] = None
             self._ask_size[t] = None
+            self._bid_size[t] = None
         self._last_pushed = ()
 
     def idle_seconds(self, now: Optional[float] = None) -> float:
@@ -417,9 +478,10 @@ class _NegRiskGroupState:
             except (TypeError, ValueError):
                 pass
 
-        bid = _best_bid_price(event.get("bids", []))
-        if bid is not None:
-            self._best_bid[asset_id] = bid
+        bid_level = _best_bid_level(event.get("bids", []))
+        if bid_level is not None:
+            self._best_bid[asset_id] = bid_level[0]
+            self._bid_size[asset_id] = bid_level[1]
 
         best = _best_ask_level(event.get("asks", []))
         if best is None:
@@ -489,6 +551,7 @@ class _NegRiskGroupState:
         asks:      list[float] = []
         sizes:     list[float | None] = []
         bids:      list[float | None] = []
+        bid_sizes: list[float | None] = []
         leg_ticks: list[float | None] = []
         for t in self.no_token_ids:
             ask = self._best_ask.get(t)
@@ -499,12 +562,21 @@ class _NegRiskGroupState:
             # None propagates as "depth unknown" — see _handle_price_change.
             sizes.append(self._ask_size.get(t))
             bids.append(self._best_bid.get(t))
+            bid_sizes.append(self._bid_size.get(t))
             leg_ticks.append(self._tick_size.get(t))
 
         if len(token_ids) < self.MIN_QUOTED_LEGS:
             return None
 
-        fingerprint = (tuple(token_ids), tuple(asks), tuple(sizes), tuple(bids))
+        # The queue at the touch decides whether a maker quote can fill, so a
+        # book that drains from 10,000 shares to 90 must reach the detector even
+        # when no price moved. Raw sizes in the fingerprint would push a tick on
+        # every one-share flicker, so bucket by order of magnitude: a real drain
+        # changes the bucket, jitter does not.
+        fingerprint = (
+            tuple(token_ids), tuple(asks), tuple(sizes), tuple(bids),
+            tuple(_depth_bucket(s) for s in bid_sizes),
+        )
         if fingerprint == self._last_pushed:
             return None
         self._last_pushed = fingerprint
@@ -522,6 +594,9 @@ class _NegRiskGroupState:
             # kept for order validity, but the detector needs the real per-leg
             # grid to know what improving a book actually costs.
             "no_best_bids":      bids,
+            # Shares already queued at each best bid. A post-only quote that
+            # lands on an existing level sits BEHIND all of it.
+            "no_bid_sizes":      bid_sizes,
             "leg_tick_sizes":    leg_ticks,
             # Coarsest observed grid — valid on every member market.
             "tick_size":         max(_ticks) if _ticks else None,

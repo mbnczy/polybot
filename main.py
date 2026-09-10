@@ -101,7 +101,7 @@ from config import BotConfig                                       # noqa: E402
 from core.clob_client import (                                     # noqa: E402
     PolyClient, classify_fills, prime_market_meta,
 )
-from core import market_titles                                  # noqa: E402
+from core import market_flow, market_titles                                  # noqa: E402
 from core.scanner import FeedRegistry, MarketScanner               # noqa: E402
 from execution.auto_redeem import AutoRedeemer                     # noqa: E402
 from execution.inventory_manager import InventoryManager           # noqa: E402
@@ -127,6 +127,7 @@ from strategy.arbitrage import (                                   # noqa: E402
     NegRiskArbDetector,
     NegRiskSignal,
     _normalise_fee,
+    plan_bundle_execution,
 )
 from strategy.arb_duration import ArbDurationTracker               # noqa: E402
 from strategy.tuner import fee_recalibration_loop, tuner_loop                               # noqa: E402
@@ -359,7 +360,16 @@ async def strategy_loop(
                     # HEDGE_TIMEOUT_S — the strategy loop must NOT release or
                     # unwind here, or a later lone fill would go unnoticed.
                     notifier.arb_execution_started(condition_id)
-                    pair_guard.watch_pair(arb_signal, n_shares, yes_resp, no_resp)
+                    pair_guard.watch_pair(
+                        arb_signal, n_shares, yes_resp, no_resp,
+                        book={
+                            "yes_best_bid": tick.get("yes_best_bid"),
+                            "no_best_bid":  tick.get("no_best_bid"),
+                            "yes_bid_size": tick.get("yes_bid_size"),
+                            "no_bid_size":  tick.get("no_bid_size"),
+                            "tick_size":    tick.get("tick_size"),
+                        },
+                    )
                     logger.info(
                         "Maker orders resting for %s (%s) — PairGuard watching.",
                         condition_id[:16], fill_state,
@@ -455,6 +465,8 @@ async def strategy_loop(
                     tick_size=tick.get("tick_size"),
                     no_ask_sizes=tick.get("no_ask_sizes"),
                     no_best_bids=tick.get("no_best_bids"),
+                    no_bid_sizes=tick.get("no_bid_sizes"),
+                    group_volume_24h=market_flow.get(condition_id),
                     leg_tick_sizes=tick.get("leg_tick_sizes"),
                 )
                 if nr_signal is None:
@@ -526,9 +538,25 @@ async def strategy_loop(
                 if not breaker.check_arb(nr_intent):
                     continue
 
+                # Split the bundle: legs whose quote cannot fill (it joins a
+                # queue far deeper than our order) or whose maker saving is too
+                # small to be worth the non-fill risk are bought outright now,
+                # the rest rest. Off unless NEGRISK_EARLY_CROSS is set — it
+                # moves risk rather than removing it, and only pays once the
+                # fill log shows the reachability call is accurate.
+                rest_legs, cross_legs = plan_bundle_execution(nr_signal.legs)
+                if cross_legs:
+                    logger.info(
+                        "NegRisk | crossing %d of %d leg(s) at submission "
+                        "(queue too deep or saving too small): %s",
+                        len(cross_legs), len(nr_signal.legs),
+                        ", ".join(f"{l.token_id[:10]}@{l.no_ask:.3f}"
+                                  for l in cross_legs),
+                    )
+
                 bundle_legs = [
                     BundleLeg(token_id=leg.token_id, bid=leg.no_bid, size=leg.size)
-                    for leg in nr_signal.legs
+                    for leg in rest_legs
                 ]
 
                 if _negrisk_exec_mode == "clob":
@@ -538,9 +566,25 @@ async def strategy_loop(
                     breaker.on_arb_open()
                     _negrisk_inflight.add(condition_id)
                     try:
-                        responses = await client.execute_negrisk_clob_bundle(
-                            bundle_legs
+                        crossed = await _cross_legs_now(
+                            client, cross_legs, notifier
                         )
+                        maker_resp = (
+                            await client.execute_negrisk_clob_bundle(bundle_legs)
+                            if bundle_legs else []
+                        )
+                        # The guard indexes responses against signal.legs, so
+                        # rebuild the original order. A crossed leg reports as
+                        # already matched; whatever failed reports as an error
+                        # and the guard resolves it like any other bad leg.
+                        by_token = {}
+                        for leg, r in zip(rest_legs, maker_resp):
+                            by_token[leg.token_id] = r
+                        by_token.update(crossed)
+                        responses = [
+                            by_token.get(leg.token_id, {"status": "error"})
+                            for leg in nr_signal.legs
+                        ]
                     except CircuitBreakerTripped:
                         _negrisk_inflight.discard(condition_id)
                         raise
@@ -651,6 +695,7 @@ async def strategy_loop(
                 no_ask=no_ask,
                 max_position_usdc=MAX_ARB_PAIR_USDC,
                 fee_rate=fee_rate,
+                tick_size=tick.get("tick_size"),
             )
 
             # ── 2b. Maker arb fallback (DutchBookPricer) ──────────────────────
@@ -968,6 +1013,41 @@ def _register_shutdown_signals(
 # ═══════════════════════════════════════════════════════════════════════════
 # Entry point
 # ═══════════════════════════════════════════════════════════════════════════
+
+async def _cross_legs_now(client, legs, notifier) -> dict:
+    """
+    Buy the given legs outright, returning {token_id: response}.
+
+    Used when a leg's post-only quote cannot realistically fill, so resting it
+    only burns the bundle's TTL before the guard crosses it anyway.
+
+    A failure here is not fatal and is deliberately not retried. The leg simply
+    reports as an error, the guard sees an incomplete bundle, and its existing
+    completion-or-unwind path resolves it — the same path that already handles
+    an exchange rejection on the maker side. Anything cleverer would be a second
+    recovery mechanism competing with the one that works.
+    """
+    out: dict = {}
+    for leg in legs:
+        try:
+            resp = await client.post_order(
+                token_id=leg.token_id, side="BUY",
+                price=leg.no_ask, size=leg.size,
+            )
+            out[leg.token_id] = resp
+            status = str((resp or {}).get("status", "")).strip().lower()
+            logger.info(
+                "NegRisk | crossed %s %.2f @ %.4f -> %s",
+                leg.token_id[:12], leg.size, leg.no_ask, status or "?",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "NegRisk | crossing %s failed: %s — the guard will resolve the "
+                "bundle", leg.token_id[:12], exc,
+            )
+            out[leg.token_id] = {"status": "error", "error": str(exc)}
+    return out
+
 
 async def main() -> None:
     global STARTING_BALANCE

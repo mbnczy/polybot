@@ -61,7 +61,7 @@ from typing import Awaitable, Callable
 
 import aiohttp
 
-from core import market_titles
+from core import market_flow, market_titles
 from core.ws_feed import MarketShard
 from strategy.arbitrage import _resolve_rebate
 from telemetry.metrics import (
@@ -851,6 +851,10 @@ class MarketScanner:
             # Measured over 46 live NegRisk groups the smallest real one turns
             # over 53k in 24h, so this floor discards nothing that trades.
             group_volume = sum(_market_volume_24h_strict(m) for m in members)
+            # Kept for the fill-time estimate: queue depth alone cannot say how
+            # long a resting order waits, and this is the only flow number the
+            # bot has (the WS feed carries no trade tape).
+            market_flow.remember(group_id, group_volume)
             if group_volume < self._negrisk_min_group_volume:
                 logger.debug(
                     "MarketScanner | negrisk group=%s skipped — 24h volume "
