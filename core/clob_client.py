@@ -1399,9 +1399,27 @@ class PolyClient:
         }
 
     async def get_open_orders(self) -> list[dict]:
-        """Return all open orders for the authenticated account."""
+        """
+        Return all open orders for the authenticated account.
+
+        list_open_orders() hands back a Paginator, and iterating a Paginator
+        yields PAGES, not orders — `list(...)` therefore returned
+        [Page(items=(), ...)], which _open_order_to_dict dutifully converted
+        into one order with an empty id. The account has zero open orders and
+        this said it had one; with a real resting order it would still have
+        said one, blank.
+
+        That is not cosmetic. InventoryManager._poll_fills treats "order id
+        absent from open_orders" as proof the order filled, so a blank set made
+        every PENDING leg look filled — at fill_price 0.0 — and promoted the
+        position to PAIRED, which schedules an on-chain mergePositions for
+        shares the wallet may not hold. It is the same phantom-fill failure the
+        guards were fixed for; this path was missed.
+
+        iter_items() flattens the pages.
+        """
         orders = await self._run_with_retry(
-            lambda: list(self._client.list_open_orders())
+            lambda: list(self._client.list_open_orders().iter_items())
         )
         return [_open_order_to_dict(o) for o in orders]
 
