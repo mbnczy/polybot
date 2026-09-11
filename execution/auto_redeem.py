@@ -204,7 +204,12 @@ class AutoRedeemer:
         notifier:      "TelegramNotifier",
         clob_client:   "object | None" = None,
         on_redeemed:   "Callable[[str], None] | None" = None,
+        extra_condition_ids: "Callable[[], Iterable[str]] | None" = None,
     ) -> None:
+        # Markets to redeem that the FeedRegistry does not track — cross-market
+        # positions, whose legs are priced by REST rather than a feed. Without
+        # this their winning shares would sit unredeemed after resolution.
+        self._extra_ids = extra_condition_ids
         self._registry  = feed_registry
         self._notifier  = notifier
         # V2 SDK route (PolyClient.redeem_positions) — post-pUSD-migration the
@@ -275,9 +280,19 @@ class AutoRedeemer:
     # Internal scan
     # ──────────────────────────────────────────────────────────────────────────
 
+    def _candidate_ids(self) -> set[str]:
+        """Every market worth checking: the feed's, plus any registered extra."""
+        ids = set(self._registry.condition_ids)
+        if self._extra_ids:
+            try:
+                ids |= {str(c) for c in self._extra_ids() if c}
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("AutoRedeemer | extra condition-id lookup failed: %s", exc)
+        return ids - self._redeemed
+
     async def _scan_and_redeem(self) -> None:
         """One full pass over all tracked condition IDs."""
-        condition_ids = self._registry.condition_ids - self._redeemed
+        condition_ids = self._candidate_ids()
         if not condition_ids:
             return
 

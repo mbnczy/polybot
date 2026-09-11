@@ -70,7 +70,11 @@ class WalletReconciler:
         breaker:  "CircuitBreaker",
         notifier: "TelegramNotifier",
         poll_s:   float = RECONCILE_POLL_S,
+        managed:  "Callable[[], Iterable[str]] | None" = None,
     ) -> None:
+        # Market titles whose inventory another component owns and accounts
+        # for — cross-market positions. See _drop_managed.
+        self._managed  = managed
         self._client   = client
         self._breaker  = breaker
         self._notifier = notifier
@@ -115,7 +119,34 @@ class WalletReconciler:
             f"{r.get('title','')[:40]}|{r.get('outcome','')}": float(r.get("size") or 0.0)
             for r in rows
         }
-        return held, float(cash)
+        return self._drop_managed(held), float(cash)
+
+    def _drop_managed(self, held: dict[str, float]) -> dict[str, float]:
+        """
+        Leave out inventory another component owns and accounts for.
+
+        Cross-market positions are held for days by design, tracked in their own
+        book and in the breaker's cross ledger. Left in, every entry and exit
+        would read as an escaped order. Counted as breaker open positions
+        instead, they would hold open_positions above zero for a week and switch
+        off the one check here that catches a real leak. So they are excluded,
+        matched on the title head with the same tolerance as redemptions.
+        """
+        if not self._managed:
+            return held
+        try:
+            heads = [str(t).strip()[:40] for t in self._managed() if t]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("WalletReconciler | managed-title lookup failed: %s", exc)
+            return held
+        if not heads:
+            return held
+
+        def _owned(key: str) -> bool:
+            head = key.split("|")[0].strip()[:40]
+            return any(t.startswith(head[:24]) or head.startswith(t[:24]) for t in heads)
+
+        return {k: v for k, v in held.items() if not _owned(k)}
 
     async def check_once(self) -> "dict | None":
         """
