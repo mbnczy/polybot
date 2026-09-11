@@ -317,6 +317,10 @@ _FEE_RATE_MAX_AGE_S: int = int(os.environ.get("FEE_RATE_MAX_AGE_S", 86_400))
 # unwind slice. 0.10 = accept the top 10% price band. Dust orders parked at
 # 0.001 on a 0.96 book are not depth; counting them made the probe useless.
 _UNWIND_DEPTH_BAND: float = float(os.environ.get("UNWIND_DEPTH_BAND", 0.10))
+# A CLOB fill reaches the chain seconds after the match is reported. How long an
+# unwind waits for the wallet to show the shares before sizing the sale on it.
+_UNWIND_SETTLE_S: float = float(os.environ.get("UNWIND_SETTLE_S", 12.0))
+_UNWIND_SETTLE_POLL_S: float = 1.0
 
 
 def _resp_filled(resp: dict | None) -> bool:
@@ -662,6 +666,11 @@ def _terminal_order_error(exc: Exception) -> "str | None":
         return "insufficient balance/allowance"
     if _is_bad_order_params(exc):
         return "malformed order parameters"
+    # A killed FOK is the exchange's answer. Re-sending the same signed order
+    # can only come back "Duplicated" (observed 2026-09-11).
+    text = str(exc).lower()
+    if "couldn't be fully filled" in text or "fully filled or killed" in text:
+        return "FOK not filled"
     return None
 
 
@@ -826,6 +835,24 @@ class PolyClient:
                 "Share balance query failed for %s: %s", str(token_id)[:16], exc
             )
             return None
+
+    async def _settled_balance(self, token_id: str, want: float) -> "float | None":
+        """
+        The wallet's balance once a just-reported fill has had time to settle.
+
+        On 2026-09-11 a half-fill's unwind read the chain 65 ms after the YES leg
+        matched, saw 0.00, capped the sale to nothing and skipped it: 10.7 shares
+        stranded. The match is on the CLOB at once; the balance follows seconds
+        later. So poll until the wallet holds `want` or the settle window ends,
+        and only then let the balance cap the sale.
+        """
+        held = await self.share_balance(token_id)
+        deadline = time.monotonic() + _UNWIND_SETTLE_S
+        while (held is not None and held < want - 1e-9
+               and time.monotonic() < deadline):
+            await asyncio.sleep(_UNWIND_SETTLE_POLL_S)
+            held = await self.share_balance(token_id)
+        return held
 
     async def order_filled_size(
         self, order_id: str, token_id: "str | None" = None
@@ -1729,7 +1756,7 @@ class PolyClient:
         # sizing a sale. Note this is sizing, NOT fill attribution: a wallet
         # balance is still the wrong number for deciding whether an order
         # filled, which is why share_balance stays out of that path.
-        held = await self.share_balance(token_id)
+        held = await self._settled_balance(token_id, sell_size)
         if held is not None:
             capped = math.floor(held * 100) / 100.0
             if capped < sell_size - 1e-9:
