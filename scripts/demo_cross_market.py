@@ -480,6 +480,50 @@ def fmt_position_closed(pos) -> str:
     return "\n".join(lines)
 
 
+def confirm_at_asks(sigs: list, markets: list[dict]) -> tuple[list, list]:
+    """
+    Split violations into (still an arbitrage at the real asks, not).
+
+    The detector prices NO on narrow as 1 − the YES ask. On a thin book that is
+    badly wrong, and it reached the operator: the first live pass after this
+    branch went up alerted "+200 bps" on "Moik Baku O/U 0.5" under "O/U 0.5" —
+    narrow YES at 0.98, so "NO @ 0.02" — when the only NO ask on the book was
+    0.83 and the real entry 1.79. The paper tracker refused it in the same pass,
+    but the Telegram alert had already gone. A violation the system can see is
+    not real should not reach anyone as an opportunity.
+
+    A leg with no ask at all is not an opportunity either: there is nobody to buy
+    it from. A violation whose markets cannot be found keeps the old behaviour
+    and is alerted — suppressing on missing data would hide more than it saves.
+    """
+    from strategy.cross_exit import buy_cost        # noqa: PLC0415
+
+    by_id = {str(m.get("conditionId")): m for m in markets if m.get("conditionId")}
+    real, illusory = [], []
+    for s in sigs:
+        tn, tb = _tokens_of(by_id.get(s.narrow)), _tokens_of(by_id.get(s.broad))
+        if not tn or not tb:
+            real.append(s)
+            continue
+        _, narrow_no_ask = book_top(tn[1])
+        _, broad_yes_ask = book_top(tb[0])
+        if narrow_no_ask is None or broad_yes_ask is None:
+            illusory.append(s)
+            logger.info("cross-market | %s/%s signalled %+.4f but a leg has no ask "
+                        "— nothing to buy, not alerted", s.narrow[:10], s.broad[:10],
+                        s.edge)
+            continue
+        entry = buy_cost(narrow_no_ask) + buy_cost(broad_yes_ask)
+        if entry >= 1.0:
+            illusory.append(s)
+            logger.info("cross-market | %s/%s signalled %+.4f but costs %.4f at the "
+                        "real asks — not alerted", s.narrow[:10], s.broad[:10],
+                        s.edge, entry)
+        else:
+            real.append(s)
+    return real, illusory
+
+
 def track_positions(sigs: list, markets: list[dict], args, cache: dict) -> list[str]:
     """
     Open a paper position for each new violation, then price every open one's
@@ -655,6 +699,11 @@ def one_pass(args, markets_cache: dict) -> int:
             print(f"  {len(rels)} implication(s), all already announced — quiet.")
 
     sigs = check_prices(rels, markets, args)
+    sigs, illusory = confirm_at_asks(sigs, markets)
+    if illusory:
+        markets_cache["illusory"] = markets_cache.get("illusory", 0) + len(illusory)
+        print(f"  {len(illusory)} violation(s) NOT alerted — not an arbitrage at the "
+              f"asks actually payable")
     if sigs:
         # An arbitrage is a price condition, not a fact: it can open, close and
         # reopen on the same pair, and each opening is worth saying. Re-alert
