@@ -8,11 +8,9 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
-
 # ── Virtual environments ──────────────────────────────────────────────────────
 .venv/
 venv/
-
 # ── Generated / runtime data (reproducible; not source) ───────────────────────
 data/
 signals.db
@@ -20,13 +18,15 @@ signals.db-wal
 signals.db-shm
 daily_state.json
 *.log
-
 # ── Local scratch / IDE ───────────────────────────────────────────────────────
 asd
-
 # ── Vendored / nested repos & skill bundles ───────────────────────────────────
 .github
 docs
 claude-trading-skills
 skills/
 fill_log.jsonl
+announced.json
+*.tmp
+cross_positions.json
+cross_positions.json.tmp
