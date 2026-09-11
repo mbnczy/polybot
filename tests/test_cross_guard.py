@@ -18,6 +18,7 @@ from execution.cross_guard import (
     evaluate,
     load_implications,
     size_position,
+    stop_key,
     Level,
 )
 from risk.circuit_breaker import CircuitBreaker
@@ -324,3 +325,68 @@ def test_the_reader_export_round_trips(tmp_path):
 
 def test_a_missing_export_means_nothing_to_trade(tmp_path):
     assert load_implications(tmp_path / "absent.json") == []
+
+
+# ── the heartbeat's summary line ──────────────────────────────────────────────
+
+_CORNERS = dict(narrow_title="X vs. Y: X O/U 2.5 Corners", broad_title="X vs. Y: X O/U 2.5")
+
+
+@pytest.mark.parametrize("imp,books,key", [
+    (_imp(**_CORNERS), ARB, "different_statistic"),
+    (_imp(narrow_end_ts=None), ARB, "end_unknown"),
+    (_imp(days=-0.1), ARB, "past_end"),
+    (_imp(days=8), ARB, "outside_window"),
+    (_imp(), {"nn": _book(), "by": ARB["by"]}, "no_ask"),
+    (_imp(), {"nn": _book(asks=[(0.83, 50)]), "by": _book(asks=[(0.96, 50)])}, "edge_below_min"),
+    (_imp(), {"nn": _book(asks=[(0.40, 3)]), "by": ARB["by"]}, "thin_touch"),
+    (_imp(), ARB, "ok"),
+])
+def test_every_refusal_has_a_stop_key(imp, books, key):
+    """A reworded reason must not fall through to "other" unnoticed."""
+    _, why = evaluate(imp, books["nn"], books["by"], now=NOW)
+    assert stop_key(why) == key
+
+
+def _other(n, days=2.0):
+    return _imp(days=days, narrow=f"0xn{n}", broad=f"0xb{n}",
+                narrow_no_token=f"nn{n}", broad_yes_token=f"by{n}")
+
+
+@pytest.mark.asyncio
+async def test_the_summary_names_where_each_pair_stopped(tmp_path, monkeypatch):
+    books = {**ARB, "nn2": _book(asks=[(0.83, 50)]), "by2": _book(asks=[(0.96, 50)])}
+    imps = [_imp(), _other(2), _other(3, days=9)]
+    g, client, _, _ = _guard(tmp_path, monkeypatch, books, imps, enabled=False)
+    assert g.stop_summary() == "no pass yet"
+
+    await g.poll_once()
+    line = g.stop_summary()
+    assert "3 implication(s): " in line
+    assert "edge_below_min 1" in line and "outside_window 1" in line
+    assert "would_enter 1" in line
+    assert "best edge +0.1500" in line
+    assert client.buys == []
+
+    # Next pass the would-be entry sits out its cooldown: the snapshot moves on,
+    # the running count keeps it.
+    await g.poll_once()
+    line = g.stop_summary()
+    assert "cooldown 1" in line and "best edge -0.7900" in line
+    assert line.endswith("would_enter 1 entered 0 open 0")
+
+
+@pytest.mark.asyncio
+async def test_a_pseudo_implication_does_not_set_the_best_edge(tmp_path, monkeypatch):
+    """Corners under goals quotes a fat edge; it must not read as a near miss."""
+    g, _, _, _ = _guard(tmp_path, monkeypatch, ARB, [_imp(**_CORNERS)], enabled=False)
+    await g.poll_once()
+    line = g.stop_summary()
+    assert "different_statistic 1" in line and "best edge" not in line
+
+
+@pytest.mark.asyncio
+async def test_an_empty_export_says_so(tmp_path, monkeypatch):
+    g, _, _, _ = _guard(tmp_path, monkeypatch, {}, [], enabled=False)
+    await g.poll_once()
+    assert "no implications in" in g.stop_summary()

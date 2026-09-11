@@ -901,6 +901,7 @@ async def heartbeat_loop(
     client:        "PolyClient | None"   = None,
     detector:      "ArbDetector | None"  = None,
     neg_risk_det:  "NegRiskArbDetector | None" = None,
+    cross_guard:   "CrossGuard | None" = None,
 ) -> None:
     """
     Refresh metrics every HEARTBEAT_INTERVAL (60 s) and send a Telegram health
@@ -926,6 +927,10 @@ async def heartbeat_loop(
             # one rejection logged anywhere, which said nothing about why.
             if neg_risk_det is not None and neg_risk_det.stops:
                 logger.info("NegRisk stops | %s", neg_risk_det.stop_summary())
+            # Same problem, same answer: the cross guard logs only when a pair
+            # clears every gate, so silence alone says nothing.
+            if cross_guard is not None:
+                logger.info("Cross stops | %s", cross_guard.stop_summary())
 
             now = time.monotonic()
             if (
@@ -1342,7 +1347,8 @@ async def main() -> None:
         *([asyncio.create_task(negrisk_guard.run(), name="negrisk_guard")]
           if negrisk_guard is not None else []),
         asyncio.create_task(heartbeat_loop(breaker, notifier, feed_registry, client, detector,
-                                           neg_risk_det=neg_risk_det), name="heartbeat"),
+                                           neg_risk_det=neg_risk_det,
+                                           cross_guard=cross_guard), name="heartbeat"),
         asyncio.create_task(telegram_loop(notifier),                           name="telegram"),
         asyncio.create_task(sig_logger.run(),                                  name="sig_logger"),
         asyncio.create_task(metrics_server(),                                  name="metrics"),

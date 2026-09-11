@@ -231,6 +231,43 @@ def size_position(no_ask: Level, yes_ask: Level, entry_per_pair: float, *,
     return shares if shares >= min_shares else 0.0
 
 
+def quoted_entry(
+    no_book: dict, yes_book: dict,
+    rate_narrow: "float | None" = None, rate_broad: "float | None" = None,
+) -> "tuple[Level, Level, float] | None":
+    """Both touches and the fee-inclusive cost of one pair; None without an ask on each leg."""
+    no_ask, yes_ask = best_level(no_book, "asks"), best_level(yes_book, "asks")
+    if no_ask is None or yes_ask is None:
+        return None
+    return no_ask, yes_ask, buy_cost(no_ask.price, rate_narrow) + buy_cost(yes_ask.price, rate_broad)
+
+
+# Where an implication stopped, in a word, for the heartbeat's summary line.
+# Matched against evaluate()'s reasons in order; a test pins every refusal to
+# its key, so a reworded reason cannot silently fall through to "other".
+_STOP_KEYS: tuple[tuple[str, str], ...] = (
+    ("different statistics", "different_statistic"),
+    ("date unknown", "end_unknown"),
+    ("past its end date", "past_end"),
+    ("window", "outside_window"),
+    ("no ask", "no_ask"),
+    ("at the real asks", "edge_below_min"),
+    ("depth at the best ask", "thin_touch"),
+)
+# Stops reached with both asks priced on a genuine implication: only these
+# contribute to "best edge", so a pseudo-implication's fake edge cannot show.
+_PRICED_STOPS = frozenset({"edge_below_min", "thin_touch", "ok"})
+
+
+def stop_key(reason: str) -> str:
+    if reason == "ok":
+        return "ok"
+    for needle, key in _STOP_KEYS:
+        if needle in reason:
+            return key
+    return "other"
+
+
 def evaluate(
     imp: Implication, no_book: dict, yes_book: dict, *,
     now: float,
@@ -255,10 +292,10 @@ def evaluate(
         return None, "already past its end date"
     if lockup > max_lockup_days:
         return None, f"locks capital {lockup:.1f}d > {max_lockup_days:g}d window"
-    no_ask, yes_ask = best_level(no_book, "asks"), best_level(yes_book, "asks")
-    if no_ask is None or yes_ask is None:
+    quote = quoted_entry(no_book, yes_book, rate_narrow, rate_broad)
+    if quote is None:
         return None, "a leg has no ask — nothing to buy"
-    entry = buy_cost(no_ask.price, rate_narrow) + buy_cost(yes_ask.price, rate_broad)
+    no_ask, yes_ask, entry = quote
     if 1.0 - entry < min_edge:
         return None, f"edge {1.0 - entry:+.4f} < {min_edge:.4f} at the real asks"
     shares = size_position(no_ask, yes_ask, entry, max_usdc=max_usdc,
@@ -309,6 +346,9 @@ class CrossGuard:
         self.last_reason: dict[tuple[str, str], str] = {}
         self.stats = {"evaluated": 0, "would_enter": 0, "entered": 0,
                       "half_filled": 0, "exited": 0, "resolved": 0, "stuck": 0}
+        # The last complete pass over the reader's file, for stop_summary():
+        # (when, implications read, stops by key, (best edge, narrow title)).
+        self._last_pass: "tuple[float, int, dict[str, int], tuple[float, str] | None] | None" = None
         logger.info(
             "CrossGuard init | %s | window=%gd min_edge=%.3f max_pos=%.2f USDC "
             "open=%d file=%s",
@@ -351,6 +391,28 @@ class CrossGuard:
     def open_positions(self) -> list[CrossPosition]:
         return self._book.open_positions()
 
+    def stop_summary(self) -> str:
+        """
+        One line for the heartbeat: where the last pass over the reader's file
+        stopped, commonest first, and the best edge the real asks quoted.
+
+        Entries are logged only when a pair clears every gate, so without this a
+        quiet journal cannot tell "no opportunity" from "not looking".
+        """
+        if self._last_pass is None:
+            return "no pass yet"
+        ts, total, stops, best = self._last_pass
+        head = f"last pass {time.time() - ts:.0f}s ago"
+        if not total:
+            return f"{head} | no implications in {self._imp_path}"
+        parts = ", ".join(f"{k} {v}" for k, v in
+                          sorted(stops.items(), key=lambda kv: (-kv[1], kv[0])))
+        line = f"{head} | {total} implication(s): {parts}"
+        if best is not None:
+            line += f" | best edge {best[0]:+.4f} (min {self._min_edge:.4f}) {best[1][:50]}"
+        return (f"{line} | would_enter {self.stats['would_enter']} "
+                f"entered {self.stats['entered']} open {len(self._book.open_positions())}")
+
     # ── loop ──────────────────────────────────────────────────────────────────
 
     async def run(self) -> None:
@@ -387,44 +449,69 @@ class CrossGuard:
             return None
 
     async def _scan_entries(self, now: float) -> None:
-        for imp in load_implications(self._imp_path):
-            key = imp.key
-            if self._book.has_open(*key) or key in self._stuck:
-                continue
-            if self._cooldown.get(key, 0.0) > now:
-                continue
-            ends = imp.resolves_ts
-            # Cheap window check before spending two book reads on it.
-            if ends is None or not 0.0 < (ends - now) / 86_400.0 <= self._max_lockup:
-                continue
-            self.stats["evaluated"] += 1
-            no_book = await self._client.get_orderbook(imp.narrow_no_token)
-            yes_book = await self._client.get_orderbook(imp.broad_yes_token)
-            opp, reason = evaluate(
-                imp, no_book, yes_book, now=now,
-                rate_narrow=await self._rate(imp.narrow),
-                rate_broad=await self._rate(imp.broad),
-                max_lockup_days=self._max_lockup, min_edge=self._min_edge,
-                max_usdc=self._max_usdc, min_shares=self._min_shares,
+        imps = load_implications(self._imp_path)
+        stops: dict[str, int] = {}
+        best: "tuple[float, str] | None" = None
+        for imp in imps:
+            stop, edge = await self._consider(imp, now)
+            stops[stop] = stops.get(stop, 0) + 1
+            if edge is not None and (best is None or edge > best[0]):
+                best = (edge, imp.narrow_title)
+        self._last_pass = (now, len(imps), stops, best)
+
+    async def _consider(self, imp: Implication, now: float) -> "tuple[str, float | None]":
+        """
+        One implication through every gate. Returns where it stopped and, once
+        both asks are priced on a genuine implication, the edge they quote.
+        """
+        key = imp.key
+        if self._book.has_open(*key):
+            return "held", None
+        if key in self._stuck:
+            return "stuck", None
+        if self._cooldown.get(key, 0.0) > now:
+            return "cooldown", None
+        ends = imp.resolves_ts
+        # Cheap window check before spending two book reads on it.
+        if ends is None:
+            return "end_unknown", None
+        if ends <= now:
+            return "past_end", None
+        if (ends - now) / 86_400.0 > self._max_lockup:
+            return "outside_window", None
+        self.stats["evaluated"] += 1
+        no_book = await self._client.get_orderbook(imp.narrow_no_token)
+        yes_book = await self._client.get_orderbook(imp.broad_yes_token)
+        rate_narrow, rate_broad = await self._rate(imp.narrow), await self._rate(imp.broad)
+        opp, reason = evaluate(
+            imp, no_book, yes_book, now=now,
+            rate_narrow=rate_narrow, rate_broad=rate_broad,
+            max_lockup_days=self._max_lockup, min_edge=self._min_edge,
+            max_usdc=self._max_usdc, min_shares=self._min_shares,
+        )
+        self.last_reason[key] = reason
+        stop, edge = stop_key(reason), None
+        if stop in _PRICED_STOPS:
+            quote = quoted_entry(no_book, yes_book, rate_narrow, rate_broad)
+            edge = None if quote is None else 1.0 - quote[2]
+        if opp is None:
+            return stop, edge
+        if not self._breaker.check_cross(opp.committed):
+            self.last_reason[key] = "blocked by the breaker"
+            return "breaker", edge
+        if not self._enabled:
+            self.stats["would_enter"] += 1
+            self._cooldown[key] = now + CROSS_ENTRY_COOLDOWN_S
+            logger.info(
+                "CrossGuard | WOULD ENTER (disabled) %s ⊆ %s | %.2f pairs @ %.4f "
+                "→ edge %+.4f/pair · %.2f USDC · %.1fd",
+                imp.narrow_title[:40], imp.broad_title[:40], opp.shares,
+                opp.entry_per_pair, opp.edge_per_pair, opp.committed,
+                opp.lockup_days,
             )
-            self.last_reason[key] = reason
-            if opp is None:
-                continue
-            if not self._breaker.check_cross(opp.committed):
-                self.last_reason[key] = "blocked by the breaker"
-                continue
-            if not self._enabled:
-                self.stats["would_enter"] += 1
-                self._cooldown[key] = now + CROSS_ENTRY_COOLDOWN_S
-                logger.info(
-                    "CrossGuard | WOULD ENTER (disabled) %s ⊆ %s | %.2f pairs @ %.4f "
-                    "→ edge %+.4f/pair · %.2f USDC · %.1fd",
-                    imp.narrow_title[:40], imp.broad_title[:40], opp.shares,
-                    opp.entry_per_pair, opp.edge_per_pair, opp.committed,
-                    opp.lockup_days,
-                )
-                continue
-            await self._enter(opp, now)
+            return "would_enter", edge
+        await self._enter(opp, now)
+        return "attempted", edge
 
     async def _buy(self, token: str, price: float, shares: float) -> "float | None":
         """FOK buy. Returns shares received, or None when nothing filled."""
