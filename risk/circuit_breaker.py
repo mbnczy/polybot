@@ -195,6 +195,14 @@ class CircuitBreaker:
         self._fill_times: list[float] = []
         self._lock   = threading.Lock()
         self._daily  = self._load_daily_state()
+        # Cross-market positions: their own slots and capital ceiling, the same
+        # P&L. See check_cross.
+        self._cross_max_positions: int = int(os.environ.get("CROSS_MAX_POSITIONS", 2))
+        self._cross_max_committed: float = float(
+            os.environ.get("CROSS_MAX_COMMITTED_USDC", 10.0)
+        )
+        self._cross_open: int = 0
+        self._cross_committed: float = 0.0
         logger.info(
             "CircuitBreaker init | balance=%.2f max_pos=%d drawdown_pct=%.1f "
             "pair_cap=%.2f USDC daily_pnl=%.2f",
@@ -443,6 +451,112 @@ class CircuitBreaker:
                 f"limit={DAILY_LOSS_LIMIT:.2f}"
             )
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Cross-market positions
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def check_cross(self, committed_usdc: float) -> bool:
+        """
+        Gate one cross-market entry.
+
+        Its own slots and its own capital ceiling. A cross position is held until
+        its markets resolve — up to CROSS_MAX_LOCKUP_DAYS — and letting it take one
+        of the bundle slots for that long would starve the strategy that turns
+        over in seconds: with MAX_POSITIONS=3, two cross positions would leave the
+        bundle path one slot for a week.
+
+        What it SHARES is the loss accounting. Its realised P&L lands in the same
+        session and daily totals as every bundle, so the daily loss limit and the
+        drawdown guard cover both strategies at once.
+
+        Raises CircuitBreakerTripped at the daily loss limit, like check_arb.
+        """
+        with self._lock:
+            self._maybe_roll_window()
+            if self._daily.daily_pnl <= DAILY_LOSS_LIMIT:
+                raise CircuitBreakerTripped(
+                    f"Daily loss limit breached: daily_pnl={self._daily.daily_pnl:.2f} "
+                    f"limit={DAILY_LOSS_LIMIT:.2f}"
+                )
+        reason = self._cross_blocking_reason(committed_usdc)
+        if reason:
+            self._state.orders_blocked += 1
+            logger.warning("Cross entry BLOCKED [%s] | committed=%.4f USDC",
+                           reason, committed_usdc)
+            return False
+        self._state.orders_passed += 1
+        return True
+
+    def _cross_blocking_reason(self, committed_usdc: float) -> Optional[str]:
+        s = self._state
+        drawdown_limit = (self._max_drawdown_pct / 100.0) * s.starting_balance
+        if s.session_pnl <= -drawdown_limit:
+            return (
+                f"drawdown limit hit: pnl={s.session_pnl:.2f} "
+                f"limit=-{drawdown_limit:.2f}"
+            )
+        if committed_usdc <= 0.0:
+            return "nothing to commit"
+        if self._cross_open >= self._cross_max_positions:
+            return (
+                f"cross position cap: open={self._cross_open} "
+                f"max={self._cross_max_positions}"
+            )
+        if self._cross_committed + committed_usdc > self._cross_max_committed + 1e-9:
+            return (
+                f"cross capital cap: committed={self._cross_committed:.2f} "
+                f"+ {committed_usdc:.2f} > {self._cross_max_committed:.2f} USDC"
+            )
+        if committed_usdc > MAX_ARB_PAIR_USDC:
+            return (
+                f"position cost {committed_usdc:.4f} USDC exceeds "
+                f"cap {MAX_ARB_PAIR_USDC:.2f} USDC"
+            )
+        return None
+
+    def on_cross_open(self, committed_usdc: float) -> None:
+        """Reserve a cross slot and its capital. Also restores one after restart."""
+        with self._lock:
+            self._cross_open += 1
+            self._cross_committed += max(0.0, committed_usdc)
+
+    def release_cross(self, committed_usdc: float) -> None:
+        """Undo a reservation that never became a position — no P&L booked."""
+        with self._lock:
+            self._cross_open = max(0, self._cross_open - 1)
+            self._cross_committed = max(
+                0.0, self._cross_committed - max(0.0, committed_usdc)
+            )
+
+    def on_cross_close(self, pnl: float, committed_usdc: float) -> None:
+        """
+        Free the slot and capital, and book the realised result into the same
+        session and daily P&L as every other trade.
+
+        Deliberately does not touch the fill timestamps: those tell the auto-tuner
+        whether BUNDLE signals convert, and a cross exit says nothing about that.
+        Raises CircuitBreakerTripped when the result puts the day through its
+        loss limit.
+        """
+        self.release_cross(committed_usdc)
+        self._state.session_pnl += pnl
+        with self._lock:
+            self._maybe_roll_window()
+            self._daily.daily_pnl += pnl
+            self._save_daily_state()
+            daily = self._daily.daily_pnl
+        logger.info(
+            "Cross position closed | pnl=%.6f session_pnl=%.4f daily_pnl=%.4f "
+            "cross_open=%d committed=%.4f",
+            pnl, self._state.session_pnl, daily,
+            self._cross_open, self._cross_committed,
+        )
+        if daily <= DAILY_LOSS_LIMIT:
+            raise CircuitBreakerTripped(
+                f"Daily loss limit hit on cross close: daily_pnl={daily:.2f} "
+                f"limit={DAILY_LOSS_LIMIT:.2f}"
+            )
+
     def reset_session(self, new_balance: float) -> None:
         """Reset session counters for a new trading session. Daily window unaffected."""
         self._state = _State(starting_balance=new_balance)
@@ -474,6 +588,9 @@ class CircuitBreaker:
             "daily_loss_limit":  DAILY_LOSS_LIMIT,
             "daily_window_start": daily_window_start,
             "open_positions":    s.open_positions,
+            "cross_open":        self._cross_open,
+            "cross_committed_usdc": round(self._cross_committed, 4),
+            "cross_cap_usdc":    self._cross_max_committed,
             "pair_cap_usdc":     MAX_ARB_PAIR_USDC,
             "orders_passed":     s.orders_passed,
             "orders_blocked":    s.orders_blocked,
