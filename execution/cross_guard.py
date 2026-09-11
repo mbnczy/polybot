@@ -67,6 +67,7 @@ from typing import Awaitable, Callable
 
 from core.clob_client import _FILLED_STATUSES
 from risk.circuit_breaker import CircuitBreakerTripped
+from strategy.quantity_guard import same_quantity
 from strategy.cross_exit import (
     ROUTE_SELL,
     CrossPosition,
@@ -241,6 +242,11 @@ def evaluate(
     min_shares: float = CROSS_MIN_SHARES,
 ) -> "tuple[Opportunity | None, str]":
     """Every entry gate, from the two books. Returns (opportunity, reason)."""
+    # Belt and braces: the reader's prefilter already drops these, but this guard
+    # trades whatever the file says, and the first pair ever to clear every
+    # other gate here was three corners "implying" three goals.
+    if same_quantity(imp.narrow_title, imp.broad_title) is False:
+        return None, "the two markets count different statistics — not an implication"
     ends = imp.resolves_ts
     if ends is None:
         return None, "resolution date unknown — cannot show it fits the window"

@@ -59,6 +59,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from strategy.cross_market import Implication
+from strategy.quantity_guard import is_over_under, statistics
 
 logger = logging.getLogger(__name__)
 
@@ -424,14 +425,18 @@ def build_candidates(
         cid   = str(m.get("conditionId") or m.get("condition_id") or "").strip()
         if not title or not cid:
             continue
+        # What an over/under market counts, computed once per market: comparing
+        # it per PAIR would run the vocabulary against ~720,000 pairs.
+        quantity = statistics(title) if is_over_under(title) else None
         rows.append((cid, title, _tokens(title), _event_id(m), _exclusion_group(m),
-                     _end_ts(m)))
+                     _end_ts(m), quantity))
 
     out: list[Candidate] = []
     excluded_siblings = 0
     now = time.time()
     too_slow = 0
-    for (a_id, a_t, a_tok, a_ev, a_ng, a_end), (b_id, b_t, b_tok, b_ev, b_ng, b_end) \
+    cross_statistic = 0
+    for (a_id, a_t, a_tok, a_ev, a_ng, a_end, a_q), (b_id, b_t, b_tok, b_ev, b_ng, b_end, b_q) \
             in itertools.combinations(rows, 2):
         if a_id == b_id or not a_tok or not b_tok:
             continue
@@ -442,6 +447,13 @@ def build_candidates(
         # their titles are near-identical and they would otherwise dominate.
         if a_ng and a_ng == b_ng:
             excluded_siblings += 1
+            continue
+        # Two over/under markets counting different things — a team's corners
+        # and its goals — share a template and look like a nest. They are not
+        # related at all, and the one-week window is full of them. See
+        # strategy/quantity_guard.py.
+        if a_q is not None and b_q is not None and a_q != b_q:
+            cross_statistic += 1
             continue
         union = a_tok | b_tok
         if not union:
@@ -464,6 +476,12 @@ def build_candidates(
             a_id, b_id, a_t, b_t, overlap, same_event,
             a_ev if same_event else "", pair_shape(a_t, b_t), lockup,
         ))
+
+    if cross_statistic:
+        logger.info(
+            "implication mapper | skipped %d over/under pair(s) counting different "
+            "statistics — corners do not imply goals", cross_statistic,
+        )
 
     if excluded_siblings:
         logger.info(
