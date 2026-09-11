@@ -107,6 +107,7 @@ from execution.auto_redeem import AutoRedeemer                     # noqa: E402
 from execution.inventory_manager import InventoryManager           # noqa: E402
 from execution.negrisk_guard import NegRiskBundleGuard             # noqa: E402
 from execution.reconciler import WalletReconciler                 # noqa: E402
+from execution.cross_guard import CrossGuard                                    # noqa: E402
 from execution.pair_guard import MakerPairGuard                    # noqa: E402
 from risk.circuit_breaker import (                                 # noqa: E402
     ArbOrderIntent,
@@ -1231,7 +1232,18 @@ async def main() -> None:
     # ── wallet reconciler: the only check that does not trust the bot's own
     #    account of events. Every serious fault on 2026-09-05/06 was invisible
     #    in the logs and plain in the wallet, so compare against the chain.
-    reconciler = WalletReconciler(client, breaker, notifier)
+    # ── cross-market executor: trades the implications the read-only reader
+    #    discovers (it writes them to CROSS_IMPLICATIONS_PATH). OFF unless
+    #    CROSS_EXECUTION_ENABLED=true; while off it evaluates and logs only.
+    #    Open positions are restored into the breaker's cross ledger first, so a
+    #    restart never forgets capital that is still committed.
+    cross_guard = CrossGuard(client, breaker, notifier, fee_engine=fee_engine)
+    cross_guard.restore()
+
+    # Cross positions are held for days by design; the reconciler leaves their
+    # markets out rather than reading every entry and exit as an escape.
+    reconciler = WalletReconciler(client, breaker, notifier,
+                                  managed=cross_guard.managed_titles)
 
     # Redemptions are announced to the reconciler so a settlement is never
     # mistaken for an order that escaped supervision.
@@ -1240,6 +1252,9 @@ async def main() -> None:
         notifier=notifier,
         clob_client=client,   # V2 SDK redemption routing (post-pUSD migration)
         on_redeemed=lambda title: reconciler.note_redemption(title),
+        # Cross legs are priced by REST, not the feed registry, so their markets
+        # would otherwise never be redeemed.
+        extra_condition_ids=cross_guard.condition_ids,
     )
 
     # ── inventory manager: recycles paired-fill collateral via mergePositions
@@ -1322,6 +1337,7 @@ async def main() -> None:
         asyncio.create_task(auto_redeem_loop(redeemer),                        name="auto_redeem"),
         asyncio.create_task(inventory.run(),                                   name="inventory"),
         asyncio.create_task(reconciler.run(),                                  name="reconciler"),
+        asyncio.create_task(cross_guard.run(),                                 name="cross_guard"),
         asyncio.create_task(pair_guard.run(),                                  name="pair_guard"),
         *([asyncio.create_task(negrisk_guard.run(), name="negrisk_guard")]
           if negrisk_guard is not None else []),
