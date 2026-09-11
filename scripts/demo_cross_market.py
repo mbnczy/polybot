@@ -57,26 +57,74 @@ _BOOK  = "https://clob.polymarket.com/book"
 
 # ── market data (public, read-only) ───────────────────────────────────────────
 
-def fetch_markets(limit: int) -> list[dict]:
-    """Page the Gamma active universe, the same way core.scanner does."""
+_GAMMA_MAX_OFFSET = 2000   # beyond this Gamma answers 422 "use /markets/keyset"
+
+
+def _page(params: dict, limit: int) -> list[dict]:
+    """Page one Gamma query, stopping cleanly at its offset ceiling."""
     import httpx
 
     out: list[dict] = []
     offset = 0
     with httpx.Client(timeout=30) as h:
-        while len(out) < limit:
-            r = h.get(_GAMMA, params={
-                "active": "true", "closed": "false", "archived": "false",
-                "limit": 100, "offset": offset,
-            })
+        while len(out) < limit and offset < _GAMMA_MAX_OFFSET:
+            r = h.get(_GAMMA, params={**params, "limit": 100, "offset": offset})
             if r.status_code != 200:
+                logger.warning("gamma %s at offset %d: %s", r.status_code, offset,
+                               r.text[:120])
                 break
             page = r.json()
             if not page:
                 break
             out += page
-            offset += 100
+            offset += len(page)
     return out[:limit]
+
+
+def fetch_markets(
+    limit: int, fast_days: float = 0.0, fast_limit: int = 0,
+    fast_min_hours: float = 1.0,
+) -> list[dict]:
+    """
+    The active universe, plus the markets that resolve soonest.
+
+    Unordered, Gamma's active universe is almost all long-dated: measured on
+    800 live markets, none resolved within a week and the median was 112 days.
+    So the prefilter's time priority had nothing to promote — every candidate
+    pair it could see locked capital until year end.
+
+    A second query ordered by end date and bounded by `fast_days` brings the
+    fast ones in. What it finds is mostly match sub-markets — "Team X O/U 0.5"
+    under "O/U 0.5", "1st Half O/U 0.5" under "O/U 0.5" — genuine implications
+    that resolve in hours rather than months. Merged and de-duplicated with the
+    general pool so the long-dated coverage is kept, not traded away.
+    """
+    base = {"active": "true", "closed": "false", "archived": "false"}
+    out = _page(base, limit)
+    if fast_days > 0 and fast_limit > 0:
+        from datetime import timedelta, timezone        # noqa: PLC0415
+        now = datetime.now(timezone.utc)
+        iso = "%Y-%m-%dT%H:%M:%SZ"
+        fast = _page({
+            **base, "order": "endDate", "ascending": "true",
+            # A full timestamp, not a date. Gamma reads a bare "2026-09-11" as
+            # that day's midnight, so a date-only lower bound returned 100 of 100
+            # markets whose end time had ALREADY passed — ended but not yet
+            # resolved, the worst place there is to read a price. The same query
+            # with the current time returned 0 of those and 100 genuinely ahead.
+            #
+            # `fast_min_hours` skips the last stretch before the end. A match
+            # sub-market closing within the hour is usually in play, where the
+            # price jumps on every event and a REST snapshot is stale before it
+            # lands.
+            "end_date_min": (now + timedelta(hours=fast_min_hours)).strftime(iso),
+            "end_date_max": (now + timedelta(days=fast_days)).strftime(iso),
+        }, fast_limit)
+        seen = {str(m.get("conditionId")) for m in out}
+        added = [m for m in fast if str(m.get("conditionId")) not in seen]
+        out += added
+        print(f"    +{len(added)} market(s) resolving within {fast_days:g} days")
+    return out
 
 
 def yes_price(market: dict) -> float | None:
@@ -190,7 +238,11 @@ def discover(markets: list[dict], args) -> list:
 
     provider = im.resolve_provider()
     model    = im.resolve_model(provider)
-    cands    = im.build_candidates(markets, max_pairs=args.pairs)
+    # A fast match fields a dozen sub-markets, every pair of them a nest, so one
+    # fixture filled all 30 slots when measured. The cap buys breadth across
+    # matches — ten fixtures at three pairs each rather than one at thirty.
+    cands    = im.build_candidates(markets, max_pairs=args.pairs,
+                                   max_per_event=args.max_per_event)
     print(f"  prefilter  : {len(cands)} candidate pair(s)")
     if not cands:
         return []
@@ -213,6 +265,31 @@ def discover(markets: list[dict], args) -> list:
     strong = [r for r in rels if r.confidence >= args.threshold]
     print(f"    {len(rels)} asserted · {len(strong)} at/above {args.threshold}")
     return strong
+
+
+def _drop_backwards(rels: list, markets: list[dict]) -> list:
+    """
+    Refuse implications whose direction contradicts their own ladder family.
+
+    The ten largest arbitrages this reader ever reported were one falling ladder
+    read as a rising one: "Trump approval hit 35%" called narrower than "hit
+    25%", when falling to 25% requires passing 35% first. The prices were right;
+    the implication was backwards; a trade on it could pay nothing on either
+    leg. Filtered here, straight after discovery, so a backwards relation is
+    neither announced nor priced. See strategy/ladder_direction.py.
+    """
+    from strategy.ladder_direction import filter_implications  # noqa: PLC0415
+
+    kept, backwards = filter_implications(rels, markets)
+    if backwards:
+        titles = {str(m.get("conditionId")): str(m.get("question") or "")
+                  for m in markets}
+        print(f"  {len(backwards)} implication(s) refused — direction contradicts "
+              f"the ladder they belong to")
+        for r in backwards[:5]:
+            print(f"    ✗ {titles.get(r.narrow, r.narrow[:12])[:54]}\n"
+                  f"      does not imply {titles.get(r.broad, r.broad[:12])[:48]}")
+    return kept
 
 
 def check_prices(rels: list, markets: list[dict], args) -> list:
@@ -276,6 +353,238 @@ def check_prices(rels: list, markets: list[dict], args) -> list:
     return signals
 
 
+# ── positions: following the arbitrages the reader finds ─────────────────────
+#
+# A cross-market arbitrage pays at least 1.00 per pair, but only at resolution —
+# and the pairs this reader finds resolve months out. Completing a full set on
+# each market (buy YES on narrow, NO on broad) merges to 2.00 immediately, and
+# once the market has corrected that returns the guaranteed edge plus the price
+# of the middle outcome, in weeks instead of months. See strategy/cross_exit.py.
+#
+# These are PAPER positions: nothing is bought. The point is to find out, on
+# live books, how often and how fast the corrections actually come, before any
+# money depends on the answer.
+
+def book_top(token_id: str) -> tuple[float | None, float | None]:
+    """
+    (best bid, best ask) for one token, or Nones.
+
+    Scanned for extremes rather than read off the ends: the exchange sends bids
+    ascending and asks descending, so bids[0] and asks[0] are the WORST prices.
+    """
+    import httpx
+
+    try:
+        r = httpx.get(_BOOK, params={"token_id": token_id}, timeout=20)
+        if r.status_code != 200:
+            return None, None
+        body = r.json()
+        bids = [float(x["price"]) for x in body.get("bids", []) if float(x["price"]) > 0]
+        asks = [float(x["price"]) for x in body.get("asks", []) if float(x["price"]) > 0]
+        return (max(bids) if bids else None, min(asks) if asks else None)
+    except Exception as exc:                        # noqa: BLE001 — stay up
+        logger.debug("book fetch failed for %s: %s", token_id[:12], exc)
+        return None, None
+
+
+def _tokens_of(market: dict | None) -> tuple[str, str] | None:
+    """(YES token, NO token) for a binary market."""
+    if not market:
+        return None
+    toks = market.get("clobTokenIds")
+    if isinstance(toks, str):
+        try:
+            toks = json.loads(toks)
+        except ValueError:
+            return None
+    if not toks or len(toks) != 2:
+        return None
+    return str(toks[0]), str(toks[1])
+
+
+def _market_end_ts(market: dict | None) -> float | None:
+    if not market:
+        return None
+    end = market.get("endDate") or market.get("end_date")
+    if not end:
+        return None
+    try:
+        return datetime.fromisoformat(str(end).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _resolved_outcome(condition_id: str) -> bool | None:
+    """
+    True if YES won, False if NO won, None while unresolved or unclear.
+
+    Gamma filters on `condition_ids`. The camel-case `conditionId` is silently
+    ignored and returns an unfiltered page — which is how a query for one
+    market's fee once returned a different market's every time.
+    """
+    import httpx
+
+    try:
+        r = httpx.get(_GAMMA, params={"condition_ids": condition_id}, timeout=20)
+        rows = r.json() if r.status_code == 200 else []
+    except Exception:                               # noqa: BLE001
+        return None
+    for m in rows:
+        if str(m.get("conditionId")) != condition_id:
+            continue
+        try:
+            yes, no = (float(x) for x in json.loads(m.get("outcomePrices") or "[]"))
+        except (TypeError, ValueError):
+            return None
+        if {yes, no} != {0.0, 1.0}:
+            return None
+        return yes == 1.0
+    return None
+
+
+def fmt_position_opened(pos, sig) -> str:
+    days = pos.days_to_resolution()
+    when = f"resolves in {days:.0f} days" if days is not None else "resolution date unknown"
+    shortfall = sig.edge - pos.guaranteed_edge
+    return (
+        "📒 CROSS POSITION OPENED — paper, nothing bought\n"
+        f"  NO  {pos.narrow_title[:56]}  @ {pos.narrow_no_paid:.4f}\n"
+        f"  YES {pos.broad_title[:56]}  @ {pos.broad_yes_paid:.4f}\n"
+        f"  entry {pos.entry_cost:.4f}/pair → guaranteed {pos.guaranteed_edge:+.4f} "
+        f"({when})\n"
+        f"  the signal said {sig.edge:+.4f}; the real NO ask and fees cost "
+        f"{shortfall:.4f} of it\n"
+        "  Watching for the market to correct."
+    )
+
+
+def fmt_position_closed(pos) -> str:
+    from strategy.cross_exit import annualised
+
+    held = pos.days_held()
+    apr = annualised(pos.exit_profit, pos.entry_cost, held)
+    head = {
+        "exited": "🔓 CROSS POSITION EXITED EARLY — paper",
+        "resolved": "🏁 CROSS POSITION RESOLVED — paper",
+    }.get(pos.status, "CROSS POSITION CLOSED")
+    lines = [
+        head,
+        f"  {pos.narrow_title[:56]}",
+        f"  {pos.broad_title[:56]}",
+        f"  route {pos.exit_route or '—'} · held {held:.1f} days",
+        f"  {pos.exit_profit:+.4f}/pair against {pos.guaranteed_edge:+.4f} guaranteed "
+        f"· {pos.exit_profit * pos.size:+.2f} USDC on {pos.size:g} pairs",
+    ]
+    if apr is not None:
+        lines.append(f"  {apr * 100:.0f}% annualised")
+    return "\n".join(lines)
+
+
+def track_positions(sigs: list, markets: list[dict], args, cache: dict) -> list[str]:
+    """
+    Open a paper position for each new violation, then price every open one's
+    exits and close it when leaving beats holding.
+    """
+    from strategy.cross_exit import (
+        CrossPosition, PositionBook, best_exit, buy_cost, resolution_profit,
+        should_exit,
+    )
+
+    book = cache.get("positions")
+    if book is None:
+        book = PositionBook(args.positions_file).load()
+        cache["positions"] = book
+    by_id = {str(m.get("conditionId")): m for m in markets if m.get("conditionId")}
+    now = time.time()
+    msgs: list[str] = []
+    changed = False
+
+    # ── open ──────────────────────────────────────────────────────────────────
+    for s in sigs:
+        if book.has_open(s.narrow, s.broad):
+            continue
+        mn, mb = by_id.get(s.narrow), by_id.get(s.broad)
+        tn, tb = _tokens_of(mn), _tokens_of(mb)
+        if not tn or not tb:
+            continue
+        # Priced at what the legs actually cost. The signal prices NO on narrow
+        # as 1 − the YES ask; the NO ask is nearer 1 − the YES bid, which puts
+        # the real entry about one spread higher — a median of 100 bps on the
+        # live book. Opening at the signal's price would book an edge that was
+        # never available.
+        _, narrow_no_ask = book_top(tn[1])
+        _, broad_yes_ask = book_top(tb[0])
+        if narrow_no_ask is None or broad_yes_ask is None:
+            continue
+        no_paid, yes_paid = buy_cost(narrow_no_ask), buy_cost(broad_yes_ask)
+        if no_paid + yes_paid >= 1.0:
+            cache["illusory"] = cache.get("illusory", 0) + 1
+            logger.info(
+                "cross positions | %s/%s signalled %+.4f but costs %.4f at the "
+                "real asks — not an arbitrage, not opened",
+                s.narrow[:10], s.broad[:10], s.edge, no_paid + yes_paid,
+            )
+            continue
+        ends = [_market_end_ts(mn), _market_end_ts(mb)]
+        pos = CrossPosition(
+            narrow=s.narrow, broad=s.broad,
+            narrow_title=s.narrow_title, broad_title=s.broad_title,
+            narrow_yes_token=tn[0], narrow_no_token=tn[1],
+            broad_yes_token=tb[0], broad_no_token=tb[1],
+            size=args.paper_size,
+            narrow_no_paid=no_paid, broad_yes_paid=yes_paid,
+            opened_ts=now,
+            resolves_ts=max(ends) if None not in ends else None,
+            paper=True,
+        )
+        if book.open(pos):
+            changed = True
+            msgs.append(fmt_position_opened(pos, s))
+
+    # ── watch ─────────────────────────────────────────────────────────────────
+    for pos in book.open_positions():
+        if pos.resolves_ts is not None and now >= pos.resolves_ts:
+            ny, by = _resolved_outcome(pos.narrow), _resolved_outcome(pos.broad)
+            if ny is not None and by is not None:
+                book.close(pos, route="resolution",
+                           profit=resolution_profit(pos, ny, by),
+                           status="resolved", now=now)
+                changed = True
+                msgs.append(fmt_position_closed(pos))
+                continue
+
+        narrow_no_bid, _ = book_top(pos.narrow_no_token)
+        _, narrow_yes_ask = book_top(pos.narrow_yes_token)
+        broad_yes_bid, _ = book_top(pos.broad_yes_token)
+        _, broad_no_ask = book_top(pos.broad_no_token)
+        q = best_exit(
+            pos,
+            narrow_yes_ask=narrow_yes_ask, broad_no_ask=broad_no_ask,
+            narrow_no_bid=narrow_no_bid, broad_yes_bid=broad_yes_bid,
+        )
+        if should_exit(pos, q, min_capture=args.exit_min_capture):
+            book.close(pos, route=q.route, profit=q.profit, status="exited", now=now)
+            changed = True
+            msgs.append(fmt_position_closed(pos))
+        else:
+            logger.info(
+                "cross positions | %s/%s holding — best exit %s %+.4f against "
+                "%+.4f guaranteed",
+                pos.narrow[:10], pos.broad[:10], q.route or "none", q.profit,
+                pos.guaranteed_edge,
+            )
+
+    if changed:
+        book.save()
+    sm = book.summary()
+    print(f"  positions (paper): {sm['open']} open · {sm['exited_early']} exited "
+          f"early · {sm['resolved']} resolved · realised "
+          f"{sm['realised_usdc']:+.2f} USDC"
+          + (f" · {cache['illusory']} signal(s) not real at the asks"
+             if cache.get("illusory") else ""))
+    return msgs
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def _load_announced(args) -> set:
@@ -312,7 +621,8 @@ def one_pass(args, markets_cache: dict) -> int:
     markets = markets_cache.get("markets")
     if markets is None:
         print(f"  fetching up to {args.markets} live markets…")
-        markets = fetch_markets(args.markets)
+        markets = fetch_markets(args.markets, args.fast_days, args.fast_markets,
+                                args.fast_min_hours)
         markets_cache["markets"] = markets
         print(f"    got {len(markets)}")
 
@@ -324,7 +634,7 @@ def one_pass(args, markets_cache: dict) -> int:
     # Implications are stable; discover once and reuse across price polls.
     rels = markets_cache.get("rels")
     if rels is None:
-        rels = discover(markets, args)
+        rels = _drop_backwards(discover(markets, args), markets)
         markets_cache["rels"] = rels
 
         # Only announce relations we have not announced before.
@@ -364,6 +674,11 @@ def one_pass(args, markets_cache: dict) -> int:
             print(f"  {len(sigs)} violation(s), all within the alert cooldown.")
     else:
         print("  no price violation this pass.")
+
+    if not args.no_paper:
+        msgs = track_positions(sigs, markets, args, markets_cache)
+        if msgs:
+            deliver(msgs[:args.max_alerts], args.dry_run)
     return len(sigs)
 
 
@@ -390,6 +705,27 @@ def main() -> int:
     ap.add_argument("--arb-cooldown", type=float, default=3600.0, metavar="SEC",
                     help="do not re-alert the same violated pair within this "
                          "window (default 3600)")
+    ap.add_argument("--fast-days", type=float, default=30.0, metavar="DAYS",
+                    help="also fetch markets resolving within this many days "
+                         "(default 30; 0 disables)")
+    ap.add_argument("--fast-min-hours", type=float, default=1.0, metavar="HOURS",
+                    help="skip markets ending sooner than this — usually in play "
+                         "(default 1)")
+    ap.add_argument("--fast-markets", type=int, default=400,
+                    help="how many soonest-resolving markets to add (default 400)")
+    ap.add_argument("--max-per-event", type=int, default=3,
+                    help="candidate pairs allowed from any one event (default 3)")
+    ap.add_argument("--positions-file",
+                    default=str(REPO / "cross_positions.json"),
+                    help="where paper positions are kept across restarts")
+    ap.add_argument("--paper-size", type=float, default=10.0, metavar="PAIRS",
+                    help="pairs per paper position (default 10)")
+    ap.add_argument("--exit-min-capture", type=float, default=None,
+                    metavar="FRACTION",
+                    help="fraction of the guaranteed edge an early exit must "
+                         "capture (default CROSS_EXIT_MIN_CAPTURE, 1.0)")
+    ap.add_argument("--no-paper", action="store_true",
+                    help="do not open or track paper positions")
     ap.add_argument("--no-implication-alerts", action="store_true",
                     help="only alert on price violations, not on discoveries")
     ap.add_argument("--dry-run",     action="store_true")

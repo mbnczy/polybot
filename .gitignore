@@ -31,3 +31,5 @@ claude-trading-skills
 skills/
 announced.json
 *.tmp
+cross_positions.json
+cross_positions.json.tmp
