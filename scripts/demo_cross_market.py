@@ -267,6 +267,48 @@ def discover(markets: list[dict], args) -> list:
     return strong
 
 
+def export_implications(rels: list, markets: list[dict], path: str) -> int:
+    """
+    Hand the verified implications to the trading bot.
+
+    The reader stays read-only by construction — its systemd unit cannot even
+    see the wallet's .env — so it does not trade. It writes what it has found,
+    after the direction guard, to one JSON file the bot's cross guard reads and
+    prices live. Everything the bot needs to act is in the file: both markets'
+    token pairs and end dates, so it never has to trust a title.
+
+    Written atomically: the bot must never read half a file.
+    """
+    by_id = {str(m.get("conditionId")): m for m in markets if m.get("conditionId")}
+    rows = []
+    for r in rels:
+        mn, mb = by_id.get(r.narrow), by_id.get(r.broad)
+        tn, tb = _tokens_of(mn), _tokens_of(mb)
+        if not tn or not tb:
+            continue
+        rows.append({
+            "narrow": r.narrow, "broad": r.broad,
+            "narrow_title": str(mn.get("question") or ""),
+            "broad_title": str(mb.get("question") or ""),
+            "narrow_yes_token": tn[0], "narrow_no_token": tn[1],
+            "broad_yes_token": tb[0], "broad_no_token": tb[1],
+            "narrow_end_ts": _market_end_ts(mn), "broad_end_ts": _market_end_ts(mb),
+            "confidence": float(getattr(r, "confidence", 0.0)),
+            "evidence": str(getattr(r, "evidence", ""))[:300],
+        })
+    p = Path(path)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    try:
+        tmp.write_text(json.dumps({"generated_at": time.time(), "implications": rows},
+                                  indent=1))
+        tmp.replace(p)
+    except OSError as exc:
+        logger.error("cannot write implications to %s: %s", p, exc)
+        return 0
+    print(f"  exported {len(rows)} implication(s) for the bot → {p.name}")
+    return len(rows)
+
+
 def _drop_backwards(rels: list, markets: list[dict]) -> list:
     """
     Refuse implications whose direction contradicts their own ladder family.
@@ -680,6 +722,7 @@ def one_pass(args, markets_cache: dict) -> int:
     if rels is None:
         rels = _drop_backwards(discover(markets, args), markets)
         markets_cache["rels"] = rels
+        export_implications(rels, markets, args.implications_file)
 
         # Only announce relations we have not announced before.
         #
@@ -754,9 +797,9 @@ def main() -> int:
     ap.add_argument("--arb-cooldown", type=float, default=3600.0, metavar="SEC",
                     help="do not re-alert the same violated pair within this "
                          "window (default 3600)")
-    ap.add_argument("--fast-days", type=float, default=30.0, metavar="DAYS",
+    ap.add_argument("--fast-days", type=float, default=7.0, metavar="DAYS",
                     help="also fetch markets resolving within this many days "
-                         "(default 30; 0 disables)")
+                         "(default 7 — the execution window; 0 disables)")
     ap.add_argument("--fast-min-hours", type=float, default=1.0, metavar="HOURS",
                     help="skip markets ending sooner than this — usually in play "
                          "(default 1)")
@@ -764,6 +807,9 @@ def main() -> int:
                     help="how many soonest-resolving markets to add (default 400)")
     ap.add_argument("--max-per-event", type=int, default=3,
                     help="candidate pairs allowed from any one event (default 3)")
+    ap.add_argument("--implications-file",
+                    default=str(REPO / "cross_implications.json"),
+                    help="where verified implications are written for the bot")
     ap.add_argument("--positions-file",
                     default=str(REPO / "cross_positions.json"),
                     help="where paper positions are kept across restarts")

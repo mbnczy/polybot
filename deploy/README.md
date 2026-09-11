@@ -24,3 +24,21 @@ Logs go to the journal: `journalctl -u polybot-crossmarket -f`.
 The hardening is unchanged except for one path: paper positions are written
 beside this branch's code, so the drop-in adds it to `ReadWritePaths`. The
 trading bot's directory stays read-only and its `.env` unreachable.
+
+## Execution
+
+The trading bot trades what the reader finds through `execution/cross_guard.py`.
+The reader writes verified implications to
+`/home/ubuntu/polybot-dev/cross-exec/cross_implications.json`; the bot reads it
+(its sandbox can read `/home/ubuntu`, only write its own directory).
+
+Execution is OFF unless the bot's `.env` sets `CROSS_EXECUTION_ENABLED=true`.
+While off it evaluates every implication against the live book and logs
+`WOULD ENTER` / `WOULD EXIT`, so the gates can be checked before money moves.
+
+    CROSS_EXECUTION_ENABLED=false   # the switch
+    CROSS_MAX_LOCKUP_DAYS=7         # both markets must resolve inside this
+    CROSS_MIN_EDGE=0.02             # per pair, at the real asks, fees included
+    CROSS_MAX_POSITION_USDC=5       # per position
+    CROSS_MAX_POSITIONS=2           # breaker cross slots, separate from bundles
+    CROSS_MAX_COMMITTED_USDC=10     # breaker cross capital ceiling

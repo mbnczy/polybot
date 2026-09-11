@@ -126,3 +126,18 @@ def test_the_optional_cap_drops_slow_pairs(monkeypatch):
 
 def test_no_cap_by_default():
     assert im._MAX_LOCKUP_DAYS == 0.0
+
+
+def test_under_a_cap_an_unknown_end_date_is_dropped(monkeypatch):
+    """
+    A pair whose lockup cannot be priced cannot be shown to fit the window, and
+    execution will refuse it anyway — so it should not spend model budget.
+    """
+    monkeypatch.setattr(im, "_MAX_LOCKUP_DAYS", 7.0)
+    c = build_candidates([
+        _mkt("a1", "Will BTC reach $80,000 by December 31?", 3, event="btc"),
+        _mkt("a2", "Will BTC reach $70,000 by December 31?", 3, event="btc"),
+        _mkt("b1", "Will ETH reach $5,000 by September 30?", None, event="eth"),
+        _mkt("b2", "Will ETH reach $4,000 by September 30?", None, event="eth"),
+    ], max_per_event=0)
+    assert c and all(x.lockup_days is not None and x.lockup_days <= 7.0 for x in c)

@@ -30,3 +30,7 @@ announced.json
 *.tmp
 cross_positions.json
 cross_positions.json.tmp
+cross_implications.json
+cross_implications.json.tmp
+cross_positions_live.json
+cross_positions_live.json.tmp

@@ -455,7 +455,9 @@ def build_candidates(
             max(0.0, (max(a_end, b_end) - now) / 86_400.0)
             if a_end is not None and b_end is not None else None
         )
-        if _MAX_LOCKUP_DAYS > 0 and lockup is not None and lockup > _MAX_LOCKUP_DAYS:
+        # With a cap set, an unknown end date cannot be shown to meet it, and a
+        # pair whose lockup cannot be priced cannot be traded inside the window.
+        if _MAX_LOCKUP_DAYS > 0 and (lockup is None or lockup > _MAX_LOCKUP_DAYS):
             too_slow += 1
             continue
         out.append(Candidate(
