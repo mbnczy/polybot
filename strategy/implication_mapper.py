@@ -54,6 +54,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -291,6 +292,54 @@ SHAPE_NEST, SHAPE_LADDER, SHAPE_LOOSE, SHAPE_SIBLING, SHAPE_DUPLICATE = (
 
 _SHAPE_RANK = {SHAPE_NEST: 3.0, SHAPE_LADDER: 2.0, SHAPE_LOOSE: 1.0, SHAPE_SIBLING: 0.0}
 
+# Time is a cost here, not a detail. A cross-market pair has no complete set to
+# merge, so an arbitrage on it pays only when the LATER leg resolves: the same
+# 21% edge is 86% a year over 112 days and several thousand percent over three.
+# So among pairs of the same shape, the one that closes sooner comes first.
+#
+# Shape still dominates. It decides whether an implication can exist at all, and
+# a sibling that resolves tomorrow is still a sibling. The two secondary weights
+# sum to under 1.0 — the gap between shape ranks — so no amount of speed lifts a
+# pair past a better shape. Within a shape, time outweighs a shared event: shape
+# now carries the relatedness evidence the event bonus was standing in for.
+_TIME_WEIGHT: float = float(os.environ.get("IMPLICATION_TIME_WEIGHT", 0.6))
+_EVENT_WEIGHT: float = float(os.environ.get("IMPLICATION_EVENT_WEIGHT", 0.3))
+
+# Lockup at which a pair's time score halves. 30 days: resolving today scores
+# 1.0, in a month 0.5, in 112 days 0.21, in a year 0.08.
+_LOCKUP_HALF_LIFE_DAYS: float = float(
+    os.environ.get("IMPLICATION_LOCKUP_HALF_LIFE_DAYS", 30.0)
+)
+
+# Refuse pairs locked up longer than this. 0 = no cap; the ranking alone already
+# spends the model budget on the fast pairs first.
+_MAX_LOCKUP_DAYS: float = float(os.environ.get("IMPLICATION_MAX_LOCKUP_DAYS", 0.0))
+
+
+def _end_ts(market: dict) -> "float | None":
+    """A market's resolution time as a unix timestamp, or None when unknown."""
+    raw = market.get("endDate") or market.get("end_date") or market.get("endDateIso")
+    if not raw:
+        return None
+    try:
+        from datetime import datetime               # noqa: PLC0415
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def time_score(lockup_days: "float | None") -> float:
+    """
+    1.0 for a pair resolving now, falling toward 0 as lockup grows.
+
+    An unknown lockup scores 0: a pair whose capital cost cannot be priced gets
+    no credit for speed it may not have. It still ranks by shape.
+    """
+    if lockup_days is None:
+        return 0.0
+    half = _LOCKUP_HALF_LIFE_DAYS if _LOCKUP_HALF_LIFE_DAYS > 0 else 30.0
+    return 1.0 / (1.0 + max(lockup_days, 0.0) / half)
+
 
 def pair_shape(a_title: str, b_title: str) -> str:
     """
@@ -343,6 +392,9 @@ class Candidate:
     same_event: bool
     event_id:   str = ""
     shape:      str = SHAPE_LOOSE   # see pair_shape() — the strongest signal
+    # Days until the LATER market resolves — how long capital would sit. None
+    # when either end date is unknown.
+    lockup_days: "float | None" = None
 
 
 def build_candidates(
@@ -372,11 +424,15 @@ def build_candidates(
         cid   = str(m.get("conditionId") or m.get("condition_id") or "").strip()
         if not title or not cid:
             continue
-        rows.append((cid, title, _tokens(title), _event_id(m), _exclusion_group(m)))
+        rows.append((cid, title, _tokens(title), _event_id(m), _exclusion_group(m),
+                     _end_ts(m)))
 
     out: list[Candidate] = []
     excluded_siblings = 0
-    for (a_id, a_t, a_tok, a_ev, a_ng), (b_id, b_t, b_tok, b_ev, b_ng) in itertools.combinations(rows, 2):
+    now = time.time()
+    too_slow = 0
+    for (a_id, a_t, a_tok, a_ev, a_ng, a_end), (b_id, b_t, b_tok, b_ev, b_ng, b_end) \
+            in itertools.combinations(rows, 2):
         if a_id == b_id or not a_tok or not b_tok:
             continue
         # Alternative outcomes of one NegRisk question. Mutually exclusive by
@@ -395,9 +451,16 @@ def build_candidates(
         floor = _SAME_EVENT_MIN_OVERLAP if same_event else min_overlap
         if overlap < floor:
             continue
+        lockup = (
+            max(0.0, (max(a_end, b_end) - now) / 86_400.0)
+            if a_end is not None and b_end is not None else None
+        )
+        if _MAX_LOCKUP_DAYS > 0 and lockup is not None and lockup > _MAX_LOCKUP_DAYS:
+            too_slow += 1
+            continue
         out.append(Candidate(
             a_id, b_id, a_t, b_t, overlap, same_event,
-            a_ev if same_event else "", pair_shape(a_t, b_t),
+            a_ev if same_event else "", pair_shape(a_t, b_t), lockup,
         ))
 
     if excluded_siblings:
@@ -418,8 +481,23 @@ def build_candidates(
     # A shared event breaks ties within a shape: Polymarket groups genuinely
     # related markets, so it is real evidence, but it is weaker than shape —
     # the siblings we just demoted were overwhelmingly same-event.
+    # Secondary terms are capped below the 1.0 gap between shape ranks, so a
+    # misconfigured pair of weights cannot let speed outrank shape.
+    secondary = _TIME_WEIGHT + _EVENT_WEIGHT
+    scale = 0.99 / secondary if secondary >= 0.99 else 1.0
+
     def _score(c: Candidate) -> float:
-        return _SHAPE_RANK.get(c.shape, 0.0) + (0.5 if c.same_event else 0.0)
+        return (
+            _SHAPE_RANK.get(c.shape, 0.0)
+            + scale * _EVENT_WEIGHT * (1.0 if c.same_event else 0.0)
+            + scale * _TIME_WEIGHT * time_score(c.lockup_days)
+        )
+
+    if too_slow:
+        logger.info(
+            "implication mapper | %d pair(s) dropped for locking capital longer "
+            "than %.0f days", too_slow, _MAX_LOCKUP_DAYS,
+        )
 
     dupes = [c for c in out if c.shape == SHAPE_DUPLICATE]
     if dupes:
