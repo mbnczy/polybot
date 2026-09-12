@@ -671,6 +671,10 @@ def _terminal_order_error(exc: Exception) -> "str | None":
     text = str(exc).lower()
     if "couldn't be fully filled" in text or "fully filled or killed" in text:
         return "FOK not filled"
+    # A token with no book has no book now and will have none in 8 seconds
+    # either: 136 of these burned five retries each on 2026-09-12.
+    if "no orderbook exists" in text:
+        return "no orderbook for token"
     return None
 
 

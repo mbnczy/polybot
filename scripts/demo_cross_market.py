@@ -280,11 +280,18 @@ def export_implications(rels: list, markets: list[dict], path: str) -> int:
     Written atomically: the bot must never read half a file.
     """
     by_id = {str(m.get("conditionId")): m for m in markets if m.get("conditionId")}
-    rows = []
+    now = time.time()
+    rows, expired = [], 0
     for r in rels:
         mn, mb = by_id.get(r.narrow), by_id.get(r.broad)
         tn, tb = _tokens_of(mn), _tokens_of(mb)
         if not tn or not tb:
+            continue
+        # A pair whose later market has ended pays nothing and cannot be
+        # entered; the bot would only read it to refuse it.
+        ends = [e for e in (_market_end_ts(mn), _market_end_ts(mb)) if e is not None]
+        if ends and max(ends) <= now:
+            expired += 1
             continue
         rows.append({
             "narrow": r.narrow, "broad": r.broad,
@@ -305,7 +312,8 @@ def export_implications(rels: list, markets: list[dict], path: str) -> int:
     except OSError as exc:
         logger.error("cannot write implications to %s: %s", p, exc)
         return 0
-    print(f"  exported {len(rows)} implication(s) for the bot → {p.name}")
+    print(f"  exported {len(rows)} implication(s) for the bot → {p.name}"
+          + (f" ({expired} expired dropped)" if expired else ""))
     return len(rows)
 
 
@@ -719,10 +727,10 @@ def one_pass(args, markets_cache: dict) -> int:
 
     # Implications are stable; discover once and reuse across price polls.
     rels = markets_cache.get("rels")
-    if rels is None:
+    fresh_discovery = rels is None
+    if fresh_discovery:
         rels = _drop_backwards(discover(markets, args), markets)
         markets_cache["rels"] = rels
-        export_implications(rels, markets, args.implications_file)
 
         # Only announce relations we have not announced before.
         #
@@ -738,8 +746,15 @@ def one_pass(args, markets_cache: dict) -> int:
                     args.dry_run)
         announced.update((r.narrow, r.broad) for r in rels)
         _save_announced(args, announced)
+
         if rels and not fresh:
             print(f"  {len(rels)} implication(s), all already announced — quiet.")
+
+    # Every pass, not only on rediscovery. The bot prices what is in this file,
+    # and inside a one-week window the match sub-markets in it expire hourly: on
+    # 2026-09-12 whole passes read "past_end 25" because the file was 90 minutes
+    # old. Expired pairs are dropped as it is written.
+    export_implications(rels, markets, args.implications_file)
 
     sigs = check_prices(rels, markets, args)
     sigs, illusory = confirm_at_asks(sigs, markets)
@@ -789,7 +804,7 @@ def main() -> int:
     ap.add_argument("--concurrency", type=int,   default=4)
     ap.add_argument("--loop",        type=int,   default=0, metavar="SECONDS",
                     help="re-poll prices every N seconds (0 = single pass)")
-    ap.add_argument("--rediscover",  type=int,   default=6, metavar="PASSES",
+    ap.add_argument("--rediscover",  type=int,   default=2, metavar="PASSES",
                     help="re-run the model every N passes when looping")
     ap.add_argument("--state-file", default=str(REPO / "announced.json"),
                     help="where announced implications are remembered across "

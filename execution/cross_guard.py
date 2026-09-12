@@ -480,8 +480,17 @@ class CrossGuard:
         if (ends - now) / 86_400.0 > self._max_lockup:
             return "outside_window", None
         self.stats["evaluated"] += 1
-        no_book = await self._client.get_orderbook(imp.narrow_no_token)
-        yes_book = await self._client.get_orderbook(imp.broad_yes_token)
+        # A book can be gone — the market closed, or the token was never
+        # tradeable. That is this pair's answer, not the pass's: letting it
+        # raise aborted the whole scan, and on 2026-09-12 the guard went 12
+        # minutes without completing one, exits included.
+        try:
+            no_book = await self._client.get_orderbook(imp.narrow_no_token)
+            yes_book = await self._client.get_orderbook(imp.broad_yes_token)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("CrossGuard | no book for %s: %s", imp.narrow_title[:40], exc)
+            self.last_reason[key] = f"orderbook unavailable: {exc}"
+            return "no_book", None
         rate_narrow, rate_broad = await self._rate(imp.narrow), await self._rate(imp.broad)
         opp, reason = evaluate(
             imp, no_book, yes_book, now=now,

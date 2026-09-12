@@ -390,3 +390,27 @@ async def test_an_empty_export_says_so(tmp_path, monkeypatch):
     g, _, _, _ = _guard(tmp_path, monkeypatch, {}, [], enabled=False)
     await g.poll_once()
     assert "no implications in" in g.stop_summary()
+
+
+@pytest.mark.asyncio
+async def test_a_missing_book_stops_one_pair_not_the_pass(tmp_path, monkeypatch):
+    """
+    On 2026-09-12 a closed market's book raised, the exception aborted the scan,
+    and the guard went 12 minutes without completing a pass — exits included.
+    """
+    books = {**ARB, "nn2": _book(asks=[(0.40, 50)]), "by2": _book(asks=[(0.45, 20)])}
+    g, client, _, _ = _guard(tmp_path, monkeypatch, books, [_other(2), _imp()],
+                             enabled=False)
+
+    async def get_orderbook(token):
+        if token == "nn2":
+            raise RuntimeError("No orderbook exists for the requested token id")
+        return client.books.get(token, _book())
+
+    client.get_orderbook = get_orderbook
+    await g.poll_once()
+    line = g.stop_summary()
+    assert "no_book 1" in line
+    # The pair behind the dead book stops; the good one is still reached.
+    assert "would_enter 1" in line
+    assert g.stats["would_enter"] == 1

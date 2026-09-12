@@ -50,3 +50,9 @@ def test_a_killed_fok_is_terminal():
 
 def test_a_transport_fault_is_still_retried():
     assert _terminal_order_error(Exception("Connection reset by peer")) is None
+
+
+def test_a_missing_orderbook_is_terminal():
+    """136 of these burned five retries each on 2026-09-12."""
+    exc = Exception("No orderbook exists for the requested token id")
+    assert _terminal_order_error(exc) == "no orderbook for token"
