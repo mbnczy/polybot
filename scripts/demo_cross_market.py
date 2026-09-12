@@ -233,8 +233,18 @@ def deliver(messages: list[str], dry_run: bool) -> None:
 # ── stages ────────────────────────────────────────────────────────────────────
 
 def discover(markets: list[dict], args) -> list:
-    """Stage 1 — expensive, infrequent. Ask the model for implications."""
+    """
+    Stage 1 — ask the model for implications, but only about pairs it has not
+    seen before.
+
+    A verdict never expires: both questions are immutable once listed. The cache
+    therefore turns the model's cost from per-pass into one-time, which is what
+    lets the net be thousands of pairs wide instead of thirty. Each pass spends
+    its budget (--new-per-pass) on pairs nobody has judged yet, so coverage
+    grows every cycle while the pass stays short.
+    """
     import strategy.implication_mapper as im
+    from strategy.verdict_cache import VerdictCache
 
     provider = im.resolve_provider()
     model    = im.resolve_model(provider)
@@ -243,9 +253,17 @@ def discover(markets: list[dict], args) -> list:
     # matches — ten fixtures at three pairs each rather than one at thirty.
     cands    = im.build_candidates(markets, max_pairs=args.pairs,
                                    max_per_event=args.max_per_event)
-    print(f"  prefilter  : {len(cands)} candidate pair(s)")
-    if not cands:
-        return []
+    cache = VerdictCache(args.cache_file).load()
+    known, unknown = cache.split(cands)
+    fresh = unknown[:args.new_per_pass]
+    print(f"  prefilter  : {len(cands)} candidate pair(s) | "
+          f"{len(cands) - len(unknown)} already judged ({len(cache)} in cache), "
+          f"{len(unknown)} new → classifying {len(fresh)}")
+    if not fresh:
+        strong = [r for r in known if r.confidence >= args.threshold]
+        print(f"    {len(known)} from cache · {len(strong)} at/above {args.threshold}")
+        return strong
+    cands = fresh
     print(f"  classifying on {provider.name}/{model}…")
     # Build the client here and close it here. Left to classify_candidates it
     # would make a fresh one per discovery round, each with its own connection
@@ -262,8 +280,12 @@ def discover(markets: list[dict], args) -> list:
         close = getattr(client, "close", None)
         if callable(close):
             close()
+    cache.remember(cands, rels)
+    cache.save()
+    rels = known + rels
     strong = [r for r in rels if r.confidence >= args.threshold]
-    print(f"    {len(rels)} asserted · {len(strong)} at/above {args.threshold}")
+    print(f"    {len(rels)} asserted ({len(known)} from cache) · "
+          f"{len(strong)} at/above {args.threshold}")
     return strong
 
 
@@ -793,7 +815,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--markets",     type=int,   default=800)
-    ap.add_argument("--pairs",       type=int,   default=30,
+    ap.add_argument("--cache-file",  default="cross_verdicts.json", metavar="PATH",
+                    help="where model verdicts are remembered between passes")
+    ap.add_argument("--new-per-pass", type=int,  default=60, metavar="N",
+                    help="how many unseen pairs each discovery sends to the model")
+    ap.add_argument("--pairs",       type=int,   default=800,
                     help="candidate pairs sent to the model")
     ap.add_argument("--threshold",   type=float, default=0.90,
                     help="minimum implication confidence (default 0.90)")
@@ -820,7 +846,7 @@ def main() -> int:
                          "(default 1)")
     ap.add_argument("--fast-markets", type=int, default=400,
                     help="how many soonest-resolving markets to add (default 400)")
-    ap.add_argument("--max-per-event", type=int, default=3,
+    ap.add_argument("--max-per-event", type=int, default=8,
                     help="candidate pairs allowed from any one event (default 3)")
     ap.add_argument("--implications-file",
                     default=str(REPO / "cross_implications.json"),

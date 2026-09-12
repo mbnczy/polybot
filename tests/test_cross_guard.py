@@ -377,11 +377,12 @@ async def test_the_summary_names_where_each_pair_stopped(tmp_path, monkeypatch):
     assert "best edge +0.1500" in line
     assert client.buys == []
 
-    # Next pass the would-be entry sits out its cooldown: the snapshot moves on,
-    # the running count keeps it.
+    # Next pass the would-be entry sits out its cooldown and the pair 79 points
+    # from the threshold is deferred rather than re-priced: the snapshot moves
+    # on, the running count keeps it.
     await g.poll_once()
     line = g.stop_summary()
-    assert "cooldown 1" in line and "best edge -0.7900" in line
+    assert "cooldown 1" in line and "deferred 1" in line
     assert line.endswith("would_enter 1 entered 0 open 0")
 
 
@@ -469,3 +470,45 @@ async def test_an_ordinary_edge_needs_no_confirmation(tmp_path, monkeypatch):
     g, client, _, _ = _guard(tmp_path, monkeypatch, ARB, [_imp()])
     await g.poll_once()
     assert len(client.buys) == 2
+
+
+# ── attention where the gap is small ──────────────────────────────────────────
+
+def test_a_pair_near_the_threshold_is_looked_at_every_poll(tmp_path, monkeypatch):
+    g, _, _, _ = _guard(tmp_path, monkeypatch, ARB, [])
+    assert g._recheck_delay("edge_below_min", 0.00) == 0.0     # 2 points away
+    assert g._recheck_delay("ok", 0.15) == 0.0
+
+
+def test_a_pair_far_from_the_threshold_waits(tmp_path, monkeypatch):
+    g, _, _, _ = _guard(tmp_path, monkeypatch, ARB, [])
+    assert g._recheck_delay("edge_below_min", -0.05) == 120.0   # mid band
+    assert g._recheck_delay("edge_below_min", -0.40) == 600.0   # far
+    assert g._recheck_delay("no_ask", None) == 120.0
+
+
+def test_a_pair_judged_without_a_book_read_is_not_deferred(tmp_path, monkeypatch):
+    g, _, _, _ = _guard(tmp_path, monkeypatch, ARB, [])
+    for stop in ("past_end", "outside_window", "cooldown", "held"):
+        assert g._recheck_delay(stop, None) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_a_far_pair_is_not_priced_again_next_poll(tmp_path, monkeypatch):
+    """Two book reads per pair per poll is what a wide net cannot afford."""
+    far = {"nn": _book(asks=[(0.83, 50)], bids=[(0.80, 50)]),
+           "by": _book(asks=[(0.96, 50)], bids=[(0.94, 50)])}     # edge -0.79
+    g, client, _, _ = _guard(tmp_path, monkeypatch, far, [_imp()], enabled=False)
+    reads = []
+    inner = client.get_orderbook
+
+    async def counting(token):
+        reads.append(token)
+        return await inner(token)
+
+    client.get_orderbook = counting
+    await g.poll_once()
+    assert len(reads) == 2
+    await g.poll_once()
+    assert len(reads) == 2                      # deferred, not re-priced
+    assert "deferred 1" in g.stop_summary()

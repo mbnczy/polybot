@@ -94,7 +94,10 @@ CROSS_IMPLICATIONS_PATH: str = os.environ.get(
 CROSS_POSITIONS_PATH: str = os.environ.get(
     "CROSS_POSITIONS_PATH", "cross_positions_live.json"
 )
-CROSS_POLL_S: float = float(os.environ.get("CROSS_POLL_S", 30.0))
+# Halved once the adaptive re-check landed: most pairs are deferred on any given
+# poll, so looking twice as often costs little and halves the delay on the ones
+# sitting at the threshold.
+CROSS_POLL_S: float = float(os.environ.get("CROSS_POLL_S", 15.0))
 # The whole point of the window: capital back within a week, not a quarter.
 CROSS_MAX_LOCKUP_DAYS: float = float(os.environ.get("CROSS_MAX_LOCKUP_DAYS", 7.0))
 CROSS_MIN_EDGE: float = float(os.environ.get("CROSS_MIN_EDGE", 0.02))
@@ -110,6 +113,15 @@ CROSS_MAX_POSITION_USDC: float = float(os.environ.get("CROSS_MAX_POSITION_USDC",
 CROSS_MIN_TIME_TO_END_S: float = float(os.environ.get("CROSS_MIN_TIME_TO_END_S", 1800.0))
 CROSS_SUSPICIOUS_EDGE: float = float(os.environ.get("CROSS_SUSPICIOUS_EDGE", 0.15))
 CROSS_SPIKE_CONFIRM_S: float = float(os.environ.get("CROSS_SPIKE_CONFIRM_S", 300.0))
+# With a wide net the file holds hundreds of pairs, and pricing every one of
+# them every poll is two book reads each against the exchange's rate limit. A
+# pair 30 points from the threshold does not become tradeable in 30 seconds, so
+# attention goes where the gap is small: near the threshold every poll, mid
+# band every few minutes, the rest rarely.
+CROSS_RECHECK_MID_S: float = float(os.environ.get("CROSS_RECHECK_MID_S", 120.0))
+CROSS_RECHECK_FAR_S: float = float(os.environ.get("CROSS_RECHECK_FAR_S", 600.0))
+CROSS_NEAR_BAND: float = float(os.environ.get("CROSS_NEAR_BAND", 0.03))
+CROSS_MID_BAND: float = float(os.environ.get("CROSS_MID_BAND", 0.10))
 # Gamma's orderMinSize on live markets.
 CROSS_MIN_SHARES: float = float(os.environ.get("CROSS_MIN_SHARES", 5.0))
 # After a failed or declined attempt, leave the pair alone this long.
@@ -368,6 +380,7 @@ class CrossGuard:
         self._suspicious_edge = (CROSS_SUSPICIOUS_EDGE if suspicious_edge is None
                                  else suspicious_edge)
         self._spike: dict[tuple[str, str], float] = {}
+        self._next_check: dict[tuple[str, str], float] = {}
         self._resolved = resolution_lookup or _gamma_resolution
         self._book = PositionBook(positions_path or CROSS_POSITIONS_PATH).load()
         self._cooldown: dict[tuple[str, str], float] = {}
@@ -484,9 +497,32 @@ class CrossGuard:
         for imp in imps:
             stop, edge = await self._consider(imp, now)
             stops[stop] = stops.get(stop, 0) + 1
+            if stop != "deferred":
+                wait = self._recheck_delay(stop, edge)
+                if wait > 0.0:
+                    self._next_check[imp.key] = now + wait
             if edge is not None and (best is None or edge > best[0]):
                 best = (edge, imp.narrow_title)
         self._last_pass = (now, len(imps), stops, best)
+
+    def _recheck_delay(self, stop: str, edge: "float | None") -> float:
+        """
+        How long this pair may be left alone. Distance from the threshold is
+        the only thing that matters: a pair 30 points away cannot cross it in
+        one poll, and pricing it again costs two book reads that a near pair
+        needs more.
+        """
+        if stop in ("held", "stuck", "cooldown", "past_end", "outside_window",
+                    "end_unknown", "different_statistic", "too_close_to_end"):
+            return 0.0                      # judged without a book read anyway
+        if edge is None:
+            return CROSS_RECHECK_MID_S      # no ask, no bid, or no book at all
+        gap = self._min_edge - edge
+        if gap <= CROSS_NEAR_BAND:
+            return 0.0                      # close: look every poll
+        if gap <= CROSS_MID_BAND:
+            return CROSS_RECHECK_MID_S
+        return CROSS_RECHECK_FAR_S
 
     async def _consider(self, imp: Implication, now: float) -> "tuple[str, float | None]":
         """
@@ -508,6 +544,8 @@ class CrossGuard:
             return "past_end", None
         if (ends - now) / 86_400.0 > self._max_lockup:
             return "outside_window", None
+        if self._next_check.get(key, 0.0) > now:
+            return "deferred", None
         self.stats["evaluated"] += 1
         # A book can be gone — the market closed, or the token was never
         # tradeable. That is this pair's answer, not the pass's: letting it
