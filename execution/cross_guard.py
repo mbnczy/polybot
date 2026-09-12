@@ -381,6 +381,10 @@ class CrossGuard:
                                  else suspicious_edge)
         self._spike: dict[tuple[str, str], float] = {}
         self._next_check: dict[tuple[str, str], float] = {}
+        # What each pair was last judged to be, so a deferred pair still reports
+        # its price rather than vanishing behind "deferred".
+        self._last_stop: dict[tuple[str, str], str] = {}
+        self._last_edge: dict[tuple[str, str], "float | None"] = {}
         self._resolved = resolution_lookup or _gamma_resolution
         self._book = PositionBook(positions_path or CROSS_POSITIONS_PATH).load()
         self._cooldown: dict[tuple[str, str], float] = {}
@@ -390,7 +394,8 @@ class CrossGuard:
                       "half_filled": 0, "exited": 0, "resolved": 0, "stuck": 0}
         # The last complete pass over the reader's file, for stop_summary():
         # (when, implications read, stops by key, (best edge, narrow title)).
-        self._last_pass: "tuple[float, int, dict[str, int], tuple[float, str] | None] | None" = None
+        self._last_pass: ("tuple[float, int, dict[str, int], "
+                          "tuple[float, str] | None, int] | None") = None
         logger.info(
             "CrossGuard init | %s | window=%gd min_edge=%.3f max_pos=%.2f USDC "
             "open=%d file=%s",
@@ -443,13 +448,15 @@ class CrossGuard:
         """
         if self._last_pass is None:
             return "no pass yet"
-        ts, total, stops, best = self._last_pass
+        ts, total, stops, best, deferred = self._last_pass
         head = f"last pass {time.time() - ts:.0f}s ago"
         if not total:
             return f"{head} | no implications in {self._imp_path}"
         parts = ", ".join(f"{k} {v}" for k, v in
                           sorted(stops.items(), key=lambda kv: (-kv[1], kv[0])))
         line = f"{head} | {total} implication(s): {parts}"
+        if deferred:
+            line += f" | {deferred} not re-priced this pass"
         if best is not None:
             line += f" | best edge {best[0]:+.4f} (min {self._min_edge:.4f}) {best[1][:50]}"
         return (f"{line} | would_enter {self.stats['would_enter']} "
@@ -494,16 +501,25 @@ class CrossGuard:
         imps = load_implications(self._imp_path)
         stops: dict[str, int] = {}
         best: "tuple[float, str] | None" = None
+        deferred = 0
         for imp in imps:
             stop, edge = await self._consider(imp, now)
-            stops[stop] = stops.get(stop, 0) + 1
-            if stop != "deferred":
+            if stop == "deferred":
+                # Report what it was when last priced; a pair 30 points away is
+                # not news every 15 seconds, but it is still the fact about it.
+                deferred += 1
+                stop = self._last_stop.get(imp.key, "not yet priced")
+                edge = self._last_edge.get(imp.key)
+            else:
+                self._last_stop[imp.key] = stop
+                self._last_edge[imp.key] = edge
                 wait = self._recheck_delay(stop, edge)
                 if wait > 0.0:
                     self._next_check[imp.key] = now + wait
+            stops[stop] = stops.get(stop, 0) + 1
             if edge is not None and (best is None or edge > best[0]):
                 best = (edge, imp.narrow_title)
-        self._last_pass = (now, len(imps), stops, best)
+        self._last_pass = (now, len(imps), stops, best, deferred)
 
     def _recheck_delay(self, stop: str, edge: "float | None") -> float:
         """

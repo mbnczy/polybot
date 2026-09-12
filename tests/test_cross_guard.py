@@ -382,7 +382,7 @@ async def test_the_summary_names_where_each_pair_stopped(tmp_path, monkeypatch):
     # on, the running count keeps it.
     await g.poll_once()
     line = g.stop_summary()
-    assert "cooldown 1" in line and "deferred 1" in line
+    assert "cooldown 1" in line and "1 not re-priced" in line
     assert line.endswith("would_enter 1 entered 0 open 0")
 
 
@@ -511,4 +511,7 @@ async def test_a_far_pair_is_not_priced_again_next_poll(tmp_path, monkeypatch):
     assert len(reads) == 2
     await g.poll_once()
     assert len(reads) == 2                      # deferred, not re-priced
-    assert "deferred 1" in g.stop_summary()
+    line = g.stop_summary()
+    assert "1 not re-priced" in line
+    # and it still reports what it was when last priced
+    assert "edge_below_min 1" in line and "best edge -0.7900" in line
