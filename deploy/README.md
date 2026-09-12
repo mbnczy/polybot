@@ -39,6 +39,10 @@ While off it evaluates every implication against the live book and logs
     CROSS_EXECUTION_ENABLED=false   # the switch
     CROSS_MAX_LOCKUP_DAYS=7         # both markets must resolve inside this
     CROSS_MIN_EDGE=0.02             # per pair, at the real asks, fees included
-    CROSS_MAX_POSITION_USDC=5       # per position
-    CROSS_MAX_POSITIONS=2           # breaker cross slots, separate from bundles
-    CROSS_MAX_COMMITTED_USDC=10     # breaker cross capital ceiling
+    CROSS_MAX_POSITION_USDC=5       # per position; NOT lower — the exchange's
+                                    # 5-share minimum costs ~4.25 USDC a pair
+    CROSS_MAX_POSITIONS=1           # breaker cross slots, separate from bundles
+    CROSS_MAX_COMMITTED_USDC=5      # breaker cross capital ceiling
+    CROSS_MIN_TIME_TO_END_S=1800    # closer than this the book is stale quotes
+    CROSS_SUSPICIOUS_EDGE=0.15      # above this, a second poll must confirm it
+    CROSS_SPIKE_CONFIRM_S=300       # how long that confirmation stays valid

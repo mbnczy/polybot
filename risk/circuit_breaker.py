@@ -197,9 +197,9 @@ class CircuitBreaker:
         self._daily  = self._load_daily_state()
         # Cross-market positions: their own slots and capital ceiling, the same
         # P&L. See check_cross.
-        self._cross_max_positions: int = int(os.environ.get("CROSS_MAX_POSITIONS", 2))
+        self._cross_max_positions: int = int(os.environ.get("CROSS_MAX_POSITIONS", 1))
         self._cross_max_committed: float = float(
-            os.environ.get("CROSS_MAX_COMMITTED_USDC", 10.0)
+            os.environ.get("CROSS_MAX_COMMITTED_USDC", 5.0)
         )
         self._cross_open: int = 0
         self._cross_committed: float = 0.0

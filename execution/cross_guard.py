@@ -98,7 +98,18 @@ CROSS_POLL_S: float = float(os.environ.get("CROSS_POLL_S", 30.0))
 # The whole point of the window: capital back within a week, not a quarter.
 CROSS_MAX_LOCKUP_DAYS: float = float(os.environ.get("CROSS_MAX_LOCKUP_DAYS", 7.0))
 CROSS_MIN_EDGE: float = float(os.environ.get("CROSS_MIN_EDGE", 0.02))
+# Not lower than this: the exchange's minimum order is 5 shares, and 5 shares of
+# a pair costing 0.85 is 4.25 USDC. A smaller cap does not mean smaller trades,
+# it means no trades at all. Exposure is held down by the breaker's cross ledger
+# (one position at a time) instead.
 CROSS_MAX_POSITION_USDC: float = float(os.environ.get("CROSS_MAX_POSITION_USDC", 5.0))
+# A position we could not sell back is the half-fill loss, so both legs must
+# have a bid to exit into. Minutes before an event closes the book is a few
+# stale quotes nobody will honour, and an "edge" far above what these markets
+# ever really offer is that, not an arbitrage: it must survive a second poll.
+CROSS_MIN_TIME_TO_END_S: float = float(os.environ.get("CROSS_MIN_TIME_TO_END_S", 1800.0))
+CROSS_SUSPICIOUS_EDGE: float = float(os.environ.get("CROSS_SUSPICIOUS_EDGE", 0.15))
+CROSS_SPIKE_CONFIRM_S: float = float(os.environ.get("CROSS_SPIKE_CONFIRM_S", 300.0))
 # Gamma's orderMinSize on live markets.
 CROSS_MIN_SHARES: float = float(os.environ.get("CROSS_MIN_SHARES", 5.0))
 # After a failed or declined attempt, leave the pair alone this long.
@@ -250,7 +261,9 @@ _STOP_KEYS: tuple[tuple[str, str], ...] = (
     ("date unknown", "end_unknown"),
     ("past its end date", "past_end"),
     ("window", "outside_window"),
+    ("dying book", "too_close_to_end"),
     ("no ask", "no_ask"),
+    ("no bid", "no_bid"),
     ("at the real asks", "edge_below_min"),
     ("depth at the best ask", "thin_touch"),
 )
@@ -277,6 +290,7 @@ def evaluate(
     min_edge: float = CROSS_MIN_EDGE,
     max_usdc: float = CROSS_MAX_POSITION_USDC,
     min_shares: float = CROSS_MIN_SHARES,
+    min_time_to_end_s: float = CROSS_MIN_TIME_TO_END_S,
 ) -> "tuple[Opportunity | None, str]":
     """Every entry gate, from the two books. Returns (opportunity, reason)."""
     # Belt and braces: the reader's prefilter already drops these, but this guard
@@ -292,10 +306,18 @@ def evaluate(
         return None, "already past its end date"
     if lockup > max_lockup_days:
         return None, f"locks capital {lockup:.1f}d > {max_lockup_days:g}d window"
+    if ends - now < min_time_to_end_s:
+        return None, (f"resolves in {(ends - now) / 60.0:.0f} min, under the "
+                      f"{min_time_to_end_s / 60.0:.0f} min floor — dying book")
     quote = quoted_entry(no_book, yes_book, rate_narrow, rate_broad)
     if quote is None:
         return None, "a leg has no ask — nothing to buy"
     no_ask, yes_ask, entry = quote
+    # Both legs must be sellable. If the second leg fails, the first is sold
+    # straight back — into a book with no bid that is impossible, and the
+    # half-fill becomes a position we hold blind to resolution.
+    if best_level(no_book, "bids") is None or best_level(yes_book, "bids") is None:
+        return None, "a leg has no bid — a half-fill could not be sold back"
     if 1.0 - entry < min_edge:
         return None, f"edge {1.0 - entry:+.4f} < {min_edge:.4f} at the real asks"
     shares = size_position(no_ask, yes_ask, entry, max_usdc=max_usdc,
@@ -326,6 +348,8 @@ class CrossGuard:
         min_edge:          "float | None" = None,
         max_position_usdc: "float | None" = None,
         min_shares:        "float | None" = None,
+        min_time_to_end_s: "float | None" = None,
+        suspicious_edge:   "float | None" = None,
         resolution_lookup: "ResolutionLookup | None" = None,
     ) -> None:
         self._client = client
@@ -339,6 +363,11 @@ class CrossGuard:
         self._min_edge = CROSS_MIN_EDGE if min_edge is None else min_edge
         self._max_usdc = CROSS_MAX_POSITION_USDC if max_position_usdc is None else max_position_usdc
         self._min_shares = CROSS_MIN_SHARES if min_shares is None else min_shares
+        self._min_time_to_end = (CROSS_MIN_TIME_TO_END_S if min_time_to_end_s is None
+                                 else min_time_to_end_s)
+        self._suspicious_edge = (CROSS_SUSPICIOUS_EDGE if suspicious_edge is None
+                                 else suspicious_edge)
+        self._spike: dict[tuple[str, str], float] = {}
         self._resolved = resolution_lookup or _gamma_resolution
         self._book = PositionBook(positions_path or CROSS_POSITIONS_PATH).load()
         self._cooldown: dict[tuple[str, str], float] = {}
@@ -497,6 +526,7 @@ class CrossGuard:
             rate_narrow=rate_narrow, rate_broad=rate_broad,
             max_lockup_days=self._max_lockup, min_edge=self._min_edge,
             max_usdc=self._max_usdc, min_shares=self._min_shares,
+            min_time_to_end_s=self._min_time_to_end,
         )
         self.last_reason[key] = reason
         stop, edge = stop_key(reason), None
@@ -508,6 +538,21 @@ class CrossGuard:
         if not self._breaker.check_cross(opp.committed):
             self.last_reason[key] = "blocked by the breaker"
             return "breaker", edge
+        # These markets do not offer 47% arbitrages. One quoted on 2026-09-12,
+        # two hours from resolution, in a pass where 16 of 17 other pairs had no
+        # ask at all — a stale book, not an edge. A real one is still there on
+        # the next poll; a ghost is not.
+        if opp.edge_per_pair >= self._suspicious_edge:
+            seen = self._spike.get(key, 0.0)
+            self._spike[key] = now
+            if now - seen > CROSS_SPIKE_CONFIRM_S:
+                logger.info(
+                    "CrossGuard | %+.4f/pair on %s is above %.2f — waiting for a "
+                    "second poll to confirm it is not a stale book",
+                    opp.edge_per_pair, imp.narrow_title[:40], self._suspicious_edge,
+                )
+                self.last_reason[key] = "edge above the plausible band, unconfirmed"
+                return "unconfirmed_spike", edge
         if not self._enabled:
             self.stats["would_enter"] += 1
             self._cooldown[key] = now + CROSS_ENTRY_COOLDOWN_S

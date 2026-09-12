@@ -110,7 +110,10 @@ def _guard(tmp_path, monkeypatch, books, imps, *, enabled=True, **kw):
 
 
 # Books with a real arbitrage: NO on narrow 0.40 + YES on broad 0.45 = 0.85.
-ARB = {"nn": _book(asks=[(0.40, 50)]), "by": _book(asks=[(0.45, 20)])}
+# Both carry a bid: a leg with no bid could not be sold back after a half-fill,
+# and is refused.
+ARB = {"nn": _book(asks=[(0.40, 50)], bids=[(0.38, 50)]),
+       "by": _book(asks=[(0.45, 20)], bids=[(0.43, 20)])}
 
 
 # ── the pure gates ────────────────────────────────────────────────────────────
@@ -131,7 +134,8 @@ def test_a_pair_past_its_end_date_is_refused():
 
 
 def test_an_edge_that_does_not_survive_the_asks_is_refused():
-    books = {"nn": _book(asks=[(0.83, 50)]), "by": _book(asks=[(0.96, 50)])}
+    books = {"nn": _book(asks=[(0.83, 50)], bids=[(0.80, 50)]),
+             "by": _book(asks=[(0.96, 50)], bids=[(0.94, 50)])}
     opp, why = evaluate(_imp(), books["nn"], books["by"], now=NOW)
     assert opp is None and "edge" in why
 
@@ -148,7 +152,8 @@ def test_size_is_bounded_by_the_thinner_touch_and_the_cap():
 
 
 def test_a_touch_below_the_minimum_size_is_refused():
-    opp, why = evaluate(_imp(), _book(asks=[(0.40, 3)]), ARB["by"], now=NOW)
+    opp, why = evaluate(_imp(), _book(asks=[(0.40, 3)], bids=[(0.38, 3)]),
+                        ARB["by"], now=NOW)
     assert opp is None and "depth" in why
 
 
@@ -338,8 +343,11 @@ _CORNERS = dict(narrow_title="X vs. Y: X O/U 2.5 Corners", broad_title="X vs. Y:
     (_imp(days=-0.1), ARB, "past_end"),
     (_imp(days=8), ARB, "outside_window"),
     (_imp(), {"nn": _book(), "by": ARB["by"]}, "no_ask"),
-    (_imp(), {"nn": _book(asks=[(0.83, 50)]), "by": _book(asks=[(0.96, 50)])}, "edge_below_min"),
-    (_imp(), {"nn": _book(asks=[(0.40, 3)]), "by": ARB["by"]}, "thin_touch"),
+    (_imp(), {"nn": _book(asks=[(0.83, 50)], bids=[(0.80, 50)]),
+              "by": _book(asks=[(0.96, 50)], bids=[(0.94, 50)])}, "edge_below_min"),
+    (_imp(), {"nn": _book(asks=[(0.40, 3)], bids=[(0.38, 3)]), "by": ARB["by"]}, "thin_touch"),
+    (_imp(), {"nn": _book(asks=[(0.40, 50)]), "by": ARB["by"]}, "no_bid"),
+    (_imp(days=0.01), ARB, "too_close_to_end"),
     (_imp(), ARB, "ok"),
 ])
 def test_every_refusal_has_a_stop_key(imp, books, key):
@@ -355,7 +363,8 @@ def _other(n, days=2.0):
 
 @pytest.mark.asyncio
 async def test_the_summary_names_where_each_pair_stopped(tmp_path, monkeypatch):
-    books = {**ARB, "nn2": _book(asks=[(0.83, 50)]), "by2": _book(asks=[(0.96, 50)])}
+    books = {**ARB, "nn2": _book(asks=[(0.83, 50)], bids=[(0.80, 50)]),
+             "by2": _book(asks=[(0.96, 50)], bids=[(0.94, 50)])}
     imps = [_imp(), _other(2), _other(3, days=9)]
     g, client, _, _ = _guard(tmp_path, monkeypatch, books, imps, enabled=False)
     assert g.stop_summary() == "no pass yet"
@@ -398,7 +407,8 @@ async def test_a_missing_book_stops_one_pair_not_the_pass(tmp_path, monkeypatch)
     On 2026-09-12 a closed market's book raised, the exception aborted the scan,
     and the guard went 12 minutes without completing a pass — exits included.
     """
-    books = {**ARB, "nn2": _book(asks=[(0.40, 50)]), "by2": _book(asks=[(0.45, 20)])}
+    books = {**ARB, "nn2": _book(asks=[(0.40, 50)], bids=[(0.38, 50)]),
+             "by2": _book(asks=[(0.45, 20)], bids=[(0.43, 20)])}
     g, client, _, _ = _guard(tmp_path, monkeypatch, books, [_other(2), _imp()],
                              enabled=False)
 
@@ -414,3 +424,48 @@ async def test_a_missing_book_stops_one_pair_not_the_pass(tmp_path, monkeypatch)
     # The pair behind the dead book stops; the good one is still reached.
     assert "would_enter 1" in line
     assert g.stats["would_enter"] == 1
+
+
+# ── the three gates added after the first live WOULD ENTER ────────────────────
+
+def test_a_leg_without_a_bid_is_refused():
+    """A half-fill on this pair could not be sold back at any price."""
+    opp, why = evaluate(_imp(), _book(asks=[(0.40, 50)]), ARB["by"], now=NOW)
+    assert opp is None and "no bid" in why
+
+
+def test_a_market_minutes_from_resolution_is_refused():
+    """Minutes before close the book is stale quotes nobody will honour."""
+    opp, why = evaluate(_imp(days=0.01), ARB["nn"], ARB["by"], now=NOW)   # 14 min
+    assert opp is None and "dying book" in why
+
+
+def test_a_market_still_an_hour_out_is_fine():
+    opp, why = evaluate(_imp(days=0.05), ARB["nn"], ARB["by"], now=NOW)   # 72 min
+    assert why == "ok" and opp is not None
+
+
+FAT = {"nn": _book(asks=[(0.20, 50)], bids=[(0.18, 50)]),
+       "by": _book(asks=[(0.20, 50)], bids=[(0.18, 50)])}       # edge +0.60
+
+
+@pytest.mark.asyncio
+async def test_an_implausible_edge_must_survive_a_second_poll(tmp_path, monkeypatch):
+    """
+    The 2026-09-12 WOULD ENTER quoted +0.4765 two hours from resolution, in a
+    pass where 16 of 17 other pairs had no ask at all.
+    """
+    g, client, _, _ = _guard(tmp_path, monkeypatch, FAT, [_imp()])
+    await g.poll_once()
+    assert client.buys == []
+    assert "unconfirmed_spike 1" in g.stop_summary()
+
+    await g.poll_once()                      # still there on the next poll
+    assert len(client.buys) == 2
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_edge_needs_no_confirmation(tmp_path, monkeypatch):
+    g, client, _, _ = _guard(tmp_path, monkeypatch, ARB, [_imp()])
+    await g.poll_once()
+    assert len(client.buys) == 2
