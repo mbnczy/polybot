@@ -738,6 +738,26 @@ def _save_announced(args, announced: set) -> None:
         print(f"  WARN could not persist {path}: {exc}")
 
 
+def _release_freed_memory() -> bool:
+    """
+    Hand memory Python has already freed back to the operating system.
+
+    Measured 2026-09-14: over ten passes the Python heap stayed at 94 MB while
+    RSS climbed 432 → 518 MB, stepping up at every discovery. The memory was
+    freed but glibc kept it — a market fetch and a prefilter over millions of
+    pairs leave the arenas fragmented. With malloc_trim after each pass RSS held
+    at ~357 MB. Without it the reader reached its 1 GB cap in about 15 hours and
+    was OOM-killed.
+
+    glibc only; anywhere else this is a no-op.
+    """
+    try:
+        import ctypes  # noqa: PLC0415
+        return bool(ctypes.CDLL("libc.so.6").malloc_trim(0))
+    except (OSError, AttributeError):
+        return False
+
+
 def one_pass(args, markets_cache: dict) -> int:
     markets = markets_cache.get("markets")
     if markets is None:
@@ -911,6 +931,7 @@ def main() -> int:
             return 0
         except Exception as exc:                    # noqa: BLE001 — daemon stays up
             logger.error("pass failed: %s", exc)
+        _release_freed_memory()
         time.sleep(args.loop)
 
 

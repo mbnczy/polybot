@@ -460,10 +460,15 @@ def build_candidates(
         if a_q is not None and b_q is not None and a_q != b_q:
             cross_statistic += 1
             continue
-        union = a_tok | b_tok
-        if not union:
+        # Both floors are positive, so a pair with no word in common can never
+        # pass — and that is most of the ~2.9M pairs 2,400 markets make. Building
+        # a union and an intersection set for each of them was millions of
+        # short-lived allocations per discovery, and glibc kept the freed memory:
+        # the reader crept to its 1 GB cap and was OOM-killed on 2026-09-13.
+        if a_tok.isdisjoint(b_tok):
             continue
-        overlap = len(a_tok & b_tok) / len(union)
+        common = len(a_tok & b_tok)
+        overlap = common / (len(a_tok) + len(b_tok) - common)
         same_event = bool(a_ev and b_ev and a_ev == b_ev)
         floor = _SAME_EVENT_MIN_OVERLAP if same_event else min_overlap
         if overlap < floor:
