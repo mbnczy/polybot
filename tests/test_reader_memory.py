@@ -32,3 +32,30 @@ def test_disjoint_pairs_are_skipped_and_overlap_is_unchanged():
     a, b = _tokens(markets[0]["question"]), _tokens(markets[1]["question"])
     (c,) = [c for c in cands if {c.a_id, c.b_id} == {"0x1", "0x2"}]
     assert c.overlap == len(a & b) / len(a | b)
+
+
+def test_book_reads_share_one_client(monkeypatch):
+    """A client per read was an SSL context per read: 80 a pass, 213 MB an hour."""
+    import httpx
+    import scripts.demo_cross_market as demo
+
+    def no_per_call_clients(*a, **k):
+        raise AssertionError("httpx.get builds a new client and SSL context per call")
+
+    monkeypatch.setattr(httpx, "get", no_per_call_clients)
+
+    class _Resp:
+        status_code = 200
+        def json(self):
+            return {"bids": [{"price": "0.40"}], "asks": [{"price": "0.45"}]}
+
+    class _Client:
+        calls = 0
+        def get(self, *a, **k):
+            _Client.calls += 1
+            return _Resp()
+
+    monkeypatch.setattr(demo, "_HTTP", _Client())
+    assert demo.book_top("tok") == (0.40, 0.45)
+    assert demo.book_top("tok") == (0.40, 0.45)
+    assert _Client.calls == 2

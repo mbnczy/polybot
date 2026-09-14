@@ -143,7 +143,7 @@ def yes_price(market: dict) -> float | None:
             toks = json.loads(toks)
         if not toks:
             return None
-        r = httpx.get(_BOOK, params={"token_id": toks[0]}, timeout=20)
+        r = _http().get(_BOOK, params={"token_id": toks[0]})
         if r.status_code != 200:
             return None
         asks = sorted(r.json().get("asks", []), key=lambda x: float(x["price"]))
@@ -442,6 +442,27 @@ def check_prices(rels: list, markets: list[dict], args) -> list:
 # live books, how often and how fast the corrections actually come, before any
 # money depends on the answer.
 
+_HTTP = None
+
+
+def _http():
+    """
+    One HTTP client for every book and resolution read, for the life of the process.
+
+    httpx.get() builds a whole client per call, and a client builds an SSL
+    context, loading the CA bundle into native OpenSSL memory. The reader made
+    over 80 of those a pass — a YES price and a book per leg — and on
+    2026-09-14 grew 213 MB an hour: the contexts sit in reference cycles, so
+    their native memory is only returned when a full collection happens to run,
+    and tracemalloc cannot see it at all. One client means one context.
+    """
+    global _HTTP
+    if _HTTP is None:
+        import httpx  # noqa: PLC0415
+        _HTTP = httpx.Client(timeout=20)
+    return _HTTP
+
+
 def book_top(token_id: str) -> tuple[float | None, float | None]:
     """
     (best bid, best ask) for one token, or Nones.
@@ -452,7 +473,7 @@ def book_top(token_id: str) -> tuple[float | None, float | None]:
     import httpx
 
     try:
-        r = httpx.get(_BOOK, params={"token_id": token_id}, timeout=20)
+        r = _http().get(_BOOK, params={"token_id": token_id})
         if r.status_code != 200:
             return None, None
         body = r.json()
@@ -502,7 +523,7 @@ def _resolved_outcome(condition_id: str) -> bool | None:
     import httpx
 
     try:
-        r = httpx.get(_GAMMA, params={"condition_ids": condition_id}, timeout=20)
+        r = _http().get(_GAMMA, params={"condition_ids": condition_id})
         rows = r.json() if r.status_code == 200 else []
     except Exception:                               # noqa: BLE001
         return None
@@ -742,15 +763,16 @@ def _release_freed_memory() -> bool:
     """
     Hand memory Python has already freed back to the operating system.
 
-    Measured 2026-09-14: over ten passes the Python heap stayed at 94 MB while
-    RSS climbed 432 → 518 MB, stepping up at every discovery. The memory was
-    freed but glibc kept it — a market fetch and a prefilter over millions of
-    pairs leave the arenas fragmented. With malloc_trim after each pass RSS held
-    at ~357 MB. Without it the reader reached its 1 GB cap in about 15 hours and
-    was OOM-killed.
+    Collect first. The measurement that justified trimming alone forced a
+    gc.collect() every pass, and production does not: with trim but no collect
+    the reader still grew 213 MB an hour on 2026-09-14, because garbage in
+    reference cycles — HTTP clients holding native SSL contexts — stays
+    allocated until a full collection, and nothing can be trimmed while it is.
 
-    glibc only; anywhere else this is a no-op.
+    glibc only for the trim; the collection runs everywhere.
     """
+    import gc  # noqa: PLC0415
+    gc.collect()
     try:
         import ctypes  # noqa: PLC0415
         return bool(ctypes.CDLL("libc.so.6").malloc_trim(0))
