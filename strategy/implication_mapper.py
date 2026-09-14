@@ -60,6 +60,7 @@ from typing import Optional
 
 from strategy.cross_market import Implication
 from strategy.quantity_guard import is_over_under, statistics
+from strategy.outcomes import contradicts_yes_side, is_yes_no, market_outcomes
 
 logger = logging.getLogger(__name__)
 
@@ -396,6 +397,10 @@ class Candidate:
     # Days until the LATER market resolves — how long capital would sit. None
     # when either end date is unknown.
     lockup_days: "float | None" = None
+    # Outcome labels in token order. Outside Yes/No markets the title does not
+    # say which outcome is YES, so the prompt has to (strategy/outcomes.py).
+    a_outcomes: "tuple[str, str] | None" = None
+    b_outcomes: "tuple[str, str] | None" = None
 
 
 def build_candidates(
@@ -429,14 +434,14 @@ def build_candidates(
         # it per PAIR would run the vocabulary against ~720,000 pairs.
         quantity = statistics(title) if is_over_under(title) else None
         rows.append((cid, title, _tokens(title), _event_id(m), _exclusion_group(m),
-                     _end_ts(m), quantity))
+                     _end_ts(m), quantity, market_outcomes(m)))
 
     out: list[Candidate] = []
     excluded_siblings = 0
     now = time.time()
     too_slow = 0
     cross_statistic = 0
-    for (a_id, a_t, a_tok, a_ev, a_ng, a_end, a_q), (b_id, b_t, b_tok, b_ev, b_ng, b_end, b_q) \
+    for (a_id, a_t, a_tok, a_ev, a_ng, a_end, a_q, a_o), (b_id, b_t, b_tok, b_ev, b_ng, b_end, b_q, b_o) \
             in itertools.combinations(rows, 2):
         if a_id == b_id or not a_tok or not b_tok:
             continue
@@ -474,7 +479,7 @@ def build_candidates(
             continue
         out.append(Candidate(
             a_id, b_id, a_t, b_t, overlap, same_event,
-            a_ev if same_event else "", pair_shape(a_t, b_t), lockup,
+            a_ev if same_event else "", pair_shape(a_t, b_t), lockup, a_o, b_o,
         ))
 
     if cross_statistic:
@@ -591,6 +596,12 @@ Examples that are NOT implications:
   Two outcomes of the same race — mutually exclusive, not nested
   Two similarly-named but DIFFERENT subjects (a person and their namesake)
 
+Some markets are not phrased as yes/no questions — an over/under line, a spread,
+a pick between two teams. For those, the outcome that counts as YES is stated
+under the market. Judge the implication ONLY for that YES outcome:
+  "Exact score 0-0" does NOT imply "O/U 5.5 (YES = Over)" — a 0-0 is Under.
+  "Over 8.5 corners (YES = Over)" DOES imply "Over 7.5 corners (YES = Over)".
+
 Resolution details matter. Two markets that sound nested but settle on different
 events, dates, or data sources are NOT an implication.
 
@@ -620,10 +631,18 @@ _RESULT_SCHEMA = {
 }
 
 
+def _outcome_note(label: str, outcomes: "tuple[str, str] | None") -> str:
+    """Say which outcome is YES, where the title cannot."""
+    if outcomes is None or is_yes_no(outcomes):
+        return ""
+    return (f'\n  (Market {label} resolves YES only if the outcome is "{outcomes[0]}"; '
+            f'"{outcomes[1]}" resolves NO)')
+
+
 def _user_prompt(c: Candidate) -> str:
     return (
-        f"Market A: {c.a_title}\n"
-        f"Market B: {c.b_title}\n"
+        f"Market A: {c.a_title}{_outcome_note('A', c.a_outcomes)}\n"
+        f"Market B: {c.b_title}{_outcome_note('B', c.b_outcomes)}\n"
         f"Same event: {'yes' if c.same_event else 'unknown'}"
     )
 
@@ -668,6 +687,18 @@ def _to_implication(
     """Turn a model verdict into a registry entry, or None."""
     if relation not in ("A_IMPLIES_B", "B_IMPLIES_A"):
         return None
+    # Defence in depth behind the prompt: a verdict that reasons about a
+    # market's NO outcome and never names its YES one is the Cesena mistake
+    # ("0-0 means Under, so it resolves YES" while YES is Over), whatever the
+    # model was told.
+    for title, outcomes in ((c.a_title, c.a_outcomes), (c.b_title, c.b_outcomes)):
+        wrong = contradicts_yes_side(reasoning, outcomes)
+        if wrong is not None:
+            logger.warning(
+                "implication mapper | rejected verdict reasoning about '%s' — the NO "
+                "outcome of %s: %s", wrong, title[:50], reasoning[:100],
+            )
+            return None
     try:
         conf = min(float(confidence), _MODEL_CONFIDENCE_CEILING)
     except (TypeError, ValueError):

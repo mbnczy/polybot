@@ -301,6 +301,8 @@ def export_implications(rels: list, markets: list[dict], path: str) -> int:
 
     Written atomically: the bot must never read half a file.
     """
+    from strategy.outcomes import market_outcomes  # noqa: PLC0415
+
     by_id = {str(m.get("conditionId")): m for m in markets if m.get("conditionId")}
     now = time.time()
     rows, expired = [], 0
@@ -322,6 +324,9 @@ def export_implications(rels: list, markets: list[dict], path: str) -> int:
             "narrow_yes_token": tn[0], "narrow_no_token": tn[1],
             "broad_yes_token": tb[0], "broad_no_token": tb[1],
             "narrow_end_ts": _market_end_ts(mn), "broad_end_ts": _market_end_ts(mb),
+            # Which outcome each YES token is. The bot refuses a leg whose first
+            # token is not provably "Yes" (strategy/outcomes.py).
+            "narrow_outcomes": market_outcomes(mn), "broad_outcomes": market_outcomes(mb),
             "confidence": float(getattr(r, "confidence", 0.0)),
             "evidence": str(getattr(r, "evidence", ""))[:300],
         })

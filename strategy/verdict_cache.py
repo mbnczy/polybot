@@ -32,6 +32,11 @@ from strategy.cross_market import Implication
 logger = logging.getLogger(__name__)
 
 _TTL_DAYS = 30.0
+# Bumped whenever what a verdict MEANS changes, so old ones are not reused.
+#   2 — the prompt now states which outcome is YES outside Yes/No markets.
+#       Version-1 verdicts were given with that side ambiguous, and every
+#       WOULD ENTER in two days of running came from one read the wrong way.
+_VERSION = 2
 
 
 def _key(a_id: str, b_id: str) -> str:
@@ -57,6 +62,14 @@ class VerdictCache:
             logger.warning("verdict cache unreadable (%s): starting empty", exc)
             return self
         if isinstance(raw, dict):
+            if raw.get("version") != _VERSION:
+                logger.warning(
+                    "verdict cache %s is version %s, not %s — discarding %d verdict(s) "
+                    "given under different rules", self._path, raw.get("version"),
+                    _VERSION, len(raw.get("verdicts", {}) or {}),
+                )
+                self._dirty = True
+                return self
             self._rows = {k: v for k, v in raw.get("verdicts", {}).items()
                           if isinstance(v, dict)}
         return self
@@ -67,7 +80,8 @@ class VerdictCache:
         self.prune()
         tmp = self._path.with_suffix(self._path.suffix + ".tmp")
         try:
-            tmp.write_text(json.dumps({"saved_at": time.time(), "verdicts": self._rows}))
+            tmp.write_text(json.dumps({"version": _VERSION, "saved_at": time.time(),
+                                       "verdicts": self._rows}))
             tmp.replace(self._path)          # atomic
             self._dirty = False
         except OSError as exc:

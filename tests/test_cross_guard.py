@@ -48,6 +48,7 @@ def _imp(days=2.0, **kw):
         broad_yes_token="by", broad_no_token="bn",
         narrow_end_ts=NOW + days * DAY, broad_end_ts=NOW + days * DAY,
         confidence=0.97,
+        narrow_outcomes=("Yes", "No"), broad_outcomes=("Yes", "No"),
     )
     base.update(kw)
     return Implication(**base)
@@ -92,7 +93,8 @@ def _write_imps(tmp_path, imps):
         {k: getattr(i, k) for k in (
             "narrow", "broad", "narrow_title", "broad_title", "narrow_yes_token",
             "narrow_no_token", "broad_yes_token", "broad_no_token",
-            "narrow_end_ts", "broad_end_ts", "confidence")} for i in imps]}))
+            "narrow_end_ts", "broad_end_ts", "confidence",
+            "narrow_outcomes", "broad_outcomes")} for i in imps]}))
     return p
 
 
@@ -515,3 +517,39 @@ async def test_a_far_pair_is_not_priced_again_next_poll(tmp_path, monkeypatch):
     assert "1 not re-priced" in line
     # and it still reports what it was when last priced
     assert "edge_below_min 1" in line and "best edge -0.7900" in line
+
+
+# ── only markets whose YES token is provably "Yes" ────────────────────────────
+
+def test_an_over_under_leg_is_refused():
+    """The Cesena mistake: the first token of an O/U market is Over, whatever the model said."""
+    imp = _imp(broad_outcomes=("Over", "Under"))
+    opp, why = evaluate(imp, ARB["nn"], ARB["by"], now=NOW)
+    assert opp is None and stop_key(why) == "not_yes_no"
+
+
+def test_a_leg_with_unknown_outcomes_is_refused():
+    opp, why = evaluate(_imp(narrow_outcomes=None), ARB["nn"], ARB["by"], now=NOW)
+    assert opp is None and stop_key(why) == "not_yes_no"
+
+
+def test_the_restriction_can_be_lifted():
+    opp, why = evaluate(_imp(broad_outcomes=("Over", "Under")), ARB["nn"], ARB["by"],
+                        now=NOW, yes_no_only=False)
+    assert why == "ok"
+
+
+@pytest.mark.asyncio
+async def test_a_non_yes_no_pair_costs_no_book_read(tmp_path, monkeypatch):
+    g, client, _, _ = _guard(tmp_path, monkeypatch, ARB,
+                             [_imp(broad_outcomes=("Over", "Under"))], enabled=False)
+    reads = []
+    inner = client.get_orderbook
+
+    async def counting(token):
+        reads.append(token)
+        return await inner(token)
+
+    client.get_orderbook = counting
+    await g.poll_once()
+    assert reads == [] and "not_yes_no 1" in g.stop_summary()

@@ -67,6 +67,7 @@ from typing import Awaitable, Callable
 
 from core.clob_client import _FILLED_STATUSES
 from risk.circuit_breaker import CircuitBreakerTripped
+from strategy.outcomes import is_yes_no
 from strategy.quantity_guard import same_quantity
 from strategy.cross_exit import (
     ROUTE_SELL,
@@ -87,6 +88,11 @@ def _flag(name: str, default: str) -> bool:
 
 
 CROSS_EXECUTION_ENABLED: bool = _flag("CROSS_EXECUTION_ENABLED", "false")
+# Only markets whose first token is provably "Yes". Outside them the model had to
+# guess which outcome is YES, and on 2026-09-13 it read an O/U line as Under
+# while the token it would have bought was Over (strategy/outcomes.py). The
+# prompt now states the side; this stays on until that is seen to hold.
+CROSS_YES_NO_ONLY: bool = _flag("CROSS_YES_NO_ONLY", "true")
 CROSS_IMPLICATIONS_PATH: str = os.environ.get(
     "CROSS_IMPLICATIONS_PATH",
     "/home/ubuntu/polybot-dev/cross-exec/cross_implications.json",
@@ -149,6 +155,8 @@ class Implication:
     narrow_end_ts:    "float | None"
     broad_end_ts:     "float | None"
     confidence:       float = 0.0
+    narrow_outcomes:  "tuple[str, ...] | None" = None
+    broad_outcomes:   "tuple[str, ...] | None" = None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -187,6 +195,10 @@ def load_implications(path: "str | Path") -> list[Implication]:
                 broad_end_ts=(float(r["broad_end_ts"])
                               if r.get("broad_end_ts") is not None else None),
                 confidence=float(r.get("confidence", 0.0)),
+                narrow_outcomes=(tuple(str(o) for o in r["narrow_outcomes"])
+                                 if r.get("narrow_outcomes") else None),
+                broad_outcomes=(tuple(str(o) for o in r["broad_outcomes"])
+                                if r.get("broad_outcomes") else None),
             ))
         except (KeyError, TypeError, ValueError):
             continue
@@ -269,6 +281,7 @@ def quoted_entry(
 # Matched against evaluate()'s reasons in order; a test pins every refusal to
 # its key, so a reworded reason cannot silently fall through to "other".
 _STOP_KEYS: tuple[tuple[str, str], ...] = (
+    ("not a Yes/No market", "not_yes_no"),
     ("different statistics", "different_statistic"),
     ("date unknown", "end_unknown"),
     ("past its end date", "past_end"),
@@ -303,8 +316,11 @@ def evaluate(
     max_usdc: float = CROSS_MAX_POSITION_USDC,
     min_shares: float = CROSS_MIN_SHARES,
     min_time_to_end_s: float = CROSS_MIN_TIME_TO_END_S,
+    yes_no_only: bool = CROSS_YES_NO_ONLY,
 ) -> "tuple[Opportunity | None, str]":
     """Every entry gate, from the two books. Returns (opportunity, reason)."""
+    if yes_no_only and not (is_yes_no(imp.narrow_outcomes) and is_yes_no(imp.broad_outcomes)):
+        return None, "a leg is not a Yes/No market — its YES token is not proven"
     # Belt and braces: the reader's prefilter already drops these, but this guard
     # trades whatever the file says, and the first pair ever to clear every
     # other gate here was three corners "implying" three goals.
@@ -362,6 +378,7 @@ class CrossGuard:
         min_shares:        "float | None" = None,
         min_time_to_end_s: "float | None" = None,
         suspicious_edge:   "float | None" = None,
+        yes_no_only:       "bool | None" = None,
         resolution_lookup: "ResolutionLookup | None" = None,
     ) -> None:
         self._client = client
@@ -380,6 +397,7 @@ class CrossGuard:
         self._suspicious_edge = (CROSS_SUSPICIOUS_EDGE if suspicious_edge is None
                                  else suspicious_edge)
         self._spike: dict[tuple[str, str], float] = {}
+        self._yes_no_only = CROSS_YES_NO_ONLY if yes_no_only is None else yes_no_only
         self._next_check: dict[tuple[str, str], float] = {}
         # What each pair was last judged to be, so a deferred pair still reports
         # its price rather than vanishing behind "deferred".
@@ -529,7 +547,8 @@ class CrossGuard:
         needs more.
         """
         if stop in ("held", "stuck", "cooldown", "past_end", "outside_window",
-                    "end_unknown", "different_statistic", "too_close_to_end"):
+                    "end_unknown", "different_statistic", "too_close_to_end",
+                    "not_yes_no"):
             return 0.0                      # judged without a book read anyway
         if edge is None:
             return CROSS_RECHECK_MID_S      # no ask, no bid, or no book at all
@@ -560,6 +579,9 @@ class CrossGuard:
             return "past_end", None
         if (ends - now) / 86_400.0 > self._max_lockup:
             return "outside_window", None
+        if self._yes_no_only and not (is_yes_no(imp.narrow_outcomes)
+                                      and is_yes_no(imp.broad_outcomes)):
+            return "not_yes_no", None
         if self._next_check.get(key, 0.0) > now:
             return "deferred", None
         self.stats["evaluated"] += 1
@@ -581,6 +603,7 @@ class CrossGuard:
             max_lockup_days=self._max_lockup, min_edge=self._min_edge,
             max_usdc=self._max_usdc, min_shares=self._min_shares,
             min_time_to_end_s=self._min_time_to_end,
+            yes_no_only=self._yes_no_only,
         )
         self.last_reason[key] = reason
         stop, edge = stop_key(reason), None

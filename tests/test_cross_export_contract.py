@@ -84,3 +84,21 @@ def test_a_pair_still_running_survives_the_expiry_filter(tmp_path):
     path = tmp_path / "imps.json"
     assert export_implications([Implication("0xn", "0xb", 0.97, "e")],
                                mixed, str(path)) == 1
+
+
+def test_the_outcome_labels_reach_the_bot(tmp_path):
+    """The bot refuses a leg whose first token is not provably "Yes"; it can only
+    tell if the reader hands the labels over."""
+    ou = [dict(m, outcomes=json.dumps(["Over", "Under"])) for m in MARKETS]
+    path = tmp_path / "imps.json"
+    export_implications([Implication("0xn", "0xb", 0.97, "first half ⊆ match")], ou, str(path))
+    (imp,) = load_implications(path)
+    assert imp.narrow_outcomes == ("Over", "Under")
+    assert imp.broad_outcomes == ("Over", "Under")
+
+
+def test_a_market_without_labels_exports_none(tmp_path):
+    path = tmp_path / "imps.json"
+    export_implications([Implication("0xn", "0xb", 0.97, "e")], MARKETS, str(path))
+    (imp,) = load_implications(path)
+    assert imp.narrow_outcomes is None and imp.broad_outcomes is None

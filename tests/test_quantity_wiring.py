@@ -42,5 +42,7 @@ def test_the_guard_refuses_it_even_if_the_file_says_otherwise():
     )
     # The live books that cleared every other gate: entry 0.7585.
     books = {"asks": [{"price": 0.59, "size": 5}]}, {"asks": [{"price": 0.15, "size": 32}]}
-    opp, why = evaluate(imp, books[0], books[1], now=NOW)
+    # With the Yes/No-only restriction lifted, so this pins the quantity guard
+    # itself: it must refuse corners-under-goals whatever that switch says.
+    opp, why = evaluate(imp, books[0], books[1], now=NOW, yes_no_only=False)
     assert opp is None and "statistic" in why
