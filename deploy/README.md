@@ -47,6 +47,7 @@ While off it evaluates every implication against the live book and logs
     CROSS_SUSPICIOUS_EDGE=0.15      # above this, a second poll must confirm it
     CROSS_SPIKE_CONFIRM_S=300       # how long that confirmation stays valid
     CROSS_MAX_BOOK_READS_PER_POLL=60  # two a pair; the rest wait, nearest the threshold first
+    CROSS_YES_NO_ONLY=false         # true: trade only markets whose first token is "Yes"
 
 The reader covers the whole one-week window (`--window-only`): about 70,000
 markets fetched in end-date slices, `Up or Down` series excluded, the top

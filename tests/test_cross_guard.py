@@ -350,6 +350,7 @@ _CORNERS = dict(narrow_title="X vs. Y: X O/U 2.5 Corners", broad_title="X vs. Y:
     (_imp(), {"nn": _book(asks=[(0.40, 3)], bids=[(0.38, 3)]), "by": ARB["by"]}, "thin_touch"),
     (_imp(), {"nn": _book(asks=[(0.40, 50)]), "by": ARB["by"]}, "no_bid"),
     (_imp(days=0.01), ARB, "too_close_to_end"),
+    (_imp(broad_outcomes=None), ARB, "outcomes_unknown"),
     (_imp(), ARB, "ok"),
 ])
 def test_every_refusal_has_a_stop_key(imp, books, key):
@@ -521,16 +522,27 @@ async def test_a_far_pair_is_not_priced_again_next_poll(tmp_path, monkeypatch):
 
 # ── only markets whose YES token is provably "Yes" ────────────────────────────
 
-def test_an_over_under_leg_is_refused():
-    """The Cesena mistake: the first token of an O/U market is Over, whatever the model said."""
+def test_with_the_switch_on_an_over_under_leg_is_refused():
+    """CROSS_YES_NO_ONLY still works when turned back on."""
     imp = _imp(broad_outcomes=("Over", "Under"))
-    opp, why = evaluate(imp, ARB["nn"], ARB["by"], now=NOW)
+    opp, why = evaluate(imp, ARB["nn"], ARB["by"], now=NOW, yes_no_only=True)
     assert opp is None and stop_key(why) == "not_yes_no"
 
 
-def test_a_leg_with_unknown_outcomes_is_refused():
-    opp, why = evaluate(_imp(narrow_outcomes=None), ARB["nn"], ARB["by"], now=NOW)
-    assert opp is None and stop_key(why) == "not_yes_no"
+def test_by_default_a_labelled_over_under_leg_is_priced():
+    """Off since 2026-09-15: with the YES outcome stated to the model, 355 of 355
+    over/under implications scored correct for the first token."""
+    opp, why = evaluate(_imp(narrow_outcomes=("Over", "Under"), broad_outcomes=("Over", "Under")),
+                        ARB["nn"], ARB["by"], now=NOW)
+    assert why == "ok" and opp is not None
+
+
+def test_a_leg_with_unknown_outcomes_is_refused_whatever_the_switch():
+    """Nothing told the model which outcome an unlabelled market's first token is."""
+    for switch in (True, False):
+        opp, why = evaluate(_imp(narrow_outcomes=None), ARB["nn"], ARB["by"], now=NOW,
+                            yes_no_only=switch)
+        assert opp is None and stop_key(why) == "outcomes_unknown"
 
 
 def test_the_restriction_can_be_lifted():
@@ -542,7 +554,8 @@ def test_the_restriction_can_be_lifted():
 @pytest.mark.asyncio
 async def test_a_non_yes_no_pair_costs_no_book_read(tmp_path, monkeypatch):
     g, client, _, _ = _guard(tmp_path, monkeypatch, ARB,
-                             [_imp(broad_outcomes=("Over", "Under"))], enabled=False)
+                             [_imp(broad_outcomes=("Over", "Under"))], enabled=False,
+                             yes_no_only=True)
     reads = []
     inner = client.get_orderbook
 

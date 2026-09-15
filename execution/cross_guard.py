@@ -88,11 +88,15 @@ def _flag(name: str, default: str) -> bool:
 
 
 CROSS_EXECUTION_ENABLED: bool = _flag("CROSS_EXECUTION_ENABLED", "false")
-# Only markets whose first token is provably "Yes". Outside them the model had to
-# guess which outcome is YES, and on 2026-09-13 it read an O/U line as Under
-# while the token it would have bought was Over (strategy/outcomes.py). The
-# prompt now states the side; this stays on until that is seen to hold.
-CROSS_YES_NO_ONLY: bool = _flag("CROSS_YES_NO_ONLY", "true")
+# Restrict trading to markets whose first token is provably "Yes". It went in on
+# 2026-09-13, when the model read an O/U line as Under while the token bought
+# would have been Over (strategy/outcomes.py). Off since 2026-09-15: with each
+# market's YES outcome stated in the prompt, all 355 over/under implications
+# asserted over the next 19 hours scored correct for the first token, and the
+# restriction was blocking 68% of pairs — at whole-window scale, 189 of 189.
+# A leg whose outcome labels are unknown is still refused: nothing stated which
+# outcome its first token is.
+CROSS_YES_NO_ONLY: bool = _flag("CROSS_YES_NO_ONLY", "false")
 CROSS_IMPLICATIONS_PATH: str = os.environ.get(
     "CROSS_IMPLICATIONS_PATH",
     "/home/ubuntu/polybot-dev/cross-exec/cross_implications.json",
@@ -285,6 +289,7 @@ def quoted_entry(
 # Matched against evaluate()'s reasons in order; a test pins every refusal to
 # its key, so a reworded reason cannot silently fall through to "other".
 _STOP_KEYS: tuple[tuple[str, str], ...] = (
+    ("outcome labels are unknown", "outcomes_unknown"),
     ("not a Yes/No market", "not_yes_no"),
     ("different statistics", "different_statistic"),
     ("date unknown", "end_unknown"),
@@ -323,13 +328,15 @@ def evaluate(
     yes_no_only: bool = CROSS_YES_NO_ONLY,
 ) -> "tuple[Opportunity | None, str]":
     """Every entry gate, from the two books. Returns (opportunity, reason)."""
-    if yes_no_only and not (is_yes_no(imp.narrow_outcomes) and is_yes_no(imp.broad_outcomes)):
-        return None, "a leg is not a Yes/No market — its YES token is not proven"
     # Belt and braces: the reader's prefilter already drops these, but this guard
     # trades whatever the file says, and the first pair ever to clear every
     # other gate here was three corners "implying" three goals.
     if same_quantity(imp.narrow_title, imp.broad_title) is False:
         return None, "the two markets count different statistics — not an implication"
+    if imp.narrow_outcomes is None or imp.broad_outcomes is None:
+        return None, "a leg's outcome labels are unknown — its YES token is not proven"
+    if yes_no_only and not (is_yes_no(imp.narrow_outcomes) and is_yes_no(imp.broad_outcomes)):
+        return None, "a leg is not a Yes/No market — its YES token is not proven"
     ends = imp.resolves_ts
     if ends is None:
         return None, "resolution date unknown — cannot show it fits the window"
@@ -596,7 +603,7 @@ class CrossGuard:
         """
         if stop in ("held", "stuck", "cooldown", "past_end", "outside_window",
                     "end_unknown", "different_statistic", "too_close_to_end",
-                    "not_yes_no"):
+                    "not_yes_no", "outcomes_unknown"):
             return 0.0                      # judged without a book read anyway
         if edge is None:
             return CROSS_RECHECK_MID_S      # no ask, no bid, or no book at all
@@ -634,6 +641,8 @@ class CrossGuard:
             return "past_end"
         if (ends - now) / 86_400.0 > self._max_lockup:
             return "outside_window"
+        if imp.narrow_outcomes is None or imp.broad_outcomes is None:
+            return "outcomes_unknown"
         if self._yes_no_only and not (is_yes_no(imp.narrow_outcomes)
                                       and is_yes_no(imp.broad_outcomes)):
             return "not_yes_no"
