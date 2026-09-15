@@ -127,6 +127,10 @@ CROSS_SPIKE_CONFIRM_S: float = float(os.environ.get("CROSS_SPIKE_CONFIRM_S", 300
 CROSS_RECHECK_MID_S: float = float(os.environ.get("CROSS_RECHECK_MID_S", 120.0))
 CROSS_RECHECK_FAR_S: float = float(os.environ.get("CROSS_RECHECK_FAR_S", 600.0))
 CROSS_NEAR_BAND: float = float(os.environ.get("CROSS_NEAR_BAND", 0.03))
+# Book reads per poll, two a pair. With the whole one-week window in the file
+# there are more due pairs than a poll can price without leaning on the
+# exchange's rate limit; the rest wait for the next poll, nearest first.
+CROSS_MAX_BOOK_READS_PER_POLL: int = int(os.environ.get("CROSS_MAX_BOOK_READS_PER_POLL", 60))
 CROSS_MID_BAND: float = float(os.environ.get("CROSS_MID_BAND", 0.10))
 # Gamma's orderMinSize on live markets.
 CROSS_MIN_SHARES: float = float(os.environ.get("CROSS_MIN_SHARES", 5.0))
@@ -379,6 +383,7 @@ class CrossGuard:
         min_time_to_end_s: "float | None" = None,
         suspicious_edge:   "float | None" = None,
         yes_no_only:       "bool | None" = None,
+        max_book_reads:    "int | None" = None,
         resolution_lookup: "ResolutionLookup | None" = None,
     ) -> None:
         self._client = client
@@ -398,6 +403,9 @@ class CrossGuard:
                                  else suspicious_edge)
         self._spike: dict[tuple[str, str], float] = {}
         self._yes_no_only = CROSS_YES_NO_ONLY if yes_no_only is None else yes_no_only
+        self._max_reads = (CROSS_MAX_BOOK_READS_PER_POLL if max_book_reads is None
+                           else max_book_reads)
+        self._imp_cache: "tuple[tuple[int, int] | None, list[Implication]]" = (None, [])
         self._next_check: dict[tuple[str, str], float] = {}
         # What each pair was last judged to be, so a deferred pair still reports
         # its price rather than vanishing behind "deferred".
@@ -515,17 +523,57 @@ class CrossGuard:
             logger.debug("CrossGuard | fee lookup failed for %s: %s", condition_id[:12], exc)
             return None
 
+    def _implications(self) -> list[Implication]:
+        """
+        The reader's export, re-read only when the file changes. Covering the
+        whole one-week window it holds thousands of pairs, and parsing that every
+        15 seconds would be most of the guard's work.
+        """
+        try:
+            st = os.stat(self._imp_path)
+        except OSError:
+            self._imp_cache = (None, [])
+            return []
+        sig = (st.st_mtime_ns, st.st_size)
+        if self._imp_cache[0] != sig:
+            self._imp_cache = (sig, load_implications(self._imp_path))
+        return self._imp_cache[1]
+
+    def _priority(self, imp: Implication) -> tuple:
+        """Where a book read is worth most: near the threshold, then never priced, then longest waiting."""
+        key = imp.key
+        if key not in self._last_stop:
+            return (1, 0.0)
+        edge = self._last_edge.get(key)
+        if edge is not None and self._min_edge - edge <= CROSS_NEAR_BAND:
+            return (0, -edge)
+        return (2, self._next_check.get(key, 0.0))
+
     async def _scan_entries(self, now: float) -> None:
-        imps = load_implications(self._imp_path)
+        imps = self._implications()
+        judged: "list[tuple[Implication, str, float | None]]" = []
+        due: list[Implication] = []
+        for imp in imps:
+            stop = self._cheap_stop(imp, now)
+            if stop is None:
+                due.append(imp)
+            else:
+                judged.append((imp, stop, None))
+        due.sort(key=self._priority)
+        budget = max(1, self._max_reads // 2)
+        for imp in due[:budget]:
+            stop, edge = await self._priced(imp, now)
+            judged.append((imp, stop, edge))
+        judged.extend((imp, "queued", None) for imp in due[budget:])
+
         stops: dict[str, int] = {}
         best: "tuple[float, str] | None" = None
-        deferred = 0
-        for imp in imps:
-            stop, edge = await self._consider(imp, now)
-            if stop == "deferred":
+        waiting = 0
+        for imp, stop, edge in judged:
+            if stop in ("deferred", "queued"):
                 # Report what it was when last priced; a pair 30 points away is
                 # not news every 15 seconds, but it is still the fact about it.
-                deferred += 1
+                waiting += 1
                 stop = self._last_stop.get(imp.key, "not yet priced")
                 edge = self._last_edge.get(imp.key)
             else:
@@ -537,7 +585,7 @@ class CrossGuard:
             stops[stop] = stops.get(stop, 0) + 1
             if edge is not None and (best is None or edge > best[0]):
                 best = (edge, imp.narrow_title)
-        self._last_pass = (now, len(imps), stops, best, deferred)
+        self._last_pass = (now, len(imps), stops, best, waiting)
 
     def _recheck_delay(self, stop: str, edge: "float | None") -> float:
         """
@@ -564,26 +612,38 @@ class CrossGuard:
         One implication through every gate. Returns where it stopped and, once
         both asks are priced on a genuine implication, the edge they quote.
         """
+        stop = self._cheap_stop(imp, now)
+        if stop is not None:
+            return stop, None
+        return await self._priced(imp, now)
+
+    def _cheap_stop(self, imp: Implication, now: float) -> "str | None":
+        """The gates that need no book read; None when the pair is due for pricing."""
         key = imp.key
         if self._book.has_open(*key):
-            return "held", None
+            return "held"
         if key in self._stuck:
-            return "stuck", None
+            return "stuck"
         if self._cooldown.get(key, 0.0) > now:
-            return "cooldown", None
+            return "cooldown"
         ends = imp.resolves_ts
         # Cheap window check before spending two book reads on it.
         if ends is None:
-            return "end_unknown", None
+            return "end_unknown"
         if ends <= now:
-            return "past_end", None
+            return "past_end"
         if (ends - now) / 86_400.0 > self._max_lockup:
-            return "outside_window", None
+            return "outside_window"
         if self._yes_no_only and not (is_yes_no(imp.narrow_outcomes)
                                       and is_yes_no(imp.broad_outcomes)):
-            return "not_yes_no", None
+            return "not_yes_no"
         if self._next_check.get(key, 0.0) > now:
-            return "deferred", None
+            return "deferred"
+        return None
+
+    async def _priced(self, imp: Implication, now: float) -> "tuple[str, float | None]":
+        """The gates that need both books."""
+        key = imp.key
         self.stats["evaluated"] += 1
         # A book can be gone — the market closed, or the token was never
         # tradeable. That is this pair's answer, not the pass's: letting it

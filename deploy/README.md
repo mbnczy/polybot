@@ -46,3 +46,10 @@ While off it evaluates every implication against the live book and logs
     CROSS_MIN_TIME_TO_END_S=1800    # closer than this the book is stale quotes
     CROSS_SUSPICIOUS_EDGE=0.15      # above this, a second poll must confirm it
     CROSS_SPIKE_CONFIRM_S=300       # how long that confirmation stays valid
+    CROSS_MAX_BOOK_READS_PER_POLL=60  # two a pair; the rest wait, nearest the threshold first
+
+The reader covers the whole one-week window (`--window-only`): about 70,000
+markets fetched in end-date slices, `Up or Down` series excluded, the top
+`--pairs` candidates ranked by the prefilter, and `--new-per-pass` of the ones
+never judged before sent to the model each discovery. Verdicts are cached in
+`cross_verdicts.json`, so the model sees a pair once.

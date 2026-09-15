@@ -41,6 +41,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import threading
 import sys
 import time
 from datetime import datetime
@@ -79,6 +81,157 @@ def _page(params: dict, limit: int) -> list[dict]:
             out += page
             offset += len(page)
     return out[:limit]
+
+
+# The fields the reader and the prefilter read. A Gamma market is ~7 KB of JSON;
+# across the whole one-week window (~40,000 markets) that is 280 MB raw and well
+# over the reader's 1 GB cap as Python objects. Slimmed, it is a few hundred bytes.
+_KEEP_FIELDS = ("conditionId", "question", "endDate", "outcomes", "clobTokenIds",
+                "negRiskMarketID", "outcomePrices", "bestBid", "bestAsk", "updatedAt")
+
+
+def _slim(m: dict) -> dict:
+    out = {k: m[k] for k in _KEEP_FIELDS if m.get(k) is not None}
+    ev = m.get("events")
+    if isinstance(ev, list) and ev and isinstance(ev[0], dict) and ev[0].get("id") is not None:
+        out["events"] = [{"id": str(ev[0]["id"])}]
+    return out
+
+
+_SLICE_HOURS = 6.0
+# Halving stops at a minute. Below that the markets share an end time — every
+# sub-market of one match closes together — and no time slice can separate them;
+# what still hits the page ceiling is reported, not silently dropped.
+_MIN_SLICE_S = 60.0
+_FETCH_LOCAL = threading.local()
+
+
+def _thread_client():
+    """One Gamma client per fetch thread, not per request (see _http)."""
+    client = getattr(_FETCH_LOCAL, "client", None)
+    if client is None:
+        import httpx  # noqa: PLC0415
+        client = _FETCH_LOCAL.client = httpx.Client(timeout=30)
+    return client
+
+
+def _gamma_get(params: dict) -> "list[dict] | None":
+    for attempt in range(4):
+        try:
+            r = _thread_client().get(_GAMMA, params=params)
+        except Exception as exc:  # noqa: BLE001 — retried, then given up
+            logger.warning("gamma request failed: %s", exc)
+            time.sleep(1.0 + attempt)
+            continue
+        # A rate limit or a server error is transient. Giving up on it mid-slice
+        # would leave that slice's later pages silently unfetched.
+        if r.status_code == 429 or r.status_code >= 500:
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        if r.status_code != 200:
+            logger.warning("gamma %s: %s", r.status_code, r.text[:120])
+            return None
+        return r.json()
+    return None
+
+
+def _fetch_slice(lo, hi) -> "tuple[list[dict] | None, bool]":
+    """
+    Every market ending in [lo, hi]: (markets, still capped). (None, True) when
+    the slice holds more than one query can page, so the caller splits it.
+    """
+    iso = "%Y-%m-%dT%H:%M:%SZ"
+    params = {"active": "true", "closed": "false", "archived": "false", "limit": 100,
+              "order": "endDate", "ascending": "true",
+              "end_date_min": lo.strftime(iso), "end_date_max": hi.strftime(iso)}
+    if (hi - lo).total_seconds() > _MIN_SLICE_S:
+        probe = _gamma_get({**params, "offset": _GAMMA_MAX_OFFSET - 100})
+        if probe is not None and len(probe) >= 100:
+            return None, True
+    out: list[dict] = []
+    offset = 0
+    while offset < _GAMMA_MAX_OFFSET:
+        page = _gamma_get({**params, "offset": offset})
+        if not page:
+            break
+        out.extend(_slim(m) for m in page)
+        offset += len(page)
+        if len(page) < 100:
+            break
+    return out, offset >= _GAMMA_MAX_OFFSET
+
+
+def fetch_window(days: float, min_hours: float = 1.0, concurrency: int = 4,
+                 exclude: "str | None" = None) -> list[dict]:
+    """
+    Every market resolving within `days` — not just the first page of them.
+
+    The first version asked for the 400 soonest-ending markets. On 2026-09-15
+    those 400 covered 90 minutes: 189 temperature markets and ~180 five-minute
+    crypto "Up or Down" markets. The first football market sat at position
+    1,390, and for hours the reader exported nothing at all.
+
+    The window holds about 40,000 markets and one Gamma query pages at most
+    2,000. So it is cut into slices, a slice too full for one query is halved
+    until it fits, slices are fetched in parallel, and each market is slimmed to
+    the fields that are read. `exclude` drops title series that cannot hold an
+    implication and would only crowd the prefilter.
+    """
+    from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+    from datetime import timedelta, timezone          # noqa: PLC0415
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    start, end = now + timedelta(hours=min_hours), now + timedelta(days=days)
+    pending, t = [], start
+    while t < end:
+        nxt = min(t + timedelta(hours=_SLICE_HOURS), end)
+        pending.append((t, nxt))
+        t = nxt
+    seen: set[str] = set()
+    out: list[dict] = []
+    splits = capped = 0
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        while pending:
+            # One second of overlap between neighbours: a market ending exactly
+            # on a boundary is fetched twice and de-duplicated, never missed.
+            results = list(pool.map(
+                lambda sl: _fetch_slice(sl[0], sl[1] + timedelta(seconds=1)), pending))
+            next_round = []
+            for (lo, hi), (rows, full) in zip(pending, results):
+                if rows is None:
+                    mid = lo + timedelta(seconds=int((hi - lo).total_seconds() // 2))
+                    next_round += [(lo, mid), (mid, hi)]
+                    splits += 1
+                    continue
+                capped += bool(full)
+                for m in rows:
+                    cid = m.get("conditionId")
+                    if cid and cid not in seen:
+                        seen.add(cid)
+                        out.append(m)
+            pending = next_round
+    rx = re.compile(exclude) if exclude else None
+    kept = [m for m in out if not (rx and rx.search(str(m.get("question") or "")))]
+    print(f"    {len(kept)} market(s) resolving within {days:g} days "
+          f"({len(out) - len(kept)} excluded by title, {splits} slice split(s)"
+          f"{f', {capped} slice(s) still at the page ceiling' if capped else ''})")
+    return kept
+
+
+def snapshot_yes_ask(market: dict) -> float | None:
+    """
+    P(YES) as the best YES ask in the fetched snapshot — no book read.
+
+    Reading a book per leg was a request per leg per pass; over the whole window
+    that is thousands every five minutes. The snapshot is up to one discovery
+    old, which is fine for flagging: anything flagged is confirmed against the
+    live book before it reaches anyone (confirm_at_asks).
+    """
+    try:
+        p = float(market.get("bestAsk"))
+    except (TypeError, ValueError):
+        return None
+    return p if 0.0 < p < 1.0 else None
 
 
 def fetch_markets(
@@ -390,7 +543,9 @@ def check_prices(rels: list, markets: list[dict], args) -> list:
 
     by_id = {str(m.get("conditionId")): m for m in markets if m.get("conditionId")}
     needed = {r.narrow for r in rels} | {r.broad for r in rels}
-    print(f"  pricing {len(needed)} leg(s) from live books…")
+    window = getattr(args, "window_only", False)
+    print(f"  pricing {len(needed)} leg(s) from "
+          f"{'the market snapshot' if window else 'live books'}…")
 
     # Resolution dates, so the detector can price how long capital would be
     # locked. A cross-market pair has no complete set to merge, so the money
@@ -415,7 +570,7 @@ def check_prices(rels: list, markets: list[dict], args) -> list:
         m = by_id.get(cid)
         if not m:
             continue
-        p = yes_price(m)
+        p = snapshot_yes_ask(m) if window else yes_price(m)
         if p is None:
             continue
         # One REST snapshot prices every leg, so they share an observation time
@@ -784,8 +939,12 @@ def one_pass(args, markets_cache: dict) -> int:
     markets = markets_cache.get("markets")
     if markets is None:
         print(f"  fetching up to {args.markets} live markets…")
-        markets = fetch_markets(args.markets, args.fast_days, args.fast_markets,
-                                args.fast_min_hours)
+        if args.window_only:
+            markets = fetch_window(args.fast_days, args.fast_min_hours,
+                                   args.fetch_concurrency, args.exclude_title)
+        else:
+            markets = fetch_markets(args.markets, args.fast_days, args.fast_markets,
+                                    args.fast_min_hours)
         markets_cache["markets"] = markets
         print(f"    got {len(markets)}")
 
@@ -891,6 +1050,12 @@ def main() -> int:
     ap.add_argument("--fast-min-hours", type=float, default=1.0, metavar="HOURS",
                     help="skip markets ending sooner than this — usually in play "
                          "(default 1)")
+    ap.add_argument("--window-only", action="store_true",
+                    help="fetch every market resolving within --fast-days, in slices, "
+                         "instead of the general pool plus the first --fast-markets")
+    ap.add_argument("--exclude-title", default=None, metavar="REGEX",
+                    help="drop markets whose title matches, e.g. 'Up or Down'")
+    ap.add_argument("--fetch-concurrency", type=int, default=4, metavar="N")
     ap.add_argument("--fast-markets", type=int, default=400,
                     help="how many soonest-resolving markets to add (default 400)")
     ap.add_argument("--max-per-event", type=int, default=8,
@@ -917,6 +1082,9 @@ def main() -> int:
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="  %(levelname)s %(message)s")
+    # httpx logs every request at INFO. Fetching the whole window is ~500 of them
+    # per discovery — 70,000 journal lines a day saying "200 OK".
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     for noisy in ("httpx", "openai", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 

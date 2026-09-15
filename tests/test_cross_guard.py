@@ -553,3 +553,74 @@ async def test_a_non_yes_no_pair_costs_no_book_read(tmp_path, monkeypatch):
     client.get_orderbook = counting
     await g.poll_once()
     assert reads == [] and "not_yes_no 1" in g.stop_summary()
+
+
+# ── the whole window: more pairs than a poll can price ────────────────────────
+
+def _many(n, books):
+    imps = [_other(k) for k in range(100, 100 + n)]
+    for k in range(100, 100 + n):
+        books[f"nn{k}"] = _book(asks=[(0.83, 50)], bids=[(0.80, 50)])
+        books[f"by{k}"] = _book(asks=[(0.96, 50)], bids=[(0.94, 50)])
+    return imps
+
+
+@pytest.mark.asyncio
+async def test_a_poll_prices_no_more_than_its_budget(tmp_path, monkeypatch):
+    books: dict = {}
+    imps = _many(5, books)
+    g, client, _, _ = _guard(tmp_path, monkeypatch, books, imps, enabled=False,
+                             max_book_reads=4)
+    reads = []
+    inner = client.get_orderbook
+
+    async def counting(token):
+        reads.append(token)
+        return await inner(token)
+
+    client.get_orderbook = counting
+    await g.poll_once()
+    assert len(reads) == 4                       # two pairs, two books each
+    assert "3 not re-priced this pass" in g.stop_summary()
+    await g.poll_once()
+    assert len(reads) == 8                       # the next two, not the same two again
+
+
+@pytest.mark.asyncio
+async def test_a_pair_near_the_threshold_is_priced_first(tmp_path, monkeypatch):
+    books: dict = {}
+    imps = _many(3, books)
+    near = _imp()                                # ARB books: edge +0.15, near by any measure
+    books.update(ARB)
+    g, client, _, _ = _guard(tmp_path, monkeypatch, books, imps + [near], enabled=False,
+                             max_book_reads=2)
+    g._last_stop[near.key] = "edge_below_min"
+    g._last_edge[near.key] = 0.01
+    reads = []
+    inner = client.get_orderbook
+
+    async def counting(token):
+        reads.append(token)
+        return await inner(token)
+
+    client.get_orderbook = counting
+    await g.poll_once()
+    assert reads == ["nn", "by"]
+
+
+@pytest.mark.asyncio
+async def test_the_file_is_parsed_only_when_it_changes(tmp_path, monkeypatch):
+    import execution.cross_guard as cg
+    g, _, _, _ = _guard(tmp_path, monkeypatch, ARB, [_imp()], enabled=False)
+    calls = []
+    real = cg.load_implications
+    monkeypatch.setattr(cg, "load_implications", lambda p: calls.append(p) or real(p))
+    await g.poll_once()
+    await g.poll_once()
+    assert len(calls) == 1
+    _write_imps(tmp_path, [_imp(), _other(7)])   # the reader writes a new file
+    import os
+    st = os.stat(tmp_path / "imps.json")
+    os.utime(tmp_path / "imps.json", ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+    await g.poll_once()
+    assert len(calls) == 2
