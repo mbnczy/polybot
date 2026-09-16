@@ -251,6 +251,56 @@ def fetch_rules(cids, concurrency: int = 4) -> "dict[str, str]":
     return {c: _RULES.get(c, "") for c in cids}
 
 
+def fetch_resolved(cids) -> list[dict]:
+    """Markets by condition id, closed ones included, for the resolution audit."""
+    from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
+    ids = list(dict.fromkeys(c for c in cids if c))
+    batches = [ids[i:i + 50] for i in range(0, len(ids), 50)]
+
+    def one(batch):
+        params = [("condition_ids", c) for c in batch] + [("limit", "100")]
+        return (_gamma_get(params + [("closed", "true")]) or []) + (_gamma_get(params) or [])
+
+    out: list[dict] = []
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for rows in pool.map(one, batches):
+            out += rows
+    return out
+
+
+def run_resolution_audit(args, cache: dict) -> "object":
+    """Check resolved pairs; forbid the violated ones and alert on newly blocked templates."""
+    from strategy.resolution_audit import ResolutionAudit  # noqa: PLC0415
+    from strategy.verdict_cache import VerdictCache        # noqa: PLC0415
+
+    audit = cache.get("audit")
+    if audit is None:
+        audit = cache["audit"] = ResolutionAudit(args.audit_file).load()
+    summary = audit.run(fetch_resolved)
+    if summary["violated"]:
+        verdicts = VerdictCache(args.cache_file).load()
+        for p in summary["violated"]:
+            verdicts.forbid(p["narrow"], p["broad"], "violated by its resolution")
+        verdicts.save()
+        bad = {(p["narrow"], p["broad"]) for p in summary["violated"]}
+        if cache.get("rels"):
+            cache["rels"] = [r for r in cache["rels"] if (r.narrow, r.broad) not in bad]
+    audit.save()
+    print(f"  audit      : {summary['checked']} resolved pair(s) checked · {summary['held']} held · "
+          f"{len(summary['violated'])} violated · {summary['pending']} awaiting resolution · "
+          f"blocked templates: {', '.join(audit.blocked_templates()) or 'none'}")
+    if summary["newly_blocked"]:
+        lines = []
+        for t in summary["newly_blocked"]:
+            st = audit.templates[t]
+            lines.append(f"<b>🚫 IMPLICATION TEMPLATE BLOCKED</b>\n{t}\n"
+                         f"{st['violated']} of {st['held'] + st['violated']} resolved pairs paid "
+                         f"less than 1\n" + "\n".join(f"  • {e}" for e in st["examples"]))
+        deliver(lines, args.dry_run)
+    return audit
+
+
 def snapshot_yes_ask(market: dict) -> float | None:
     """
     P(YES) as the best YES ask in the fetched snapshot — no book read.
@@ -484,7 +534,7 @@ def discover(markets: list[dict], args) -> list:
     return strong
 
 
-def export_implications(rels: list, markets: list[dict], path: str) -> int:
+def export_implications(rels: list, markets: list[dict], path: str, audit=None) -> int:
     """
     Hand the verified implications to the trading bot.
 
@@ -500,7 +550,7 @@ def export_implications(rels: list, markets: list[dict], path: str) -> int:
 
     by_id = {str(m.get("conditionId")): m for m in markets if m.get("conditionId")}
     now = time.time()
-    rows, expired = [], 0
+    rows, expired, blocked = [], 0, 0
     for r in rels:
         mn, mb = by_id.get(r.narrow), by_id.get(r.broad)
         tn, tb = _tokens_of(mn), _tokens_of(mb)
@@ -511,6 +561,12 @@ def export_implications(rels: list, markets: list[dict], path: str) -> int:
         ends = [e for e in (_market_end_ts(mn), _market_end_ts(mb)) if e is not None]
         if ends and max(ends) <= now:
             expired += 1
+            continue
+        # A pair proven wrong by its own resolution, or of a template that keeps
+        # being wrong, never reaches the bot (strategy/resolution_audit.py).
+        if audit is not None and (audit.violated(r.narrow, r.broad) or audit.is_blocked(
+                str(mn.get("question") or ""), str(mb.get("question") or ""))):
+            blocked += 1
             continue
         rows.append({
             "narrow": r.narrow, "broad": r.broad,
@@ -534,8 +590,12 @@ def export_implications(rels: list, markets: list[dict], path: str) -> int:
     except OSError as exc:
         logger.error("cannot write implications to %s: %s", p, exc)
         return 0
+    if audit is not None:
+        audit.record(rows)
+        audit.save()
     print(f"  exported {len(rows)} implication(s) for the bot → {p.name}"
-          + (f" ({expired} expired dropped)" if expired else ""))
+          + (f" ({expired} expired dropped)" if expired else "")
+          + (f" ({blocked} refused by the resolution audit)" if blocked else ""))
     return len(rows)
 
 
@@ -775,22 +835,24 @@ def fmt_position_closed(pos) -> str:
     return "\n".join(lines)
 
 
-def confirm_at_asks(sigs: list, markets: list[dict]) -> tuple[list, list]:
+def confirm_at_asks(sigs: list, markets: list[dict],
+                    min_edge: float = 0.0) -> tuple[list, list]:
     """
-    Split violations into (still an arbitrage at the real asks, not).
+    Split violations into (an arbitrage at the real asks, not).
 
-    The detector prices NO on narrow as 1 − the YES ask. On a thin book that is
-    badly wrong, and it reached the operator: the first live pass after this
-    branch went up alerted "+200 bps" on "Moik Baku O/U 0.5" under "O/U 0.5" —
-    narrow YES at 0.98, so "NO @ 0.02" — when the only NO ask on the book was
-    0.83 and the real entry 1.79. The paper tracker refused it in the same pass,
-    but the Telegram alert had already gone. A violation the system can see is
-    not real should not reach anyone as an opportunity.
+    Only an edge the live book confirms is alerted, and the alert carries the
+    confirmed prices and edge, not the snapshot's.
 
-    A leg with no ask at all is not an opportunity either: there is nobody to buy
-    it from. A violation whose markets cannot be found keeps the old behaviour
-    and is alerted — suppressing on missing data would hide more than it saves.
+    The first version only asked whether the entry was under 1.00. On
+    2026-09-15 "1st Half Spread: CA Osasuna (-2.5)" under "Spread" went out
+    twelve times as "+5020 bps" while the real entry was 0.9999 — an edge of
+    one hundredth of a cent, reported from the snapshot. Before that, "+200 bps"
+    on "Moik Baku O/U 0.5" went out with a real entry of 1.79.
+
+    A violation whose markets cannot be found, or with a leg nobody sells, cannot
+    be confirmed and is not alerted.
     """
+    import dataclasses                              # noqa: PLC0415
     from strategy.cross_exit import buy_cost        # noqa: PLC0415
 
     by_id = {str(m.get("conditionId")): m for m in markets if m.get("conditionId")}
@@ -798,7 +860,10 @@ def confirm_at_asks(sigs: list, markets: list[dict]) -> tuple[list, list]:
     for s in sigs:
         tn, tb = _tokens_of(by_id.get(s.narrow)), _tokens_of(by_id.get(s.broad))
         if not tn or not tb:
-            real.append(s)
+            illusory.append(s)
+            logger.info("cross-market | %s/%s signalled %+.4f but its markets are not in "
+                        "the snapshot — cannot confirm, not alerted",
+                        s.narrow[:10], s.broad[:10], s.edge)
             continue
         _, narrow_no_ask = book_top(tn[1])
         _, broad_yes_ask = book_top(tb[0])
@@ -809,13 +874,17 @@ def confirm_at_asks(sigs: list, markets: list[dict]) -> tuple[list, list]:
                         s.edge)
             continue
         entry = buy_cost(narrow_no_ask) + buy_cost(broad_yes_ask)
-        if entry >= 1.0:
+        edge = 1.0 - entry
+        if edge < min_edge:
             illusory.append(s)
-            logger.info("cross-market | %s/%s signalled %+.4f but costs %.4f at the "
-                        "real asks — not alerted", s.narrow[:10], s.broad[:10],
-                        s.edge, entry)
-        else:
-            real.append(s)
+            logger.info("cross-market | %s/%s signalled %+.4f but %+.4f at the real asks "
+                        "(entry %.4f) — not alerted", s.narrow[:10], s.broad[:10],
+                        s.edge, edge, entry)
+            continue
+        apr = (edge / entry) * 365.0 / s.lockup_days if s.lockup_days > 0 and entry > 0 else 0.0
+        real.append(dataclasses.replace(
+            s, narrow_price=1.0 - narrow_no_ask, broad_price=broad_yes_ask,
+            violation=(1.0 - narrow_no_ask) - broad_yes_ask, cost=entry, edge=edge, apr=apr))
     return real, illusory
 
 
@@ -856,7 +925,9 @@ def track_positions(sigs: list, markets: list[dict], args, cache: dict) -> list[
         if narrow_no_ask is None or broad_yes_ask is None:
             continue
         no_paid, yes_paid = buy_cost(narrow_no_ask), buy_cost(broad_yes_ask)
-        if no_paid + yes_paid >= 1.0:
+        # The same bar as an alert: a paper position is a claim that the edge was
+        # real. The Osasuna spread opened one at an entry of 0.9999.
+        if 1.0 - (no_paid + yes_paid) < args.min_edge:
             cache["illusory"] = cache.get("illusory", 0) + 1
             logger.info(
                 "cross positions | %s/%s signalled %+.4f but costs %.4f at the "
@@ -998,6 +1069,12 @@ def one_pass(args, markets_cache: dict) -> int:
     # Implications are stable; discover once and reuse across price polls.
     rels = markets_cache.get("rels")
     fresh_discovery = rels is None
+    audit = markets_cache.get("audit")
+    if fresh_discovery and args.audit_file:
+        try:
+            audit = run_resolution_audit(args, markets_cache)
+        except Exception as exc:                    # noqa: BLE001 — never stops a pass
+            logger.error("resolution audit failed: %s", exc)
     if fresh_discovery:
         rels = _drop_backwards(discover(markets, args), markets)
         markets_cache["rels"] = rels
@@ -1024,10 +1101,13 @@ def one_pass(args, markets_cache: dict) -> int:
     # and inside a one-week window the match sub-markets in it expire hourly: on
     # 2026-09-12 whole passes read "past_end 25" because the file was 90 minutes
     # old. Expired pairs are dropped as it is written.
-    export_implications(rels, markets, args.implications_file)
+    if audit is not None:
+        rels = [r for r in rels if not audit.violated(r.narrow, r.broad)
+                and not audit.is_blocked(titles.get(r.narrow, ""), titles.get(r.broad, ""))]
+    export_implications(rels, markets, args.implications_file, audit)
 
     sigs = check_prices(rels, markets, args)
-    sigs, illusory = confirm_at_asks(sigs, markets)
+    sigs, illusory = confirm_at_asks(sigs, markets, args.min_edge)
     if illusory:
         markets_cache["illusory"] = markets_cache.get("illusory", 0) + len(illusory)
         print(f"  {len(illusory)} violation(s) NOT alerted — not an arbitrage at the "
@@ -1063,6 +1143,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--markets",     type=int,   default=800)
+    ap.add_argument("--audit-file",  default="cross_audit.json", metavar="PATH",
+                    help="resolution audit ledger; empty to disable")
     ap.add_argument("--cache-file",  default="cross_verdicts.json", metavar="PATH",
                     help="where model verdicts are remembered between passes")
     ap.add_argument("--new-per-pass", type=int,  default=60, metavar="N",

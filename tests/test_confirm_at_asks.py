@@ -67,8 +67,27 @@ def test_a_leg_with_no_ask_is_not_an_opportunity(monkeypatch):
     assert real == [] and len(illusory) == 1
 
 
-def test_unknown_markets_keep_the_old_behaviour(monkeypatch):
-    """Suppressing on missing data would hide more than it saves."""
+def test_a_signal_that_cannot_be_confirmed_is_not_alerted(monkeypatch):
+    """Only an edge the live book confirms reaches anyone. This used to alert on
+    missing data; unconfirmed alerts are what filled the channel with false ones."""
     _books(monkeypatch, {})
     real, illusory = reader.confirm_at_asks([_sig()], [])
-    assert len(real) == 1
+    assert real == [] and len(illusory) == 1
+
+
+def test_an_edge_below_the_minimum_is_not_alerted(monkeypatch):
+    """The Osasuna spread went out as +5020 bps with a real entry of 0.9999."""
+    import strategy.cross_exit as cross_exit
+    monkeypatch.setattr(cross_exit, "CROSS_TAKER_RATE", 0.0)
+    _books(monkeypatch, {"nn": 0.9905, "by": 0.0094})
+    real, illusory = reader.confirm_at_asks([_sig(edge=0.502)], MARKETS, min_edge=0.02)
+    assert real == [] and len(illusory) == 1
+
+
+def test_the_alert_carries_the_confirmed_edge_not_the_snapshot(monkeypatch):
+    import strategy.cross_exit as cross_exit
+    monkeypatch.setattr(cross_exit, "CROSS_TAKER_RATE", 0.0)
+    _books(monkeypatch, {"nn": 0.30, "by": 0.40})
+    (s,), _ = reader.confirm_at_asks([_sig(edge=0.9)], MARKETS, min_edge=0.02)
+    assert abs(s.edge - 0.30) < 1e-9 and abs(s.cost - 0.70) < 1e-9
+    assert abs(s.broad_price - 0.40) < 1e-9 and abs((1 - s.narrow_price) - 0.30) < 1e-9

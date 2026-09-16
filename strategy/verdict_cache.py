@@ -129,6 +129,11 @@ class VerdictCache:
                                          str(row.get("evidence") or "")))
         return known, unknown
 
+    def forbid(self, a_id: str, b_id: str, reason: str) -> None:
+        """A refusal that no later classification overrides — the pair was proven wrong."""
+        self._rows[_key(a_id, b_id)] = {"narrow": None, "refused": reason[:200], "ts": time.time()}
+        self._dirty = True
+
     def remember(self, candidates: list, rels: list) -> None:
         """Record one classification round: every candidate, verdict or not."""
         found = {_key(r.narrow, r.broad): r for r in rels}
