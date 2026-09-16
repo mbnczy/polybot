@@ -90,12 +90,14 @@ def test_an_unresolved_pair_waits_then_is_given_up(tmp_path):
     assert audit.run(lambda ids: [], now=NOW + 20 * 86_400)["pending"] == 0
 
 
-def test_a_pair_is_not_checked_before_its_grace_period(tmp_path):
+def test_a_pair_just_past_its_end_is_asked_about_but_not_judged_early(tmp_path):
+    """Early checks look for a settled market; an unsettled one keeps waiting, never given up."""
     audit = ResolutionAudit(tmp_path / "a.json")
     audit.record([_row("0xn", "0xb", TENNIS_N, TENNIS_B, end=NOW - 600)], now=NOW - 3600)
     calls = []
-    audit.run(lambda ids: calls.append(ids) or [], now=NOW)
-    assert calls == []
+    summary = audit.run(lambda ids: calls.append(ids) or [], now=NOW)
+    assert calls == [["0xb", "0xn"]]
+    assert summary["checked"] == 0 and summary["pending"] == 1
 
 
 def test_it_survives_a_restart(tmp_path):
@@ -138,3 +140,22 @@ def test_the_export_leaves_out_blocked_templates(tmp_path):
     n = reader.export_implications(rels, markets, str(tmp_path / "imps.json"), audit)
     assert n == 1
     assert set(audit.pending) == {"0xo|0xp"}          # what was exported is recorded
+
+
+def test_a_market_that_settles_before_its_end_date_is_audited(tmp_path):
+    """Pazardzhik's walkover resolved on the 15th; the market's end date was the 22nd."""
+    audit = ResolutionAudit(tmp_path / "a.json")
+    rows = [_row(f"0xn{i}", f"0xb{i}", TENNIS_N, TENNIS_B, end=NOW + 6 * 86_400) for i in range(2)]
+    audit.record(rows, now=NOW - 3600)
+    markets = []
+    for i in range(2):
+        markets += [_closed(f"0xn{i}", ["0.5", "0.5"]), _closed(f"0xb{i}", ["0", "1"])]
+    summary = audit.run(lambda ids: markets, now=NOW)
+    assert len(summary["violated"]) == 2 and audit.is_blocked(TENNIS_N, TENNIS_B)
+
+
+def test_an_open_market_before_its_end_date_just_waits(tmp_path):
+    audit = ResolutionAudit(tmp_path / "a.json")
+    audit.record([_row("0xn", "0xb", TENNIS_N, TENNIS_B, end=NOW + 6 * 86_400)], now=NOW - 3600)
+    summary = audit.run(lambda ids: [], now=NOW)
+    assert summary["checked"] == 0 and summary["pending"] == 1

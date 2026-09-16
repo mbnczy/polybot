@@ -259,8 +259,10 @@ def fetch_resolved(cids) -> list[dict]:
     batches = [ids[i:i + 50] for i in range(0, len(ids), 50)]
 
     def one(batch):
-        params = [("condition_ids", c) for c in batch] + [("limit", "100")]
-        return (_gamma_get(params + [("closed", "true")]) or []) + (_gamma_get(params) or [])
+        # Only a closed market can be judged, and Gamma returns closed markets
+        # only when asked for them.
+        return _gamma_get([("condition_ids", c) for c in batch]
+                          + [("closed", "true"), ("limit", "100")]) or []
 
     out: list[dict] = []
     with ThreadPoolExecutor(max_workers=4) as pool:

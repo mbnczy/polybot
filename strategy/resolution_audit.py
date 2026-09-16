@@ -42,6 +42,11 @@ BLOCK_MIN_VIOLATIONS = 2
 BLOCK_MIN_RATE = 0.25
 GRACE_S = 2 * 3600.0            # resolution lands some time after the end date
 GIVE_UP_DAYS = 14.0             # unresolved this long after its end: stop asking
+# Pairs not yet at their end date are checked too, a rotating batch per run. The
+# walkover pairs settled days before their official end — Pazardzhik's market
+# said September 22 and had resolved on the 15th. Waiting for the date would
+# have let the same mistake trade for a week.
+EARLY_BATCH = 1000
 KEEP_RESULTS_DAYS = 30.0
 
 _KINDS: tuple[tuple[str, str], ...] = (
@@ -216,6 +221,11 @@ class ResolutionAudit:
         """
         now = time.time() if now is None else now
         due = self.due(now)
+        early = sorted((p for p in self.pending.values() if p["end_ts"] + GRACE_S > now),
+                       key=lambda p: p.get("last_checked", 0.0))[:EARLY_BATCH]
+        for p in early:
+            p["last_checked"] = now
+        due = due + early
         before = set(self.blocked_templates())
         summary = {"checked": 0, "held": 0, "violated": [], "pending": len(self.pending),
                    "newly_blocked": []}
