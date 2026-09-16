@@ -65,7 +65,7 @@ def test_it_survives_a_restart(tmp_path):
 
 def test_stale_entries_are_pruned(tmp_path):
     path = tmp_path / "v.json"
-    path.write_text(json.dumps({"version": 2, "verdicts": {
+    path.write_text(json.dumps({"version": 3, "verdicts": {
         "0xa|0xb": {"narrow": None, "ts": time.time() - 40 * 86_400},
         "0xc|0xd": {"narrow": None, "ts": time.time()},
     }}))

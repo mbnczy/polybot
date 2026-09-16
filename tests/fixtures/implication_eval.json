@@ -1,0 +1,1216 @@
+{
+ "items": [
+  {
+   "cls": "O/U nest or ladder (TRUE)",
+   "a": "0x9964da735d1eb9ade546f6e108b34f5ea7e4b575a9c24f7224e77294c15ae5ff",
+   "b": "0xd0568acd54e4a38da9d430ce51182cb700d32fa009c61ecc8addfdf6c30283b5",
+   "a_title": "FC Lahti vs. FF Jaro: FF Jaro O/U 0.5",
+   "b_title": "FC Lahti vs. FF Jaro: O/U 0.5",
+   "expected": "A_IMPLIES_B",
+   "why": "Over the stronger line implies Over the weaker"
+  },
+  {
+   "cls": "O/U nest or ladder (TRUE)",
+   "a": "0x0bcf3ad3dff44e1ea3d51dd3646819f5e56ffdad06165f3351e54b9e43a9d4bb",
+   "b": "0x439985afe9618727f91bf15e3bcfc404fc7431c7a7b97ae8944f9f29f6f77b4e",
+   "a_title": "FC Arda Kardzhali vs. PFC Cherno More Varna: FC Arda Kardzhali 1st Half O/U 0.5",
+   "b_title": "FC Arda Kardzhali vs. PFC Cherno More Varna: O/U 0.5",
+   "expected": "A_IMPLIES_B",
+   "why": "Over the stronger line implies Over the weaker"
+  },
+  {
+   "cls": "O/U nest or ladder (TRUE)",
+   "a": "0x90db3a991e19df2215184df110e38db8135e23301ecb251246f6b76af80978ba",
+   "b": "0x1328c41ffac314f55c57fe03869c44dfd3869ceebe7a4d098de0d799792acb4d",
+   "a_title": "FC Internazionale Milano vs. BK H\u00e4cken FF: FC Internazionale Milano 1st Half O/U 0.5",
+   "b_title": "FC Internazionale Milano vs. BK H\u00e4cken FF: O/U 0.5",
+   "expected": "A_IMPLIES_B",
+   "why": "Over the stronger line implies Over the weaker"
+  },
+  {
+   "cls": "O/U nest or ladder (TRUE)",
+   "a": "0x7843a7c32737a83cbde0a8d930376205fbbf6d61c21e0196fba640dd5d8680d1",
+   "b": "0x00d3f5903580f7d0a0d5223c17e3009ba0dfe659a7b511b5f58e2f09da07802b",
+   "a_title": "LD Alajuelense vs. Inter San Carlos: Inter San Carlos O/U 0.5",
+   "b_title": "LD Alajuelense vs. Inter San Carlos: O/U 0.5",
+   "expected": "A_IMPLIES_B",
+   "why": "Over the stronger line implies Over the weaker"
+  },
+  {
+   "cls": "O/U nest or ladder (TRUE)",
+   "a": "0x4f18cb9574e545d568679683a9906fee1c2aa71951e96039491e3eeb9c74a291",
+   "b": "0xc1bd0a1a18ce302d2886cf4e8a6fccce630be3b9b8084cc53e911261e43ef1d4",
+   "a_title": "Halmstads BK vs. AIK: Halmstads BK 1st Half O/U 0.5",
+   "b_title": "Halmstads BK vs. AIK: O/U 0.5",
+   "expected": "A_IMPLIES_B",
+   "why": "Over the stronger line implies Over the weaker"
+  },
+  {
+   "cls": "O/U nest or ladder (TRUE)",
+   "a": "0x91b878e0a865df27a35b7c24fca92c498d8587a1e702972e4a2df7acf7fa73fe",
+   "b": "0x50e76a61adb6552518b6ea5995d6fd5bdcbc3747dae663ed75dad45264a5b8be",
+   "a_title": "Manchester United FC vs. Brighton & Hove Albion FC: Brighton & Hove Albion FC O/U 0.5",
+   "b_title": "Manchester United FC vs. Brighton & Hove Albion FC: O/U 0.5",
+   "expected": "A_IMPLIES_B",
+   "why": "Over the stronger line implies Over the weaker"
+  },
+  {
+   "cls": "O/U nest or ladder (TRUE)",
+   "a": "0x1baa3adbc628cbcd26e454763bd281f4d99743bea3c2e789aa87f7e82d4c7595",
+   "b": "0x9de3a13e5978ff44b424e865215aedc03223fee9ef8f4a206f2ec75de061b533",
+   "a_title": "Cardiff City FC vs. Charlton Athletic FC: Cardiff City FC O/U 0.5",
+   "b_title": "Cardiff City FC vs. Charlton Athletic FC: O/U 0.5",
+   "expected": "A_IMPLIES_B",
+   "why": "Over the stronger line implies Over the weaker"
+  },
+  {
+   "cls": "O/U nest or ladder (TRUE)",
+   "a": "0x07869c03fef6dc5685c1acc20256007c70a29d7ac1dd53587224ded021e0248d",
+   "b": "0xb2f9c8f1fefa4465204ac9797ae5a8f10f7432f9cf84ee5257e8db4fc2eb595e",
+   "a_title": "FC Viktoria Plze\u0148 vs. RU Saint-Gilloise: FC Viktoria Plze\u0148 O/U 0.5",
+   "b_title": "FC Viktoria Plze\u0148 vs. RU Saint-Gilloise: O/U 0.5",
+   "expected": "A_IMPLIES_B",
+   "why": "Over the stronger line implies Over the weaker"
+  },
+  {
+   "cls": "O/U nest or ladder (TRUE)",
+   "a": "0x04585ea4f655af9db47be2b4bd5adde9f9191f589d506acec395129dde680618",
+   "b": "0xa94f834039824a5793172b50dceca99a0ba689dc6bf0d6b694891ffb7e577f56",
+   "a_title": "Vit\u00f3ria SC vs. Moreirense FC: Vit\u00f3ria SC O/U 0.5",
+   "b_title": "Vit\u00f3ria SC vs. Moreirense FC: O/U 0.5",
+   "expected": "A_IMPLIES_B",
+   "why": "Over the stronger line implies Over the weaker"
+  },
+  {
+   "cls": "O/U nest or ladder (TRUE)",
+   "a": "0x948d3b549a067888a6b7143e60275eebf4a448a2a9c89065ada426a8c04ee29c",
+   "b": "0xcba42ca23ed3f4fe0a56c34f86bd5cf9de46f2547168bbacd0893c96f6bc08d6",
+   "a_title": "CA Lan\u00fas vs. Estudiantes de La Plata: Estudiantes de La Plata O/U 0.5",
+   "b_title": "CA Lan\u00fas vs. Estudiantes de La Plata: O/U 0.5",
+   "expected": "A_IMPLIES_B",
+   "why": "Over the stronger line implies Over the weaker"
+  },
+  {
+   "cls": "1st-half spread \u2286 full spread (FALSE)",
+   "a": "0x9a4a618b3eabf961c4f9860db516f5b10740bdf2640d2cb59c767b021f0f80c7",
+   "b": "0xff66f56bda84a31d94bbf0712ce66ab4e97b2cae31a99e4af8f0007029dd2deb",
+   "a_title": "1st Half Spread: M\u00e1laga CF (-1.5)",
+   "b_title": "Spread: M\u00e1laga CF (-1.5)",
+   "expected": "NONE",
+   "why": "a first-half margin can be lost in the second half"
+  },
+  {
+   "cls": "1st-half spread \u2286 full spread (FALSE)",
+   "a": "0x2cae90d2da8f782baee660a6749b33eb24e3f808986d41fc6607c5e5d971d7b9",
+   "b": "0xb455dd2876eb23ffce318cce7c5dd146a584fcbe2156bfd2df5a2420079773f9",
+   "a_title": "1st Half Spread: CA Osasuna (-1.5)",
+   "b_title": "Spread: CA Osasuna (-1.5)",
+   "expected": "NONE",
+   "why": "a first-half margin can be lost in the second half"
+  },
+  {
+   "cls": "1st-half spread \u2286 full spread (FALSE)",
+   "a": "0x62ebb2db351a4d24fe09ea3489902dadbfae6c6d15a7d583da9b37eae09751f3",
+   "b": "0x462435c4a88a81ac18cf32ac2424df0f922cf9e9af3a2831f43a2d66bbf53a91",
+   "a_title": "1st Half Spread: Stade Brestois 29 (-1.5)",
+   "b_title": "Spread: Stade Brestois 29 (-1.5)",
+   "expected": "NONE",
+   "why": "a first-half margin can be lost in the second half"
+  },
+  {
+   "cls": "1st-half spread \u2286 full spread (FALSE)",
+   "a": "0x14ea2912c0f74f41ca7b386c7a196aa0afae1d81d7865a3f5de190578c31b940",
+   "b": "0x5af83bbb34a8eb9eb19634a1e647f4844d982397330f1f55617445e9f85dc82a",
+   "a_title": "1st Half Spread: CA Osasuna (-2.5)",
+   "b_title": "Spread: CA Osasuna (-2.5)",
+   "expected": "NONE",
+   "why": "a first-half margin can be lost in the second half"
+  },
+  {
+   "cls": "1st-half spread \u2286 full spread (FALSE)",
+   "a": "0x6fd5762927157795174e9cfafa169af4823edb7c2920c786db1d26ad65385514",
+   "b": "0x3c86c4b6eead4f942b31eb6773054f610f137f0c7c7f461899aaf34b5be7bc79",
+   "a_title": "1st Half Spread: Racing Club de Lens (-1.5)",
+   "b_title": "Spread: Racing Club de Lens (-1.5)",
+   "expected": "NONE",
+   "why": "a first-half margin can be lost in the second half"
+  },
+  {
+   "cls": "1st-half spread \u2286 full spread (FALSE)",
+   "a": "0x5897a2d9ef835c4b0a511b73adaae816815bff4a19e81bba9727c9141e762261",
+   "b": "0x071420c99393e157fb5e994211b5cbac01082955c7443701b1a82fd3e8fbb652",
+   "a_title": "1st Half Spread: Real Racing Club (-1.5)",
+   "b_title": "Spread: Real Racing Club (-1.5)",
+   "expected": "NONE",
+   "why": "a first-half margin can be lost in the second half"
+  },
+  {
+   "cls": "winner \u2286 completed match (FALSE)",
+   "a": "0xce7c95c0f58dc04894a6bd0a24ac3b169abb20021d9509b36d80d319a5540d03",
+   "b": "0x4d17e4e2e29637eebe53d9bdb637b4382cbaff062e076064960c766ba01a6e7c",
+   "a_title": "Caldas da Rainha: Noma Noha Akugue vs Malaika Rapolu",
+   "b_title": "Caldas da Rainha: Completed Match: Noma Noha Akugue vs Malaika Rapolu",
+   "expected": "NONE",
+   "why": "walkover/retirement: a winner advances, the match is not completed"
+  },
+  {
+   "cls": "winner \u2286 completed match (FALSE)",
+   "a": "0x7d0aec7b921746c794aadf1a82025fe28a4ccf36584124874ac32df2e16343c2",
+   "b": "0x64e471ceffede099b7d3f9dc36cc6253623a5e5e473324d2fef59049fd67b03d",
+   "a_title": "Guadalajara Open Akron: Zeynep Sonmez vs Iva Jovic",
+   "b_title": "Guadalajara Open Akron: Completed Match: Zeynep Sonmez vs Iva Jovic",
+   "expected": "NONE",
+   "why": "walkover/retirement: a winner advances, the match is not completed"
+  },
+  {
+   "cls": "winner \u2286 completed match (FALSE)",
+   "a": "0x52607f08e6d8a7c8ab4500e153bca6647d115c370882177be58738729f3ead8f",
+   "b": "0xfe55806ac07a11144656fd4915e6b4d6606545407bf4c83d215b717b6128a9e8",
+   "a_title": "Caldas da Rainha: Kylie Collins vs Kayla Cross",
+   "b_title": "Caldas da Rainha: Completed Match: Kylie Collins vs Kayla Cross",
+   "expected": "NONE",
+   "why": "walkover/retirement: a winner advances, the match is not completed"
+  },
+  {
+   "cls": "winner \u2286 completed match (FALSE)",
+   "a": "0x85b07e34fe59e397e7469d5fb700cf25bac187732b3221a8b6cb081189965212",
+   "b": "0x81a3904490430da65fe8222a32dcc927c28eb63088ba0613036ab54a0b0ba7ca",
+   "a_title": "M25 Nevers: Robin Eldin vs Luke Hooper",
+   "b_title": "M25 Nevers, Main Draw: Completed Match: Robin Eldin vs Luke Hooper",
+   "expected": "NONE",
+   "why": "walkover/retirement: a winner advances, the match is not completed"
+  },
+  {
+   "cls": "winner \u2286 completed match (FALSE)",
+   "a": "0x431b618fc505ca2c9b0f15a0f8c2266f5375dd0a89ce9b9d2925b6f088e5ba83",
+   "b": "0xbe95a99847666a9327566e1363db3108b2cbb39fcec3e83102508f5962526570",
+   "a_title": "Sao Paulo Open: Eva Lys vs Gabriela Ce",
+   "b_title": "Sao Paulo Open: Completed Match: Eva Lys vs Gabriela Ce",
+   "expected": "NONE",
+   "why": "walkover/retirement: a winner advances, the match is not completed"
+  },
+  {
+   "cls": "winner \u2286 completed match (FALSE)",
+   "a": "0x399569f658a35a063f7eff7e6fa018eb6192b4a3266e9f0b36d613a0ce46eeb4",
+   "b": "0x8b275c1f0f8d60b0862ad6476ef03d9378bef9b0895dd9b92ef9d47a3c48c2a0",
+   "a_title": "Sao Paulo Open: Vendula Valdmannova vs Laura Pigossi",
+   "b_title": "Sao Paulo Open: Completed Match: Vendula Valdmannova vs Laura Pigossi",
+   "expected": "NONE",
+   "why": "walkover/retirement: a winner advances, the match is not completed"
+  },
+  {
+   "cls": "final 0-0 \u2286 half-time 0-0 (TRUE)",
+   "a": "0x7f3b99492f9bd4e4da6b024a142ab67c03984c0e7312ad30a268497cf16a57ec",
+   "b": "0xf52d05c6493b2f1ca69646c51aae20c05c1668759e9c139beed89c467558bf62",
+   "a_title": "Exact Score: Leeds United FC 0 - 0 Crystal Palace FC?",
+   "b_title": "1st Half Exact Score: Leeds United FC 0 - 0 Crystal Palace FC?",
+   "expected": "A_IMPLIES_B",
+   "why": "no goals at all means none by half-time"
+  },
+  {
+   "cls": "final 0-0 \u2286 half-time 0-0 (TRUE)",
+   "a": "0x5dc241b17fde4649ec606d466c31004f0354c438b11fcd07a47b9e237076dd37",
+   "b": "0x7acce6fe541c9b6923055ecfb09ea4ccb6ca232601dedf5e22ebd7db8282f40d",
+   "a_title": "Exact Score: AJ Auxerre 0 - 0 Stade Brestois 29?",
+   "b_title": "1st Half Exact Score: AJ Auxerre 0 - 0 Stade Brestois 29?",
+   "expected": "A_IMPLIES_B",
+   "why": "no goals at all means none by half-time"
+  },
+  {
+   "cls": "final 0-0 \u2286 half-time 0-0 (TRUE)",
+   "a": "0x8d8febf36546b368b53b0adb45e7a682ae0f95573f7738bbcb34295230811353",
+   "b": "0xe91958bb969ba8fcf319a183422cb94e4b2b3141b1517beeff5c72087a68d5ea",
+   "a_title": "Exact Score: Nottingham Forest FC 0 - 0 Coventry City FC?",
+   "b_title": "1st Half Exact Score: Nottingham Forest FC 0 - 0 Coventry City FC?",
+   "expected": "A_IMPLIES_B",
+   "why": "no goals at all means none by half-time"
+  },
+  {
+   "cls": "final 0-0 \u2286 half-time 0-0 (TRUE)",
+   "a": "0x31a6a5a722d6be14a3ad1c84baf26fc58a8fb98a9f7e51946694fdb98aaa8fdf",
+   "b": "0xe61c49af780d2b42d080c987f17ab2090da13b21b44243c325fe0c5ee7db9297",
+   "a_title": "Exact Score: Paris FC 0 - 0 RC Strasbourg Alsace?",
+   "b_title": "1st Half Exact Score: Paris FC 0 - 0 RC Strasbourg Alsace?",
+   "expected": "A_IMPLIES_B",
+   "why": "no goals at all means none by half-time"
+  },
+  {
+   "cls": "final 0-0 \u2286 half-time 0-0 (TRUE)",
+   "a": "0x3799525622a891dfd1291a79121a68384e3fa4f89b8ec2588397fcc84cd2bf04",
+   "b": "0x4ae365aa68115f7bdd6e21ba1bb6b74183e56e64328d85297a020318f2cbf248",
+   "a_title": "Exact Score: RC Celta de Vigo 0 - 0 Real Racing Club?",
+   "b_title": "1st Half Exact Score: RC Celta de Vigo 0 - 0 Real Racing Club?",
+   "expected": "A_IMPLIES_B",
+   "why": "no goals at all means none by half-time"
+  },
+  {
+   "cls": "final 0-0 \u2286 half-time 0-0 (TRUE)",
+   "a": "0x546ed8e1c45e5ec189386b5fb806c3d871717849b39ca572680b73abfa71620e",
+   "b": "0x380093b3fa091e2100700ea16943bcd0988472c5e107a0a34424988c9a1858c9",
+   "a_title": "Exact Score: CA Osasuna 0 - 0 Rayo Vallecano de Madrid?",
+   "b_title": "1st Half Exact Score: CA Osasuna 0 - 0 Rayo Vallecano de Madrid?",
+   "expected": "A_IMPLIES_B",
+   "why": "no goals at all means none by half-time"
+  },
+  {
+   "cls": "US #1 \u2286 global #1 (FALSE)",
+   "a": "0xa28b27fc96884a23a7f8131d163ab7dd7dbc6efbaa59e6f73a9bcd4b25e23d7e",
+   "b": "0x5d22159e9fbc4dbe56cbc28df6e9a2ad9ab90a212f821d790349589f0ee64549",
+   "a_title": "Will \"Earrings - Malcolm Todd\" be the #1 US song this week?",
+   "b_title": "Will \"Earrings - Malcolm Todd\" be the #1 song this week?",
+   "expected": "NONE",
+   "why": "number one in the US need not be number one globally"
+  },
+  {
+   "cls": "US #1 \u2286 global #1 (FALSE)",
+   "a": "0x42ff43f2bb23a7d2539039b2341b9cfba545f56d428d770b7ef666ea69450b35",
+   "b": "0x28642cf70412f61acf73a0a8694da6d68b56693dacede9dc96ad907072aaaa25",
+   "a_title": "Will \"BbY WOW - KAROL G, Judeline, rusowsky\" be the #1 US song this week?",
+   "b_title": "Will \"BbY WOW - KAROL G, Judeline, rusowsky\" be the #1 song this week?",
+   "expected": "NONE",
+   "why": "number one in the US need not be number one globally"
+  },
+  {
+   "cls": "exact score \u2286 Over a higher line (FALSE)",
+   "a": "0x24354876d0dec582841d2db987ba802417ed6ebc2f965bd85d6d07fb8f3119f6",
+   "b": "0xc6f82e49b1c1d110b1c468a8d91dacd48c45e5e5790769f9d7a44b9b97fdd36f",
+   "a_title": "Exact Score: Persita Tangerang 0 - 0 Java United FC?",
+   "b_title": "Persita Tangerang vs. Java United FC: O/U 5.5",
+   "expected": "NONE",
+   "why": "that score is Under the line; YES is Over"
+  },
+  {
+   "cls": "exact score \u2286 Over a higher line (FALSE)",
+   "a": "0x9af1deb33a2f6eb10687d619563eaf5027e96770dc63811092004ca510293fe6",
+   "b": "0x6341933d937c41115b8a73d6e8e759d0a8a2ba640bb08483d9f209cb9cbfdef9",
+   "a_title": "Exact Score: Gwangju FC 0 - 0 FC Anyang?",
+   "b_title": "Gwangju FC vs. FC Anyang: O/U 5.5",
+   "expected": "NONE",
+   "why": "that score is Under the line; YES is Over"
+  },
+  {
+   "cls": "exact score \u2286 Over a higher line (FALSE)",
+   "a": "0x43a6c6b3c8996d96b60848d4908020e728f0483b7684ff4e96fc01d3eeb22c00",
+   "b": "0x085d2a0c4b468bf3acbc30ff8f99b35ee532dfcc79956a8aa6f96c39cc01b130",
+   "a_title": "Exact Score: Cesena FC 0 - 0 US Cremonese?",
+   "b_title": "Cesena FC vs. US Cremonese: O/U 5.5",
+   "expected": "NONE",
+   "why": "that score is Under the line; YES is Over"
+  },
+  {
+   "cls": "exact score \u2286 Over a higher line (FALSE)",
+   "a": "0x3a32d04b0993e10abbceef8d0083e08082790fad1650ffe7d7a3863850e2b071",
+   "b": "0x46f9d1ae8195bd8c7b1414d297e35eaa863bd55560f368e3929484c33df52d60",
+   "a_title": "Exact Score: Gimcheon Sangmu FC 0 - 0 Gangwon FC?",
+   "b_title": "Gimcheon Sangmu FC vs. Gangwon FC: O/U 5.5",
+   "expected": "NONE",
+   "why": "that score is Under the line; YES is Over"
+  },
+  {
+   "cls": "exact score \u2286 Over a higher line (FALSE)",
+   "a": "0x22efde3c52a48cd2eea240995d4a20dcc64f1b61e9c2c18055c77c8956d461b5",
+   "b": "0xf61d60a29af4e32cda11055272983767c70e49c8d0a43e5c624f31f984b1d509",
+   "a_title": "Exact Score: Estudiantes de Merida 0 - 0 Deportivo Tachira?",
+   "b_title": "Estudiantes de Merida vs. Deportivo Tachira: O/U 5.5",
+   "expected": "NONE",
+   "why": "that score is Under the line; YES is Over"
+  },
+  {
+   "cls": "exact score \u2286 Over a higher line (FALSE)",
+   "a": "0x0054bf9173cc29f58802b84335d74d3d1fe45ffcf68281c24086356cd4e92cd2",
+   "b": "0x46f9d1ae8195bd8c7b1414d297e35eaa863bd55560f368e3929484c33df52d60",
+   "a_title": "Exact Score: Gimcheon Sangmu FC 1 - 0 Gangwon FC?",
+   "b_title": "Gimcheon Sangmu FC vs. Gangwon FC: O/U 5.5",
+   "expected": "NONE",
+   "why": "that score is Under the line; YES is Over"
+  },
+  {
+   "cls": "O/U nest or ladder (TRUE) \u2014 reversed",
+   "a": "0xd0568acd54e4a38da9d430ce51182cb700d32fa009c61ecc8addfdf6c30283b5",
+   "b": "0x9964da735d1eb9ade546f6e108b34f5ea7e4b575a9c24f7224e77294c15ae5ff",
+   "a_title": "FC Lahti vs. FF Jaro: O/U 0.5",
+   "b_title": "FC Lahti vs. FF Jaro: FF Jaro O/U 0.5",
+   "expected": "B_IMPLIES_A",
+   "why": "Over the stronger line implies Over the weaker"
+  },
+  {
+   "cls": "O/U nest or ladder (TRUE) \u2014 reversed",
+   "a": "0x439985afe9618727f91bf15e3bcfc404fc7431c7a7b97ae8944f9f29f6f77b4e",
+   "b": "0x0bcf3ad3dff44e1ea3d51dd3646819f5e56ffdad06165f3351e54b9e43a9d4bb",
+   "a_title": "FC Arda Kardzhali vs. PFC Cherno More Varna: O/U 0.5",
+   "b_title": "FC Arda Kardzhali vs. PFC Cherno More Varna: FC Arda Kardzhali 1st Half O/U 0.5",
+   "expected": "B_IMPLIES_A",
+   "why": "Over the stronger line implies Over the weaker"
+  },
+  {
+   "cls": "O/U nest or ladder (TRUE) \u2014 reversed",
+   "a": "0x1328c41ffac314f55c57fe03869c44dfd3869ceebe7a4d098de0d799792acb4d",
+   "b": "0x90db3a991e19df2215184df110e38db8135e23301ecb251246f6b76af80978ba",
+   "a_title": "FC Internazionale Milano vs. BK H\u00e4cken FF: O/U 0.5",
+   "b_title": "FC Internazionale Milano vs. BK H\u00e4cken FF: FC Internazionale Milano 1st Half O/U 0.5",
+   "expected": "B_IMPLIES_A",
+   "why": "Over the stronger line implies Over the weaker"
+  },
+  {
+   "cls": "O/U nest or ladder (TRUE) \u2014 reversed",
+   "a": "0x00d3f5903580f7d0a0d5223c17e3009ba0dfe659a7b511b5f58e2f09da07802b",
+   "b": "0x7843a7c32737a83cbde0a8d930376205fbbf6d61c21e0196fba640dd5d8680d1",
+   "a_title": "LD Alajuelense vs. Inter San Carlos: O/U 0.5",
+   "b_title": "LD Alajuelense vs. Inter San Carlos: Inter San Carlos O/U 0.5",
+   "expected": "B_IMPLIES_A",
+   "why": "Over the stronger line implies Over the weaker"
+  },
+  {
+   "cls": "O/U nest or ladder (TRUE) \u2014 reversed",
+   "a": "0xc1bd0a1a18ce302d2886cf4e8a6fccce630be3b9b8084cc53e911261e43ef1d4",
+   "b": "0x4f18cb9574e545d568679683a9906fee1c2aa71951e96039491e3eeb9c74a291",
+   "a_title": "Halmstads BK vs. AIK: O/U 0.5",
+   "b_title": "Halmstads BK vs. AIK: Halmstads BK 1st Half O/U 0.5",
+   "expected": "B_IMPLIES_A",
+   "why": "Over the stronger line implies Over the weaker"
+  },
+  {
+   "cls": "O/U nest or ladder (TRUE) \u2014 reversed",
+   "a": "0x50e76a61adb6552518b6ea5995d6fd5bdcbc3747dae663ed75dad45264a5b8be",
+   "b": "0x91b878e0a865df27a35b7c24fca92c498d8587a1e702972e4a2df7acf7fa73fe",
+   "a_title": "Manchester United FC vs. Brighton & Hove Albion FC: O/U 0.5",
+   "b_title": "Manchester United FC vs. Brighton & Hove Albion FC: Brighton & Hove Albion FC O/U 0.5",
+   "expected": "B_IMPLIES_A",
+   "why": "Over the stronger line implies Over the weaker"
+  },
+  {
+   "cls": "O/U nest or ladder (TRUE) \u2014 reversed",
+   "a": "0x9de3a13e5978ff44b424e865215aedc03223fee9ef8f4a206f2ec75de061b533",
+   "b": "0x1baa3adbc628cbcd26e454763bd281f4d99743bea3c2e789aa87f7e82d4c7595",
+   "a_title": "Cardiff City FC vs. Charlton Athletic FC: O/U 0.5",
+   "b_title": "Cardiff City FC vs. Charlton Athletic FC: Cardiff City FC O/U 0.5",
+   "expected": "B_IMPLIES_A",
+   "why": "Over the stronger line implies Over the weaker"
+  },
+  {
+   "cls": "O/U nest or ladder (TRUE) \u2014 reversed",
+   "a": "0xb2f9c8f1fefa4465204ac9797ae5a8f10f7432f9cf84ee5257e8db4fc2eb595e",
+   "b": "0x07869c03fef6dc5685c1acc20256007c70a29d7ac1dd53587224ded021e0248d",
+   "a_title": "FC Viktoria Plze\u0148 vs. RU Saint-Gilloise: O/U 0.5",
+   "b_title": "FC Viktoria Plze\u0148 vs. RU Saint-Gilloise: FC Viktoria Plze\u0148 O/U 0.5",
+   "expected": "B_IMPLIES_A",
+   "why": "Over the stronger line implies Over the weaker"
+  },
+  {
+   "cls": "HOLDOUT O/U 2.5 Over \u2286 BTTS (FALSE)",
+   "a": "0x58ad610095740adbd1fdfbd13f18dd4be803b54be826c3d304818c1067323761",
+   "b": "0xa54b3a66b7ae80dba1bc7959be2b3f2f8849e012c2ac4d3db72d3c0866822e0f",
+   "a_title": "Bologna FC 1909 vs. Torino FC: O/U 2.5",
+   "b_title": "Bologna FC 1909 vs. Torino FC: Both Teams to Score",
+   "expected": "NONE",
+   "why": "3-0 is Over 2.5 without both scoring",
+   "holdout": true
+  },
+  {
+   "cls": "HOLDOUT BTTS \u2286 O/U 1.5 Over (TRUE)",
+   "a": "0xa54b3a66b7ae80dba1bc7959be2b3f2f8849e012c2ac4d3db72d3c0866822e0f",
+   "b": "0x29b10a8f3266857330c53bdc1782bbe6ca278a213799fc6e31ecce526a38375f",
+   "a_title": "Bologna FC 1909 vs. Torino FC: Both Teams to Score",
+   "b_title": "Bologna FC 1909 vs. Torino FC: O/U 1.5",
+   "expected": "A_IMPLIES_B",
+   "why": "both scoring means at least two goals",
+   "holdout": true
+  },
+  {
+   "cls": "HOLDOUT BTTS \u2286 O/U 1.5 Over (TRUE) \u2014 reversed",
+   "a": "0x29b10a8f3266857330c53bdc1782bbe6ca278a213799fc6e31ecce526a38375f",
+   "b": "0xa54b3a66b7ae80dba1bc7959be2b3f2f8849e012c2ac4d3db72d3c0866822e0f",
+   "a_title": "Bologna FC 1909 vs. Torino FC: O/U 1.5",
+   "b_title": "Bologna FC 1909 vs. Torino FC: Both Teams to Score",
+   "expected": "B_IMPLIES_A",
+   "why": "both scoring means at least two goals",
+   "holdout": true
+  },
+  {
+   "cls": "HOLDOUT BTTS \u2286 O/U 2.5 Over (FALSE)",
+   "a": "0xa54b3a66b7ae80dba1bc7959be2b3f2f8849e012c2ac4d3db72d3c0866822e0f",
+   "b": "0x58ad610095740adbd1fdfbd13f18dd4be803b54be826c3d304818c1067323761",
+   "a_title": "Bologna FC 1909 vs. Torino FC: Both Teams to Score",
+   "b_title": "Bologna FC 1909 vs. Torino FC: O/U 2.5",
+   "expected": "NONE",
+   "why": "1-1 has both scoring and only two goals",
+   "holdout": true
+  },
+  {
+   "cls": "HOLDOUT team Over 1.5 \u2286 BTTS (FALSE)",
+   "a": "0x10b0c16ebc7e9709eb4b4dedc40f33be11a48fba142936c58b43a799eba57a0c",
+   "b": "0xa54b3a66b7ae80dba1bc7959be2b3f2f8849e012c2ac4d3db72d3c0866822e0f",
+   "a_title": "Bologna FC 1909 vs. Torino FC: 1st Half O/U 1.5",
+   "b_title": "Bologna FC 1909 vs. Torino FC: Both Teams to Score",
+   "expected": "NONE",
+   "why": "2-0 is that team Over 1.5 without both scoring",
+   "holdout": true
+  },
+  {
+   "cls": "HOLDOUT O/U 2.5 Over \u2286 BTTS (FALSE)",
+   "a": "0xb493206dec81fd2ff5471a9897a448332d56efd5b60f61c2c6db68600b39361a",
+   "b": "0xac7110db0fd7ae9229db37326b2cfa40e3d9a077673aff2934976fbb2e90be80",
+   "a_title": "Yokohama FC vs. FC Imabari: O/U 2.5",
+   "b_title": "Yokohama FC vs. FC Imabari: Both Teams to Score",
+   "expected": "NONE",
+   "why": "3-0 is Over 2.5 without both scoring",
+   "holdout": true
+  },
+  {
+   "cls": "HOLDOUT BTTS \u2286 O/U 1.5 Over (TRUE)",
+   "a": "0xac7110db0fd7ae9229db37326b2cfa40e3d9a077673aff2934976fbb2e90be80",
+   "b": "0x62c43250932f03521d29054a65365d98956b82c90fa530ff22abc3ee2d37516b",
+   "a_title": "Yokohama FC vs. FC Imabari: Both Teams to Score",
+   "b_title": "Yokohama FC vs. FC Imabari: O/U 1.5",
+   "expected": "A_IMPLIES_B",
+   "why": "both scoring means at least two goals",
+   "holdout": true
+  },
+  {
+   "cls": "HOLDOUT BTTS \u2286 O/U 1.5 Over (TRUE) \u2014 reversed",
+   "a": "0x62c43250932f03521d29054a65365d98956b82c90fa530ff22abc3ee2d37516b",
+   "b": "0xac7110db0fd7ae9229db37326b2cfa40e3d9a077673aff2934976fbb2e90be80",
+   "a_title": "Yokohama FC vs. FC Imabari: O/U 1.5",
+   "b_title": "Yokohama FC vs. FC Imabari: Both Teams to Score",
+   "expected": "B_IMPLIES_A",
+   "why": "both scoring means at least two goals",
+   "holdout": true
+  },
+  {
+   "cls": "HOLDOUT BTTS \u2286 O/U 2.5 Over (FALSE)",
+   "a": "0xac7110db0fd7ae9229db37326b2cfa40e3d9a077673aff2934976fbb2e90be80",
+   "b": "0xb493206dec81fd2ff5471a9897a448332d56efd5b60f61c2c6db68600b39361a",
+   "a_title": "Yokohama FC vs. FC Imabari: Both Teams to Score",
+   "b_title": "Yokohama FC vs. FC Imabari: O/U 2.5",
+   "expected": "NONE",
+   "why": "1-1 has both scoring and only two goals",
+   "holdout": true
+  },
+  {
+   "cls": "HOLDOUT team Over 1.5 \u2286 BTTS (FALSE)",
+   "a": "0x0dd9b49371eee039a95b08c958144e926524a51faceccfff57c884a7f7495486",
+   "b": "0xac7110db0fd7ae9229db37326b2cfa40e3d9a077673aff2934976fbb2e90be80",
+   "a_title": "Yokohama FC vs. FC Imabari: 1st Half O/U 1.5",
+   "b_title": "Yokohama FC vs. FC Imabari: Both Teams to Score",
+   "expected": "NONE",
+   "why": "2-0 is that team Over 1.5 without both scoring",
+   "holdout": true
+  },
+  {
+   "cls": "HOLDOUT O/U 2.5 Over \u2286 BTTS (FALSE)",
+   "a": "0x4a69df0e80e197de68554599b134410b5b479c95296956b3f58b791def0d10f5",
+   "b": "0x00785839cb2a5d4a1043b6c80c08c73b04d304692425e23a8ac9fb7eacc1dfb1",
+   "a_title": "Ascoli Calcio 1898 FC vs. US Avellino 1912: O/U 2.5",
+   "b_title": "Ascoli Calcio 1898 FC vs. US Avellino 1912: Both Teams to Score",
+   "expected": "NONE",
+   "why": "3-0 is Over 2.5 without both scoring",
+   "holdout": true
+  },
+  {
+   "cls": "HOLDOUT BTTS \u2286 O/U 1.5 Over (TRUE)",
+   "a": "0x00785839cb2a5d4a1043b6c80c08c73b04d304692425e23a8ac9fb7eacc1dfb1",
+   "b": "0x2bbd0a928b7a266b92a22d52756482051a2a403c136623aa7745149282f44395",
+   "a_title": "Ascoli Calcio 1898 FC vs. US Avellino 1912: Both Teams to Score",
+   "b_title": "Ascoli Calcio 1898 FC vs. US Avellino 1912: O/U 1.5",
+   "expected": "A_IMPLIES_B",
+   "why": "both scoring means at least two goals",
+   "holdout": true
+  },
+  {
+   "cls": "HOLDOUT BTTS \u2286 O/U 1.5 Over (TRUE) \u2014 reversed",
+   "a": "0x2bbd0a928b7a266b92a22d52756482051a2a403c136623aa7745149282f44395",
+   "b": "0x00785839cb2a5d4a1043b6c80c08c73b04d304692425e23a8ac9fb7eacc1dfb1",
+   "a_title": "Ascoli Calcio 1898 FC vs. US Avellino 1912: O/U 1.5",
+   "b_title": "Ascoli Calcio 1898 FC vs. US Avellino 1912: Both Teams to Score",
+   "expected": "B_IMPLIES_A",
+   "why": "both scoring means at least two goals",
+   "holdout": true
+  },
+  {
+   "cls": "HOLDOUT BTTS \u2286 O/U 2.5 Over (FALSE)",
+   "a": "0x00785839cb2a5d4a1043b6c80c08c73b04d304692425e23a8ac9fb7eacc1dfb1",
+   "b": "0x4a69df0e80e197de68554599b134410b5b479c95296956b3f58b791def0d10f5",
+   "a_title": "Ascoli Calcio 1898 FC vs. US Avellino 1912: Both Teams to Score",
+   "b_title": "Ascoli Calcio 1898 FC vs. US Avellino 1912: O/U 2.5",
+   "expected": "NONE",
+   "why": "1-1 has both scoring and only two goals",
+   "holdout": true
+  },
+  {
+   "cls": "HOLDOUT team Over 1.5 \u2286 BTTS (FALSE)",
+   "a": "0x20e514e49f644c970e4599eb2d581f00d90e3b2c4fecf4b801f7cd0fbd053df2",
+   "b": "0x00785839cb2a5d4a1043b6c80c08c73b04d304692425e23a8ac9fb7eacc1dfb1",
+   "a_title": "Ascoli Calcio 1898 FC vs. US Avellino 1912: 1st Half O/U 1.5",
+   "b_title": "Ascoli Calcio 1898 FC vs. US Avellino 1912: Both Teams to Score",
+   "expected": "NONE",
+   "why": "2-0 is that team Over 1.5 without both scoring",
+   "holdout": true
+  }
+ ],
+ "markets": {
+  "0x0054bf9173cc29f58802b84335d74d3d1fe45ffcf68281c24086356cd4e92cd2": {
+   "conditionId": "0x0054bf9173cc29f58802b84335d74d3d1fe45ffcf68281c24086356cd4e92cd2",
+   "question": "Exact Score: Gimcheon Sangmu FC 1 - 0 Gangwon FC?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming K-League game between Gimcheon Sangmu FC and Gangwon FC, scheduled for September 13, 2026 at 3:30 AM ET: This market will resolve based on the final score of the Gimcheon Sangmu FC vs. Gangwon FC match originally scheduled for September 13, 2026 at 3:30 AM ET, considering only the result at the end of 90 minutes of regulation plus stoppage time; extra time and penalty shoot-outs are excluded. If the actual score is not one of the explicitly listed outcomes, the market resolves to \"Any Other Score.\" If the match is postponed, the market will remain open until it is completed; if it is canceled with no make-up game, the market resolves to \"0-0.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome.",
+   "outcomePrices": "[\"0\", \"1\"]",
+   "closed": true
+  },
+  "0x00d3f5903580f7d0a0d5223c17e3009ba0dfe659a7b511b5f58e2f09da07802b": {
+   "conditionId": "0x00d3f5903580f7d0a0d5223c17e3009ba0dfe659a7b511b5f58e2f09da07802b",
+   "question": "LD Alajuelense vs. Inter San Carlos: O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Liga Promerica game between LD Alajuelense and Inter San Carlos, scheduled for September 20 at 7:00 PM ET:\n\nThis market will resolve to \"Over\" if LD Alajuelense and Inter San Carlos combine to score 1 or more goals in this game.\n\nIf the combined total is less than 1, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on unafut.com. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.515\", \"0.485\"]",
+   "closed": false
+  },
+  "0x04585ea4f655af9db47be2b4bd5adde9f9191f589d506acec395129dde680618": {
+   "conditionId": "0x04585ea4f655af9db47be2b4bd5adde9f9191f589d506acec395129dde680618",
+   "question": "Vit\u00f3ria SC vs. Moreirense FC: Vit\u00f3ria SC O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Primeira Liga game between Vit\u00f3ria SC and Moreirense FC, scheduled for September 20 at 10:30 AM ET: This market will resolve to \"Over\" if Vit\u00f3ria SC score 1 or more goals within the first 90 minutes of regular play plus stoppage time. If Vit\u00f3ria SC score less than 1 goals within the first 90 minutes of regular play plus stoppage time, this market will resolve to \"Under\". This market is based solely on Vit\u00f3ria SC's score, not the combined score of both teams. If the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50-50. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time. Extra time and penalty shoot-outs are excluded. The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.85\", \"0.15\"]",
+   "closed": false
+  },
+  "0x071420c99393e157fb5e994211b5cbac01082955c7443701b1a82fd3e8fbb652": {
+   "conditionId": "0x071420c99393e157fb5e994211b5cbac01082955c7443701b1a82fd3e8fbb652",
+   "question": "Spread: Real Racing Club (-1.5)",
+   "outcomes": "[\"Real Racing Club\", \"RC Celta de Vigo\"]",
+   "description": "In the upcoming La Liga game, scheduled for September 19 at 12:30 PM ET:\n\nThis market will resolve to \"Real Racing Club\" if Real Racing Club win the game by 2 or more goals.\n\nOtherwise, this market will resolve to \"RC Celta de Vigo\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nThis market will resolve according to the official final score published on laliga.com. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.075\", \"0.925\"]",
+   "closed": false
+  },
+  "0x07869c03fef6dc5685c1acc20256007c70a29d7ac1dd53587224ded021e0248d": {
+   "conditionId": "0x07869c03fef6dc5685c1acc20256007c70a29d7ac1dd53587224ded021e0248d",
+   "question": "FC Viktoria Plze\u0148 vs. RU Saint-Gilloise: FC Viktoria Plze\u0148 O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming UEFA Europa League game between FC Viktoria Plze\u0148 and RU Saint-Gilloise, scheduled for September 17 at 3:00 PM ET: This market will resolve to \"Over\" if FC Viktoria Plze\u0148 score 1 or more goals within the first 90 minutes of regular play plus stoppage time. If FC Viktoria Plze\u0148 score less than 1 goals within the first 90 minutes of regular play plus stoppage time, this market will resolve to \"Under\". This market is based solely on FC Viktoria Plze\u0148's score, not the combined score of both teams. If the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50-50. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time. Extra time and penalty shoot-outs are excluded. The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.765\", \"0.235\"]",
+   "closed": false
+  },
+  "0x085d2a0c4b468bf3acbc30ff8f99b35ee532dfcc79956a8aa6f96c39cc01b130": {
+   "conditionId": "0x085d2a0c4b468bf3acbc30ff8f99b35ee532dfcc79956a8aa6f96c39cc01b130",
+   "question": "Cesena FC vs. US Cremonese: O/U 5.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Serie B game between Cesena FC and US Cremonese, scheduled for September 12 at 1:30 PM ET:\n\nThis market will resolve to \"Over\" if Cesena FC and US Cremonese combine to score 6 or more goals in this game.\n\nIf the combined total is less than 6, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on legaserieb.it. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome.",
+   "outcomePrices": "[\"0\", \"1\"]",
+   "closed": true
+  },
+  "0x0bcf3ad3dff44e1ea3d51dd3646819f5e56ffdad06165f3351e54b9e43a9d4bb": {
+   "conditionId": "0x0bcf3ad3dff44e1ea3d51dd3646819f5e56ffdad06165f3351e54b9e43a9d4bb",
+   "question": "FC Arda Kardzhali vs. PFC Cherno More Varna: FC Arda Kardzhali 1st Half O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Bulgaria Parva Liga game between FC Arda Kardzhali and PFC Cherno More Varna, scheduled for September 19 at 12:00 PM ET: This market will resolve to \"Over\" if FC Arda Kardzhali score 1 or more goals in the first half (first 45 minutes of regular play plus first-half stoppage time). If FC Arda Kardzhali score less than 1 goals in the first half, this market will resolve to \"Under\". This market is based solely on FC Arda Kardzhali's first-half score, not the combined score of both teams. If the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50-50. This market refers only to the outcome within the first 45 minutes of regular play plus first-half stoppage time. Second-half goals, extra time, and penalty shoot-outs are excluded. The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.5\", \"0.5\"]",
+   "closed": false
+  },
+  "0x1328c41ffac314f55c57fe03869c44dfd3869ceebe7a4d098de0d799792acb4d": {
+   "conditionId": "0x1328c41ffac314f55c57fe03869c44dfd3869ceebe7a4d098de0d799792acb4d",
+   "question": "FC Internazionale Milano vs. BK H\u00e4cken FF: O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming UEFA Women's Champions League game between FC Internazionale Milano and BK H\u00e4cken FF, scheduled for September 22 at 12:45 PM ET:\n\nThis market will resolve to \"Over\" if FC Internazionale Milano and BK H\u00e4cken FF combine to score 1 or more goals in this game.\n\nIf the combined total is less than 1, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on uefa.com. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.51\", \"0.49\"]",
+   "closed": false
+  },
+  "0x14ea2912c0f74f41ca7b386c7a196aa0afae1d81d7865a3f5de190578c31b940": {
+   "conditionId": "0x14ea2912c0f74f41ca7b386c7a196aa0afae1d81d7865a3f5de190578c31b940",
+   "question": "1st Half Spread: CA Osasuna (-2.5)",
+   "outcomes": "[\"CA Osasuna\", \"Rayo Vallecano de Madrid\"]",
+   "description": "In the upcoming La Liga game between CA Osasuna and Rayo Vallecano de Madrid, scheduled for September 19 at 8:00 AM ET: This market will resolve to \"CA Osasuna\" if CA Osasuna win the first half by 3 or more goals. Otherwise, this market will resolve to \"Rayo Vallecano de Madrid\". If the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50-50. This market refers only to the outcome within the first 45 minutes of regular play plus first-half stoppage time. Second-half goals, extra time, and penalty shoot-outs are excluded. The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.25\", \"0.75\"]",
+   "closed": false
+  },
+  "0x1baa3adbc628cbcd26e454763bd281f4d99743bea3c2e789aa87f7e82d4c7595": {
+   "conditionId": "0x1baa3adbc628cbcd26e454763bd281f4d99743bea3c2e789aa87f7e82d4c7595",
+   "question": "Cardiff City FC vs. Charlton Athletic FC: Cardiff City FC O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming EFL Championship game between Cardiff City FC and Charlton Athletic FC, scheduled for September 19 at 7:30 AM ET: This market will resolve to \"Over\" if Cardiff City FC score 1 or more goals within the first 90 minutes of regular play plus stoppage time. If Cardiff City FC score less than 1 goals within the first 90 minutes of regular play plus stoppage time, this market will resolve to \"Under\". This market is based solely on Cardiff City FC's score, not the combined score of both teams. If the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50-50. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time. Extra time and penalty shoot-outs are excluded. The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.84\", \"0.16\"]",
+   "closed": false
+  },
+  "0x22efde3c52a48cd2eea240995d4a20dcc64f1b61e9c2c18055c77c8956d461b5": {
+   "conditionId": "0x22efde3c52a48cd2eea240995d4a20dcc64f1b61e9c2c18055c77c8956d461b5",
+   "question": "Exact Score: Estudiantes de Merida 0 - 0 Deportivo Tachira?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming Primera Divisi\u00f3n (Venezuela) game between Estudiantes de Merida and Deportivo Tachira, scheduled for September 12, 2026 at 5:00 PM ET: This market will resolve based on the final score of the Estudiantes de Merida vs. Deportivo Tachira match originally scheduled for September 12, 2026 at 5:00 PM ET, considering only the result at the end of 90 minutes of regulation plus stoppage time; extra time and penalty shoot-outs are excluded. If the actual score is not one of the explicitly listed outcomes, the market resolves to \"Any Other Score.\" If the match is postponed, the market will remain open until it is completed; if it is canceled with no make-up game, the market resolves to \"0-0.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0\", \"1\"]",
+   "closed": true
+  },
+  "0x24354876d0dec582841d2db987ba802417ed6ebc2f965bd85d6d07fb8f3119f6": {
+   "conditionId": "0x24354876d0dec582841d2db987ba802417ed6ebc2f965bd85d6d07fb8f3119f6",
+   "question": "Exact Score: Persita Tangerang 0 - 0 Java United FC?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming Indonesia Liga 1 game between Persita Tangerang and Java United FC, scheduled for September 13, 2026 at 4:30 AM ET: This market will resolve based on the final score of the Persita Tangerang vs. Java United FC match originally scheduled for September 13, 2026 at 4:30 AM ET, considering only the result at the end of 90 minutes of regulation plus stoppage time; extra time and penalty shoot-outs are excluded. If the actual score is not one of the explicitly listed outcomes, the market resolves to \"Any Other Score.\" If the match is postponed, the market will remain open until it is completed; if it is canceled with no make-up game, the market resolves to \"0-0.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0\", \"1\"]",
+   "closed": true
+  },
+  "0x28642cf70412f61acf73a0a8694da6d68b56693dacede9dc96ad907072aaaa25": {
+   "conditionId": "0x28642cf70412f61acf73a0a8694da6d68b56693dacede9dc96ad907072aaaa25",
+   "question": "Will \"BbY WOW - KAROL G, Judeline, rusowsky\" be the #1 song this week?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "Spotify curates a playlist of the most streamed songs globally and updates it on Fridays to reflect streaming data for the previous week, beginning on the preceding Friday and ending on Thursday.\n\nThis market will resolve according to the most-streamed song globally on Spotify for the week labeled September 18.\n\nIf Spotify does not release its top song for the week labeled September 18 by September 19, 2026, 11:59 PM ET, this market will default to \"Other\".\n\nThe resolution source for this market will be official information from Spotify. The weekly top songs chart can be found on open.spotify.com under the \"Charts\" heading.\n\nThis market and these products have not been endorsed by Spotify. Any references to Spotify, Spotify charts, streaming data, or any associated marks are descriptive only and do not indicate an endorsement of this product or any affiliation between Spotify and Polymarket. Spotify and related marks are the property of Spotify AB and its group companies.",
+   "outcomePrices": "[\"0.9965\", \"0.0035\"]",
+   "closed": false
+  },
+  "0x2cae90d2da8f782baee660a6749b33eb24e3f808986d41fc6607c5e5d971d7b9": {
+   "conditionId": "0x2cae90d2da8f782baee660a6749b33eb24e3f808986d41fc6607c5e5d971d7b9",
+   "question": "1st Half Spread: CA Osasuna (-1.5)",
+   "outcomes": "[\"CA Osasuna\", \"Rayo Vallecano de Madrid\"]",
+   "description": "In the upcoming La Liga game between CA Osasuna and Rayo Vallecano de Madrid, scheduled for September 19 at 8:00 AM ET: This market will resolve to \"CA Osasuna\" if CA Osasuna win the first half by 2 or more goals. Otherwise, this market will resolve to \"Rayo Vallecano de Madrid\". If the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50-50. This market refers only to the outcome within the first 45 minutes of regular play plus first-half stoppage time. Second-half goals, extra time, and penalty shoot-outs are excluded. The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.06\", \"0.94\"]",
+   "closed": false
+  },
+  "0x31a6a5a722d6be14a3ad1c84baf26fc58a8fb98a9f7e51946694fdb98aaa8fdf": {
+   "conditionId": "0x31a6a5a722d6be14a3ad1c84baf26fc58a8fb98a9f7e51946694fdb98aaa8fdf",
+   "question": "Exact Score: Paris FC 0 - 0 RC Strasbourg Alsace?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming Ligue 1 game between Paris FC and RC Strasbourg Alsace, scheduled for September 19, 2026 at 11:15 AM ET: This market will resolve based on the final score of the Paris FC vs. RC Strasbourg Alsace match originally scheduled for September 19, 2026 at 11:15 AM ET, considering only the result at the end of 90 minutes of regulation plus stoppage time; extra time and penalty shoot-outs are excluded. If the actual score is not one of the explicitly listed outcomes, the market resolves to \"Any Other Score.\" If the match is postponed, the market will remain open until it is completed; if it is canceled with no make-up game, the market resolves to \"0-0.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.052\", \"0.948\"]",
+   "closed": false
+  },
+  "0x3799525622a891dfd1291a79121a68384e3fa4f89b8ec2588397fcc84cd2bf04": {
+   "conditionId": "0x3799525622a891dfd1291a79121a68384e3fa4f89b8ec2588397fcc84cd2bf04",
+   "question": "Exact Score: RC Celta de Vigo 0 - 0 Real Racing Club?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming La Liga game between RC Celta de Vigo and Real Racing Club, scheduled for September 19, 2026 at 12:30 PM ET: This market will resolve based on the final score of the RC Celta de Vigo vs. Real Racing Club match originally scheduled for September 19, 2026 at 12:30 PM ET, considering only the result at the end of 90 minutes of regulation plus stoppage time; extra time and penalty shoot-outs are excluded. If the actual score is not one of the explicitly listed outcomes, the market resolves to \"Any Other Score.\" If the match is postponed, the market will remain open until it is completed; if it is canceled with no make-up game, the market resolves to \"0-0.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.052\", \"0.948\"]",
+   "closed": false
+  },
+  "0x380093b3fa091e2100700ea16943bcd0988472c5e107a0a34424988c9a1858c9": {
+   "conditionId": "0x380093b3fa091e2100700ea16943bcd0988472c5e107a0a34424988c9a1858c9",
+   "question": "1st Half Exact Score: CA Osasuna 0 - 0 Rayo Vallecano de Madrid?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming La Liga game between CA Osasuna and Rayo Vallecano de Madrid, scheduled for September 19, 2026 at 8:00 AM ET: This market will resolve based on the halftime score of the CA Osasuna vs. Rayo Vallecano de Madrid match originally scheduled for September 19, 2026 at 8:00 AM ET, considering only goals scored within the first 45 minutes of regular play plus first-half stoppage time; second-half goals, extra time, and penalty shoot-outs are excluded. If the actual halftime score is not one of the explicitly listed outcomes, the market resolves to \"Any Other Score.\" If the match is postponed, the market will remain open until it is completed; if it is canceled with no make-up game, the market resolves to \"0-0.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.31\", \"0.69\"]",
+   "closed": false
+  },
+  "0x399569f658a35a063f7eff7e6fa018eb6192b4a3266e9f0b36d613a0ce46eeb4": {
+   "conditionId": "0x399569f658a35a063f7eff7e6fa018eb6192b4a3266e9f0b36d613a0ce46eeb4",
+   "question": "Sao Paulo Open: Vendula Valdmannova vs Laura Pigossi",
+   "outcomes": "[\"Vendula Valdmannova\", \"Laura Pigossi\"]",
+   "description": "This market refers to the tennis match between Vendula Valdmannova and Laura Pigossi in the Sao Paulo Open, originally scheduled for September 14, 2026 at 9:00AM ET.\n\nThis market will resolve to 'Vendula Valdmannova' if Vendula Valdmannova advances against Laura Pigossi.\n\nThis market will resolve to 'Laura Pigossi' if Laura Pigossi advances against Vendula Valdmannova.\n\nIf the match is canceled (not played at all), ends in a tie, or a winner has not been determined by September 28, 2026, 11:59 PM ET (14 days after the scheduled start), this market will resolve to 50-50.\n\nIf the match begins but is not completed, and one player advances due to the opponent's retirement, default, or disqualification, this market will resolve to the player who advances.\n\nIf the match ends in a walkover (player withdraws before the start and the other advances automatically), this market will resolve to 50-50.\n\nThe primary resolution source will be official information from the WTA Tour. A consensus of credible reporting may also be used.",
+   "outcomePrices": "[\"0.745\", \"0.255\"]",
+   "closed": false
+  },
+  "0x3a32d04b0993e10abbceef8d0083e08082790fad1650ffe7d7a3863850e2b071": {
+   "conditionId": "0x3a32d04b0993e10abbceef8d0083e08082790fad1650ffe7d7a3863850e2b071",
+   "question": "Exact Score: Gimcheon Sangmu FC 0 - 0 Gangwon FC?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming K-League game between Gimcheon Sangmu FC and Gangwon FC, scheduled for September 13, 2026 at 3:30 AM ET: This market will resolve based on the final score of the Gimcheon Sangmu FC vs. Gangwon FC match originally scheduled for September 13, 2026 at 3:30 AM ET, considering only the result at the end of 90 minutes of regulation plus stoppage time; extra time and penalty shoot-outs are excluded. If the actual score is not one of the explicitly listed outcomes, the market resolves to \"Any Other Score.\" If the match is postponed, the market will remain open until it is completed; if it is canceled with no make-up game, the market resolves to \"0-0.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome.",
+   "outcomePrices": "[\"0\", \"1\"]",
+   "closed": true
+  },
+  "0x3c86c4b6eead4f942b31eb6773054f610f137f0c7c7f461899aaf34b5be7bc79": {
+   "conditionId": "0x3c86c4b6eead4f942b31eb6773054f610f137f0c7c7f461899aaf34b5be7bc79",
+   "question": "Spread: Racing Club de Lens (-1.5)",
+   "outcomes": "[\"Racing Club de Lens\", \"AS Monaco FC\"]",
+   "description": "In the upcoming Ligue 1 game, scheduled for September 18 at 2:45 PM ET:\n\nThis market will resolve to \"Racing Club de Lens\" if Racing Club de Lens win the game by 2 or more goals.\n\nOtherwise, this market will resolve to \"AS Monaco FC\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nThis market will resolve according to the official final score published on ligue1.com. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.115\", \"0.885\"]",
+   "closed": false
+  },
+  "0x42ff43f2bb23a7d2539039b2341b9cfba545f56d428d770b7ef666ea69450b35": {
+   "conditionId": "0x42ff43f2bb23a7d2539039b2341b9cfba545f56d428d770b7ef666ea69450b35",
+   "question": "Will \"BbY WOW - KAROL G, Judeline, rusowsky\" be the #1 US song this week?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "Spotify curates a playlist of the most streamed songs in the U.S. and updates it on Fridays to reflect streaming data for the previous week, beginning on the preceding Friday and ending on Thursday.\n\nThis market will resolve according to the most-streamed song in the U.S. on Spotify for the week labeled September 18.\n\nIf Spotify does not release its top song for the week labeled September 18 by September 19, 2026, 11:59 PM ET, this market will default to \"Other\".\n\nThe resolution source for this market will be official information from Spotify. The Weekly Top Songs - USA chart can be found on open.spotify.com under the \"Charts\" heading.\n\nThis market and these products have not been endorsed by Spotify. Any references to Spotify, Spotify charts, streaming data, or any associated marks are descriptive only and do not indicate an endorsement of this product or any affiliation between Spotify and Polymarket. Spotify and related marks are the property of Spotify AB and its group companies.",
+   "outcomePrices": "[\"0.003\", \"0.997\"]",
+   "closed": false
+  },
+  "0x431b618fc505ca2c9b0f15a0f8c2266f5375dd0a89ce9b9d2925b6f088e5ba83": {
+   "conditionId": "0x431b618fc505ca2c9b0f15a0f8c2266f5375dd0a89ce9b9d2925b6f088e5ba83",
+   "question": "Sao Paulo Open: Eva Lys vs Gabriela Ce",
+   "outcomes": "[\"Eva Lys\", \"Gabriela Ce\"]",
+   "description": "This market refers to the tennis match between Eva Lys and Gabriela Ce in the Sao Paulo Open, originally scheduled for September 14, 2026 at 9:00AM ET.\n\nThis market will resolve to 'Eva Lys' if Eva Lys advances against Gabriela Ce.\n\nThis market will resolve to 'Gabriela Ce' if Gabriela Ce advances against Eva Lys.\n\nIf the match is canceled (not played at all), ends in a tie, or a winner has not been determined by September 28, 2026, 11:59 PM ET (14 days after the scheduled start), this market will resolve to 50-50.\n\nIf the match begins but is not completed, and one player advances due to the opponent's retirement, default, or disqualification, this market will resolve to the player who advances.\n\nIf the match ends in a walkover (player withdraws before the start and the other advances automatically), this market will resolve to 50-50.\n\nThe primary resolution source will be official information from the WTA Tour. A consensus of credible reporting may also be used.",
+   "outcomePrices": "[\"0.724\", \"0.276\"]",
+   "closed": false
+  },
+  "0x439985afe9618727f91bf15e3bcfc404fc7431c7a7b97ae8944f9f29f6f77b4e": {
+   "conditionId": "0x439985afe9618727f91bf15e3bcfc404fc7431c7a7b97ae8944f9f29f6f77b4e",
+   "question": "FC Arda Kardzhali vs. PFC Cherno More Varna: O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Bulgaria Parva Liga game between FC Arda Kardzhali and PFC Cherno More Varna, scheduled for September 19 at 12:00 PM ET:\n\nThis market will resolve to \"Over\" if FC Arda Kardzhali and PFC Cherno More Varna combine to score 1 or more goals in this game.\n\nIf the combined total is less than 1, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on bfunion.bg. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.9\", \"0.1\"]",
+   "closed": false
+  },
+  "0x43a6c6b3c8996d96b60848d4908020e728f0483b7684ff4e96fc01d3eeb22c00": {
+   "conditionId": "0x43a6c6b3c8996d96b60848d4908020e728f0483b7684ff4e96fc01d3eeb22c00",
+   "question": "Exact Score: Cesena FC 0 - 0 US Cremonese?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming Serie B game between Cesena FC and US Cremonese, scheduled for September 12, 2026 at 1:30 PM ET: This market will resolve based on the final score of the Cesena FC vs. US Cremonese match originally scheduled for September 12, 2026 at 1:30 PM ET, considering only the result at the end of 90 minutes of regulation plus stoppage time; extra time and penalty shoot-outs are excluded. If the actual score is not one of the explicitly listed outcomes, the market resolves to \"Any Other Score.\" If the match is postponed, the market will remain open until it is completed; if it is canceled with no make-up game, the market resolves to \"0-0.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome.",
+   "outcomePrices": "[\"0\", \"1\"]",
+   "closed": true
+  },
+  "0x462435c4a88a81ac18cf32ac2424df0f922cf9e9af3a2831f43a2d66bbf53a91": {
+   "conditionId": "0x462435c4a88a81ac18cf32ac2424df0f922cf9e9af3a2831f43a2d66bbf53a91",
+   "question": "Spread: Stade Brestois 29 (-1.5)",
+   "outcomes": "[\"Stade Brestois 29\", \"AJ Auxerre\"]",
+   "description": "In the upcoming Ligue 1 game, scheduled for September 20 at 9:00 AM ET:\n\nThis market will resolve to \"Stade Brestois 29\" if Stade Brestois 29 win the game by 2 or more goals.\n\nOtherwise, this market will resolve to \"AJ Auxerre\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nThis market will resolve according to the official final score published on ligue1.com. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.195\", \"0.805\"]",
+   "closed": false
+  },
+  "0x46f9d1ae8195bd8c7b1414d297e35eaa863bd55560f368e3929484c33df52d60": {
+   "conditionId": "0x46f9d1ae8195bd8c7b1414d297e35eaa863bd55560f368e3929484c33df52d60",
+   "question": "Gimcheon Sangmu FC vs. Gangwon FC: O/U 5.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming K-League game between Gimcheon Sangmu FC and Gangwon FC, scheduled for September 13 at 3:30 AM ET:\n\nThis market will resolve to \"Over\" if Gimcheon Sangmu FC and Gangwon FC combine to score 6 or more goals in this game.\n\nIf the combined total is less than 6, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on kleague.com. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome.",
+   "outcomePrices": "[\"0\", \"1\"]",
+   "closed": true
+  },
+  "0x4ae365aa68115f7bdd6e21ba1bb6b74183e56e64328d85297a020318f2cbf248": {
+   "conditionId": "0x4ae365aa68115f7bdd6e21ba1bb6b74183e56e64328d85297a020318f2cbf248",
+   "question": "1st Half Exact Score: RC Celta de Vigo 0 - 0 Real Racing Club?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming La Liga game between RC Celta de Vigo and Real Racing Club, scheduled for September 19, 2026 at 12:30 PM ET: This market will resolve based on the halftime score of the RC Celta de Vigo vs. Real Racing Club match originally scheduled for September 19, 2026 at 12:30 PM ET, considering only goals scored within the first 45 minutes of regular play plus first-half stoppage time; second-half goals, extra time, and penalty shoot-outs are excluded. If the actual halftime score is not one of the explicitly listed outcomes, the market resolves to \"Any Other Score.\" If the match is postponed, the market will remain open until it is completed; if it is canceled with no make-up game, the market resolves to \"0-0.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.245\", \"0.755\"]",
+   "closed": false
+  },
+  "0x4d17e4e2e29637eebe53d9bdb637b4382cbaff062e076064960c766ba01a6e7c": {
+   "conditionId": "0x4d17e4e2e29637eebe53d9bdb637b4382cbaff062e076064960c766ba01a6e7c",
+   "question": "Caldas da Rainha: Completed Match: Noma Noha Akugue vs Malaika Rapolu",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "This market refers to the tennis match between Noma Noha Akugue and Malaika Rapolu in the Caldas da Rainha, originally scheduled for September 16, 2026 at 4:00AM ET. This market will resolve to \"Yes\" if all games and sets required to determine a match winner under governing body or event organizer rules are played to completion through normal play. Otherwise, if the match is not completed for any reason, it will resolve to \"No.\" If a forfeit of any kind occurs, including but not limited to a walkover or retirement, this market will resolve \"No.\" If the match is canceled (not played at all), ends in a tie, or a winner has not been determined by September 30, 2026, 11:59 PM ET (14 days after the scheduled start), this market will resolve to \"No.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, a consensus of credible reporting may be used instead.",
+   "outcomePrices": "[\"0.5\", \"0.5\"]",
+   "closed": false
+  },
+  "0x4f18cb9574e545d568679683a9906fee1c2aa71951e96039491e3eeb9c74a291": {
+   "conditionId": "0x4f18cb9574e545d568679683a9906fee1c2aa71951e96039491e3eeb9c74a291",
+   "question": "Halmstads BK vs. AIK: Halmstads BK 1st Half O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Allsvenskan game between Halmstads BK and AIK, scheduled for September 20 at 8:00 AM ET: This market will resolve to \"Over\" if Halmstads BK score 1 or more goals in the first half (first 45 minutes of regular play plus first-half stoppage time). If Halmstads BK score less than 1 goals in the first half, this market will resolve to \"Under\". This market is based solely on Halmstads BK's first-half score, not the combined score of both teams. If the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50-50. This market refers only to the outcome within the first 45 minutes of regular play plus first-half stoppage time. Second-half goals, extra time, and penalty shoot-outs are excluded. The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.5\", \"0.5\"]",
+   "closed": false
+  },
+  "0x50e76a61adb6552518b6ea5995d6fd5bdcbc3747dae663ed75dad45264a5b8be": {
+   "conditionId": "0x50e76a61adb6552518b6ea5995d6fd5bdcbc3747dae663ed75dad45264a5b8be",
+   "question": "Manchester United FC vs. Brighton & Hove Albion FC: O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming EFL Cup (Carabao Cup) game between Manchester United FC and Brighton & Hove Albion FC, scheduled for September 16 at 3:00 PM ET:\n\nThis market will resolve to \"Over\" if Manchester United FC and Brighton & Hove Albion FC combine to score 1 or more goals in this game.\n\nIf the combined total is less than 1, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on efl.com. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.9715\", \"0.0285\"]",
+   "closed": false
+  },
+  "0x52607f08e6d8a7c8ab4500e153bca6647d115c370882177be58738729f3ead8f": {
+   "conditionId": "0x52607f08e6d8a7c8ab4500e153bca6647d115c370882177be58738729f3ead8f",
+   "question": "Caldas da Rainha: Kylie Collins vs Kayla Cross",
+   "outcomes": "[\"Kylie Collins\", \"Kayla Cross\"]",
+   "description": "This market refers to the tennis match between Kylie Collins and Kayla Cross in the Caldas da Rainha, originally scheduled for September 16, 2026 at 4:00AM ET.\n\nThis market will resolve to 'Kylie Collins' if Kylie Collins advances against Kayla Cross.\n\nThis market will resolve to 'Kayla Cross' if Kayla Cross advances against Kylie Collins.\n\nIf the match is canceled (not played at all), ends in a tie, or a winner has not been determined by September 30, 2026, 11:59 PM ET (14 days after the scheduled start), this market will resolve to 50-50.\n\nIf the match begins but is not completed, and one player advances due to the opponent's retirement, default, or disqualification, this market will resolve to the player who advances.\n\nIf the match ends in a walkover (player withdraws before the start and the other advances automatically), this market will resolve to 50-50.\n\nThe primary resolution source will be official information from the WTA Tour. A consensus of credible reporting may also be used.",
+   "outcomePrices": "[\"0.5\", \"0.5\"]",
+   "closed": true
+  },
+  "0x546ed8e1c45e5ec189386b5fb806c3d871717849b39ca572680b73abfa71620e": {
+   "conditionId": "0x546ed8e1c45e5ec189386b5fb806c3d871717849b39ca572680b73abfa71620e",
+   "question": "Exact Score: CA Osasuna 0 - 0 Rayo Vallecano de Madrid?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming La Liga game between CA Osasuna and Rayo Vallecano de Madrid, scheduled for September 19, 2026 at 8:00 AM ET: This market will resolve based on the final score of the CA Osasuna vs. Rayo Vallecano de Madrid match originally scheduled for September 19, 2026 at 8:00 AM ET, considering only the result at the end of 90 minutes of regulation plus stoppage time; extra time and penalty shoot-outs are excluded. If the actual score is not one of the explicitly listed outcomes, the market resolves to \"Any Other Score.\" If the match is postponed, the market will remain open until it is completed; if it is canceled with no make-up game, the market resolves to \"0-0.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.085\", \"0.915\"]",
+   "closed": false
+  },
+  "0x5897a2d9ef835c4b0a511b73adaae816815bff4a19e81bba9727c9141e762261": {
+   "conditionId": "0x5897a2d9ef835c4b0a511b73adaae816815bff4a19e81bba9727c9141e762261",
+   "question": "1st Half Spread: Real Racing Club (-1.5)",
+   "outcomes": "[\"Real Racing Club\", \"RC Celta de Vigo\"]",
+   "description": "In the upcoming La Liga game between RC Celta de Vigo and Real Racing Club, scheduled for September 19 at 12:30 PM ET: This market will resolve to \"Real Racing Club\" if Real Racing Club win the first half by 2 or more goals. Otherwise, this market will resolve to \"RC Celta de Vigo\". If the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50-50. This market refers only to the outcome within the first 45 minutes of regular play plus first-half stoppage time. Second-half goals, extra time, and penalty shoot-outs are excluded. The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.26\", \"0.74\"]",
+   "closed": false
+  },
+  "0x5af83bbb34a8eb9eb19634a1e647f4844d982397330f1f55617445e9f85dc82a": {
+   "conditionId": "0x5af83bbb34a8eb9eb19634a1e647f4844d982397330f1f55617445e9f85dc82a",
+   "question": "Spread: CA Osasuna (-2.5)",
+   "outcomes": "[\"CA Osasuna\", \"Club Atl\u00e9tico de Madrid\"]",
+   "description": "In the upcoming La Liga game, scheduled for September 16 at 1:00 PM ET:\n\nThis market will resolve to \"CA Osasuna\" if CA Osasuna win the game by 3 or more goals.\n\nOtherwise, this market will resolve to \"Club Atl\u00e9tico de Madrid\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nThis market will resolve according to the official final score published on laliga.com. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.0005\", \"0.9995\"]",
+   "closed": false
+  },
+  "0x5d22159e9fbc4dbe56cbc28df6e9a2ad9ab90a212f821d790349589f0ee64549": {
+   "conditionId": "0x5d22159e9fbc4dbe56cbc28df6e9a2ad9ab90a212f821d790349589f0ee64549",
+   "question": "Will \"Earrings - Malcolm Todd\" be the #1 song this week?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "Spotify curates a playlist of the most streamed songs globally and updates it on Fridays to reflect streaming data for the previous week, beginning on the preceding Friday and ending on Thursday.\n\nThis market will resolve according to the most-streamed song globally on Spotify for the week labeled September 18.\n\nIf Spotify does not release its top song for the week labeled September 18 by September 19, 2026, 11:59 PM ET, this market will default to \"Other\".\n\nThe resolution source for this market will be official information from Spotify. The weekly top songs chart can be found on open.spotify.com under the \"Charts\" heading.\n\nThis market and these products have not been endorsed by Spotify. Any references to Spotify, Spotify charts, streaming data, or any associated marks are descriptive only and do not indicate an endorsement of this product or any affiliation between Spotify and Polymarket. Spotify and related marks are the property of Spotify AB and its group companies.",
+   "outcomePrices": "[\"0.0005\", \"0.9995\"]",
+   "closed": false
+  },
+  "0x5dc241b17fde4649ec606d466c31004f0354c438b11fcd07a47b9e237076dd37": {
+   "conditionId": "0x5dc241b17fde4649ec606d466c31004f0354c438b11fcd07a47b9e237076dd37",
+   "question": "Exact Score: AJ Auxerre 0 - 0 Stade Brestois 29?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming Ligue 1 game between AJ Auxerre and Stade Brestois 29, scheduled for September 20, 2026 at 9:00 AM ET: This market will resolve based on the final score of the AJ Auxerre vs. Stade Brestois 29 match originally scheduled for September 20, 2026 at 9:00 AM ET, considering only the result at the end of 90 minutes of regulation plus stoppage time; extra time and penalty shoot-outs are excluded. If the actual score is not one of the explicitly listed outcomes, the market resolves to \"Any Other Score.\" If the match is postponed, the market will remain open until it is completed; if it is canceled with no make-up game, the market resolves to \"0-0.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.06\", \"0.94\"]",
+   "closed": false
+  },
+  "0x62ebb2db351a4d24fe09ea3489902dadbfae6c6d15a7d583da9b37eae09751f3": {
+   "conditionId": "0x62ebb2db351a4d24fe09ea3489902dadbfae6c6d15a7d583da9b37eae09751f3",
+   "question": "1st Half Spread: Stade Brestois 29 (-1.5)",
+   "outcomes": "[\"Stade Brestois 29\", \"AJ Auxerre\"]",
+   "description": "In the upcoming Ligue 1 game between AJ Auxerre and Stade Brestois 29, scheduled for September 20 at 9:00 AM ET: This market will resolve to \"Stade Brestois 29\" if Stade Brestois 29 win the first half by 2 or more goals. Otherwise, this market will resolve to \"AJ Auxerre\". If the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50-50. This market refers only to the outcome within the first 45 minutes of regular play plus first-half stoppage time. Second-half goals, extra time, and penalty shoot-outs are excluded. The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.065\", \"0.935\"]",
+   "closed": false
+  },
+  "0x6341933d937c41115b8a73d6e8e759d0a8a2ba640bb08483d9f209cb9cbfdef9": {
+   "conditionId": "0x6341933d937c41115b8a73d6e8e759d0a8a2ba640bb08483d9f209cb9cbfdef9",
+   "question": "Gwangju FC vs. FC Anyang: O/U 5.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming K-League game between Gwangju FC and FC Anyang, scheduled for September 13 at 6:00 AM ET:\n\nThis market will resolve to \"Over\" if Gwangju FC and FC Anyang combine to score 6 or more goals in this game.\n\nIf the combined total is less than 6, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on kleague.com. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome.",
+   "outcomePrices": "[\"0\", \"1\"]",
+   "closed": true
+  },
+  "0x64e471ceffede099b7d3f9dc36cc6253623a5e5e473324d2fef59049fd67b03d": {
+   "conditionId": "0x64e471ceffede099b7d3f9dc36cc6253623a5e5e473324d2fef59049fd67b03d",
+   "question": "Guadalajara Open Akron: Completed Match: Zeynep Sonmez vs Iva Jovic",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "This market refers to the tennis match between Zeynep Sonmez and Iva Jovic in the Guadalajara Open Akron, originally scheduled for September 16, 2026 at 12:00PM ET. This market will resolve to \"Yes\" if all games and sets required to determine a match winner under governing body or event organizer rules are played to completion through normal play. Otherwise, if the match is not completed for any reason, it will resolve to \"No.\" If a forfeit of any kind occurs, including but not limited to a walkover or retirement, this market will resolve \"No.\" If the match is canceled (not played at all), ends in a tie, or a winner has not been determined by September 30, 2026, 11:59 PM ET (14 days after the scheduled start), this market will resolve to \"No.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, a consensus of credible reporting may be used instead.",
+   "outcomePrices": "[\"0.745\", \"0.255\"]",
+   "closed": false
+  },
+  "0x6fd5762927157795174e9cfafa169af4823edb7c2920c786db1d26ad65385514": {
+   "conditionId": "0x6fd5762927157795174e9cfafa169af4823edb7c2920c786db1d26ad65385514",
+   "question": "1st Half Spread: Racing Club de Lens (-1.5)",
+   "outcomes": "[\"Racing Club de Lens\", \"AS Monaco FC\"]",
+   "description": "In the upcoming Ligue 1 game between AS Monaco FC and Racing Club de Lens, scheduled for September 18 at 2:45 PM ET: This market will resolve to \"Racing Club de Lens\" if Racing Club de Lens win the first half by 2 or more goals. Otherwise, this market will resolve to \"AS Monaco FC\". If the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50-50. This market refers only to the outcome within the first 45 minutes of regular play plus first-half stoppage time. Second-half goals, extra time, and penalty shoot-outs are excluded. The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.055\", \"0.945\"]",
+   "closed": false
+  },
+  "0x7843a7c32737a83cbde0a8d930376205fbbf6d61c21e0196fba640dd5d8680d1": {
+   "conditionId": "0x7843a7c32737a83cbde0a8d930376205fbbf6d61c21e0196fba640dd5d8680d1",
+   "question": "LD Alajuelense vs. Inter San Carlos: Inter San Carlos O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Liga Promerica game between LD Alajuelense and Inter San Carlos, scheduled for September 20 at 7:00 PM ET: This market will resolve to \"Over\" if Inter San Carlos score 1 or more goals within the first 90 minutes of regular play plus stoppage time. If Inter San Carlos score less than 1 goals within the first 90 minutes of regular play plus stoppage time, this market will resolve to \"Under\". This market is based solely on Inter San Carlos's score, not the combined score of both teams. If the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50-50. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time. Extra time and penalty shoot-outs are excluded. The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.64\", \"0.36\"]",
+   "closed": false
+  },
+  "0x7acce6fe541c9b6923055ecfb09ea4ccb6ca232601dedf5e22ebd7db8282f40d": {
+   "conditionId": "0x7acce6fe541c9b6923055ecfb09ea4ccb6ca232601dedf5e22ebd7db8282f40d",
+   "question": "1st Half Exact Score: AJ Auxerre 0 - 0 Stade Brestois 29?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming Ligue 1 game between AJ Auxerre and Stade Brestois 29, scheduled for September 20, 2026 at 9:00 AM ET: This market will resolve based on the halftime score of the AJ Auxerre vs. Stade Brestois 29 match originally scheduled for September 20, 2026 at 9:00 AM ET, considering only goals scored within the first 45 minutes of regular play plus first-half stoppage time; second-half goals, extra time, and penalty shoot-outs are excluded. If the actual halftime score is not one of the explicitly listed outcomes, the market resolves to \"Any Other Score.\" If the match is postponed, the market will remain open until it is completed; if it is canceled with no make-up game, the market resolves to \"0-0.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.325\", \"0.675\"]",
+   "closed": false
+  },
+  "0x7d0aec7b921746c794aadf1a82025fe28a4ccf36584124874ac32df2e16343c2": {
+   "conditionId": "0x7d0aec7b921746c794aadf1a82025fe28a4ccf36584124874ac32df2e16343c2",
+   "question": "Guadalajara Open Akron: Zeynep Sonmez vs Iva Jovic",
+   "outcomes": "[\"Zeynep Sonmez\", \"Iva Jovic\"]",
+   "description": "This market refers to the tennis match between Zeynep Sonmez and Iva Jovic in the Guadalajara Open Akron, originally scheduled for September 16, 2026 at 12:00PM ET.\n\nThis market will resolve to 'Zeynep Sonmez' if Zeynep Sonmez advances against Iva Jovic.\n\nThis market will resolve to 'Iva Jovic' if Iva Jovic advances against Zeynep Sonmez.\n\nIf the match is canceled (not played at all), ends in a tie, or a winner has not been determined by September 30, 2026, 11:59 PM ET (14 days after the scheduled start), this market will resolve to 50-50.\n\nIf the match begins but is not completed, and one player advances due to the opponent's retirement, default, or disqualification, this market will resolve to the player who advances.\n\nIf the match ends in a walkover (player withdraws before the start and the other advances automatically), this market will resolve to 50-50.\n\nThe primary resolution source will be official information from the WTA Tour. A consensus of credible reporting may also be used.",
+   "outcomePrices": "[\"0.215\", \"0.785\"]",
+   "closed": false
+  },
+  "0x7f3b99492f9bd4e4da6b024a142ab67c03984c0e7312ad30a268497cf16a57ec": {
+   "conditionId": "0x7f3b99492f9bd4e4da6b024a142ab67c03984c0e7312ad30a268497cf16a57ec",
+   "question": "Exact Score: Leeds United FC 0 - 0 Crystal Palace FC?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming Premier League game between Leeds United FC and Crystal Palace FC, scheduled for September 20, 2026 at 9:00 AM ET: This market will resolve based on the final score of the Leeds United FC vs. Crystal Palace FC match originally scheduled for September 20, 2026 at 9:00 AM ET, considering only the result at the end of 90 minutes of regulation plus stoppage time; extra time and penalty shoot-outs are excluded. If the actual score is not one of the explicitly listed outcomes, the market resolves to \"Any Other Score.\" If the match is postponed, the market will remain open until it is completed; if it is canceled with no make-up game, the market resolves to \"0-0.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.065\", \"0.935\"]",
+   "closed": false
+  },
+  "0x81a3904490430da65fe8222a32dcc927c28eb63088ba0613036ab54a0b0ba7ca": {
+   "conditionId": "0x81a3904490430da65fe8222a32dcc927c28eb63088ba0613036ab54a0b0ba7ca",
+   "question": "M25 Nevers, Main Draw: Completed Match: Robin Eldin vs Luke Hooper",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "This market refers to the tennis match between Robin Eldin and Luke Hooper in the M25 Nevers, Main Draw, originally scheduled for September 16, 2026 at 11:15AM ET. This market will resolve to \"Yes\" if all games and sets required to determine a match winner under governing body or event organizer rules are played to completion through normal play. Otherwise, if the match is not completed for any reason, it will resolve to \"No.\" If a forfeit of any kind occurs, including but not limited to a walkover or retirement, this market will resolve \"No.\" If the match is canceled (not played at all), ends in a tie, or a winner has not been determined by September 30, 2026, 11:59 PM ET (14 days after the scheduled start), this market will resolve to \"No.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, a consensus of credible reporting may be used instead.",
+   "outcomePrices": "[\"0.5\", \"0.5\"]",
+   "closed": false
+  },
+  "0x85b07e34fe59e397e7469d5fb700cf25bac187732b3221a8b6cb081189965212": {
+   "conditionId": "0x85b07e34fe59e397e7469d5fb700cf25bac187732b3221a8b6cb081189965212",
+   "question": "M25 Nevers: Robin Eldin vs Luke Hooper",
+   "outcomes": "[\"Robin Eldin\", \"Luke Hooper\"]",
+   "description": "This market refers to the tennis match between Robin Eldin and Luke Hooper in the M25 Nevers, Main Draw, originally scheduled for September 16, 2026 at 11:15AM ET.\n\nThis market will resolve to 'Robin Eldin' if Robin Eldin advances against Luke Hooper.\n\nThis market will resolve to 'Luke Hooper' if Luke Hooper advances against Robin Eldin.\n\nIf the match is canceled (not played at all), ends in a tie, or a winner has not been determined by September 30, 2026, 11:59 PM ET (14 days after the scheduled start), this market will resolve to 50-50.\n\nIf the match begins but is not completed, and one player advances due to the opponent's retirement, default, or disqualification, this market will resolve to the player who advances.\n\nIf the match ends in a walkover (player withdraws before the start and the other advances automatically), this market will resolve to 50-50.\n\nThe primary resolution source will be official information from the International Tennis Federation (ITF). A consensus of credible reporting may also be used.",
+   "outcomePrices": "[\"0.575\", \"0.425\"]",
+   "closed": false
+  },
+  "0x8b275c1f0f8d60b0862ad6476ef03d9378bef9b0895dd9b92ef9d47a3c48c2a0": {
+   "conditionId": "0x8b275c1f0f8d60b0862ad6476ef03d9378bef9b0895dd9b92ef9d47a3c48c2a0",
+   "question": "Sao Paulo Open: Completed Match: Vendula Valdmannova vs Laura Pigossi",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "This market refers to the tennis match between Vendula Valdmannova and Laura Pigossi in the Sao Paulo Open, originally scheduled for September 14, 2026 at 9:00AM ET. This market will resolve to \"Yes\" if all games and sets required to determine a match winner under governing body or event organizer rules are played to completion through normal play. Otherwise, if the match is not completed for any reason, it will resolve to \"No.\" If a forfeit of any kind occurs, including but not limited to a walkover or retirement, this market will resolve \"No.\" If the match is canceled (not played at all), ends in a tie, or a winner has not been determined by September 28, 2026, 11:59 PM ET (14 days after the scheduled start), this market will resolve to \"No.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, a consensus of credible reporting may be used instead.",
+   "outcomePrices": "[\"0.9845\", \"0.0155\"]",
+   "closed": false
+  },
+  "0x8d8febf36546b368b53b0adb45e7a682ae0f95573f7738bbcb34295230811353": {
+   "conditionId": "0x8d8febf36546b368b53b0adb45e7a682ae0f95573f7738bbcb34295230811353",
+   "question": "Exact Score: Nottingham Forest FC 0 - 0 Coventry City FC?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming Premier League game between Nottingham Forest FC and Coventry City FC, scheduled for September 19, 2026 at 12:30 PM ET: This market will resolve based on the final score of the Nottingham Forest FC vs. Coventry City FC match originally scheduled for September 19, 2026 at 12:30 PM ET, considering only the result at the end of 90 minutes of regulation plus stoppage time; extra time and penalty shoot-outs are excluded. If the actual score is not one of the explicitly listed outcomes, the market resolves to \"Any Other Score.\" If the match is postponed, the market will remain open until it is completed; if it is canceled with no make-up game, the market resolves to \"0-0.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.065\", \"0.935\"]",
+   "closed": false
+  },
+  "0x90db3a991e19df2215184df110e38db8135e23301ecb251246f6b76af80978ba": {
+   "conditionId": "0x90db3a991e19df2215184df110e38db8135e23301ecb251246f6b76af80978ba",
+   "question": "FC Internazionale Milano vs. BK H\u00e4cken FF: FC Internazionale Milano 1st Half O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming UEFA Women's Champions League game between FC Internazionale Milano and BK H\u00e4cken FF, scheduled for September 22 at 12:45 PM ET: This market will resolve to \"Over\" if FC Internazionale Milano score 1 or more goals in the first half (first 45 minutes of regular play plus first-half stoppage time). If FC Internazionale Milano score less than 1 goals in the first half, this market will resolve to \"Under\". This market is based solely on FC Internazionale Milano's first-half score, not the combined score of both teams. If the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50-50. This market refers only to the outcome within the first 45 minutes of regular play plus first-half stoppage time. Second-half goals, extra time, and penalty shoot-outs are excluded. The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.5\", \"0.5\"]",
+   "closed": false
+  },
+  "0x91b878e0a865df27a35b7c24fca92c498d8587a1e702972e4a2df7acf7fa73fe": {
+   "conditionId": "0x91b878e0a865df27a35b7c24fca92c498d8587a1e702972e4a2df7acf7fa73fe",
+   "question": "Manchester United FC vs. Brighton & Hove Albion FC: Brighton & Hove Albion FC O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming EFL Cup (Carabao Cup) game between Manchester United FC and Brighton & Hove Albion FC, scheduled for September 16 at 3:00 PM ET: This market will resolve to \"Over\" if Brighton & Hove Albion FC score 1 or more goals within the first 90 minutes of regular play plus stoppage time. If Brighton & Hove Albion FC score less than 1 goals within the first 90 minutes of regular play plus stoppage time, this market will resolve to \"Under\". This market is based solely on Brighton & Hove Albion FC's score, not the combined score of both teams. If the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50-50. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time. Extra time and penalty shoot-outs are excluded. The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.755\", \"0.245\"]",
+   "closed": false
+  },
+  "0x948d3b549a067888a6b7143e60275eebf4a448a2a9c89065ada426a8c04ee29c": {
+   "conditionId": "0x948d3b549a067888a6b7143e60275eebf4a448a2a9c89065ada426a8c04ee29c",
+   "question": "CA Lan\u00fas vs. Estudiantes de La Plata: Estudiantes de La Plata O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Primera Divisi\u00f3n Argentina game between CA Lan\u00fas and Estudiantes de La Plata, scheduled for September 21 at 8:15 PM ET: This market will resolve to \"Over\" if Estudiantes de La Plata score 1 or more goals within the first 90 minutes of regular play plus stoppage time. If Estudiantes de La Plata score less than 1 goals within the first 90 minutes of regular play plus stoppage time, this market will resolve to \"Under\". This market is based solely on Estudiantes de La Plata's score, not the combined score of both teams. If the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50-50. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time. Extra time and penalty shoot-outs are excluded. The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.585\", \"0.415\"]",
+   "closed": false
+  },
+  "0x9964da735d1eb9ade546f6e108b34f5ea7e4b575a9c24f7224e77294c15ae5ff": {
+   "conditionId": "0x9964da735d1eb9ade546f6e108b34f5ea7e4b575a9c24f7224e77294c15ae5ff",
+   "question": "FC Lahti vs. FF Jaro: FF Jaro O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Veikkausliiga game between FC Lahti and FF Jaro, scheduled for September 18 at 11:00 AM ET: This market will resolve to \"Over\" if FF Jaro score 1 or more goals within the first 90 minutes of regular play plus stoppage time. If FF Jaro score less than 1 goals within the first 90 minutes of regular play plus stoppage time, this market will resolve to \"Under\". This market is based solely on FF Jaro's score, not the combined score of both teams. If the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50-50. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time. Extra time and penalty shoot-outs are excluded. The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.61\", \"0.39\"]",
+   "closed": false
+  },
+  "0x9a4a618b3eabf961c4f9860db516f5b10740bdf2640d2cb59c767b021f0f80c7": {
+   "conditionId": "0x9a4a618b3eabf961c4f9860db516f5b10740bdf2640d2cb59c767b021f0f80c7",
+   "question": "1st Half Spread: M\u00e1laga CF (-1.5)",
+   "outcomes": "[\"M\u00e1laga CF\", \"Villarreal CF\"]",
+   "description": "In the upcoming La Liga game between M\u00e1laga CF and Villarreal CF, scheduled for September 17 at 3:30 PM ET: This market will resolve to \"M\u00e1laga CF\" if M\u00e1laga CF win the first half by 2 or more goals. Otherwise, this market will resolve to \"Villarreal CF\". If the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50-50. This market refers only to the outcome within the first 45 minutes of regular play plus first-half stoppage time. Second-half goals, extra time, and penalty shoot-outs are excluded. The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.06\", \"0.94\"]",
+   "closed": false
+  },
+  "0x9af1deb33a2f6eb10687d619563eaf5027e96770dc63811092004ca510293fe6": {
+   "conditionId": "0x9af1deb33a2f6eb10687d619563eaf5027e96770dc63811092004ca510293fe6",
+   "question": "Exact Score: Gwangju FC 0 - 0 FC Anyang?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming K-League game between Gwangju FC and FC Anyang, scheduled for September 13, 2026 at 6:00 AM ET: This market will resolve based on the final score of the Gwangju FC vs. FC Anyang match originally scheduled for September 13, 2026 at 6:00 AM ET, considering only the result at the end of 90 minutes of regulation plus stoppage time; extra time and penalty shoot-outs are excluded. If the actual score is not one of the explicitly listed outcomes, the market resolves to \"Any Other Score.\" If the match is postponed, the market will remain open until it is completed; if it is canceled with no make-up game, the market resolves to \"0-0.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome.",
+   "outcomePrices": "[\"0\", \"1\"]",
+   "closed": true
+  },
+  "0x9de3a13e5978ff44b424e865215aedc03223fee9ef8f4a206f2ec75de061b533": {
+   "conditionId": "0x9de3a13e5978ff44b424e865215aedc03223fee9ef8f4a206f2ec75de061b533",
+   "question": "Cardiff City FC vs. Charlton Athletic FC: O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming EFL Championship game between Cardiff City FC and Charlton Athletic FC, scheduled for September 19 at 7:30 AM ET:\n\nThis market will resolve to \"Over\" if Cardiff City FC and Charlton Athletic FC combine to score 1 or more goals in this game.\n\nIf the combined total is less than 1, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on efl.com. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.945\", \"0.055\"]",
+   "closed": false
+  },
+  "0xa28b27fc96884a23a7f8131d163ab7dd7dbc6efbaa59e6f73a9bcd4b25e23d7e": {
+   "conditionId": "0xa28b27fc96884a23a7f8131d163ab7dd7dbc6efbaa59e6f73a9bcd4b25e23d7e",
+   "question": "Will \"Earrings - Malcolm Todd\" be the #1 US song this week?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "Spotify curates a playlist of the most streamed songs in the U.S. and updates it on Fridays to reflect streaming data for the previous week, beginning on the preceding Friday and ending on Thursday.\n\nThis market will resolve according to the most-streamed song in the U.S. on Spotify for the week labeled September 18.\n\nIf Spotify does not release its top song for the week labeled September 18 by September 19, 2026, 11:59 PM ET, this market will default to \"Other\".\n\nThe resolution source for this market will be official information from Spotify. The Weekly Top Songs - USA chart can be found on open.spotify.com under the \"Charts\" heading.\n\nThis market and these products have not been endorsed by Spotify. Any references to Spotify, Spotify charts, streaming data, or any associated marks are descriptive only and do not indicate an endorsement of this product or any affiliation between Spotify and Polymarket. Spotify and related marks are the property of Spotify AB and its group companies.",
+   "outcomePrices": "[\"0.003\", \"0.997\"]",
+   "closed": false
+  },
+  "0xa94f834039824a5793172b50dceca99a0ba689dc6bf0d6b694891ffb7e577f56": {
+   "conditionId": "0xa94f834039824a5793172b50dceca99a0ba689dc6bf0d6b694891ffb7e577f56",
+   "question": "Vit\u00f3ria SC vs. Moreirense FC: O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Primeira Liga game between Vit\u00f3ria SC and Moreirense FC, scheduled for September 20 at 10:30 AM ET:\n\nThis market will resolve to \"Over\" if Vit\u00f3ria SC and Moreirense FC combine to score 1 or more goals in this game.\n\nIf the combined total is less than 1, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on ligaportugal.pt. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.93\", \"0.07\"]",
+   "closed": false
+  },
+  "0xb2f9c8f1fefa4465204ac9797ae5a8f10f7432f9cf84ee5257e8db4fc2eb595e": {
+   "conditionId": "0xb2f9c8f1fefa4465204ac9797ae5a8f10f7432f9cf84ee5257e8db4fc2eb595e",
+   "question": "FC Viktoria Plze\u0148 vs. RU Saint-Gilloise: O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming UEFA Europa League game between FC Viktoria Plze\u0148 and RU Saint-Gilloise, scheduled for September 17 at 3:00 PM ET:\n\nThis market will resolve to \"Over\" if FC Viktoria Plze\u0148 and RU Saint-Gilloise combine to score 1 or more goals in this game.\n\nIf the combined total is less than 1, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on uefa.com. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.94\", \"0.06\"]",
+   "closed": false
+  },
+  "0xb455dd2876eb23ffce318cce7c5dd146a584fcbe2156bfd2df5a2420079773f9": {
+   "conditionId": "0xb455dd2876eb23ffce318cce7c5dd146a584fcbe2156bfd2df5a2420079773f9",
+   "question": "Spread: CA Osasuna (-1.5)",
+   "outcomes": "[\"CA Osasuna\", \"Rayo Vallecano de Madrid\"]",
+   "description": "In the upcoming La Liga game, scheduled for September 19 at 8:00 AM ET:\n\nThis market will resolve to \"CA Osasuna\" if CA Osasuna win the game by 2 or more goals.\n\nOtherwise, this market will resolve to \"Rayo Vallecano de Madrid\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nThis market will resolve according to the official final score published on laliga.com. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.19\", \"0.81\"]",
+   "closed": false
+  },
+  "0xbe95a99847666a9327566e1363db3108b2cbb39fcec3e83102508f5962526570": {
+   "conditionId": "0xbe95a99847666a9327566e1363db3108b2cbb39fcec3e83102508f5962526570",
+   "question": "Sao Paulo Open: Completed Match: Eva Lys vs Gabriela Ce",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "This market refers to the tennis match between Eva Lys and Gabriela Ce in the Sao Paulo Open, originally scheduled for September 14, 2026 at 9:00AM ET. This market will resolve to \"Yes\" if all games and sets required to determine a match winner under governing body or event organizer rules are played to completion through normal play. Otherwise, if the match is not completed for any reason, it will resolve to \"No.\" If a forfeit of any kind occurs, including but not limited to a walkover or retirement, this market will resolve \"No.\" If the match is canceled (not played at all), ends in a tie, or a winner has not been determined by September 28, 2026, 11:59 PM ET (14 days after the scheduled start), this market will resolve to \"No.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, a consensus of credible reporting may be used instead.",
+   "outcomePrices": "[\"0.5\", \"0.5\"]",
+   "closed": false
+  },
+  "0xc1bd0a1a18ce302d2886cf4e8a6fccce630be3b9b8084cc53e911261e43ef1d4": {
+   "conditionId": "0xc1bd0a1a18ce302d2886cf4e8a6fccce630be3b9b8084cc53e911261e43ef1d4",
+   "question": "Halmstads BK vs. AIK: O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Allsvenskan game between Halmstads BK and AIK, scheduled for September 20 at 8:00 AM ET:\n\nThis market will resolve to \"Over\" if Halmstads BK and AIK combine to score 1 or more goals in this game.\n\nIf the combined total is less than 1, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on allsvenskan.se. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.94\", \"0.06\"]",
+   "closed": false
+  },
+  "0xc6f82e49b1c1d110b1c468a8d91dacd48c45e5e5790769f9d7a44b9b97fdd36f": {
+   "conditionId": "0xc6f82e49b1c1d110b1c468a8d91dacd48c45e5e5790769f9d7a44b9b97fdd36f",
+   "question": "Persita Tangerang vs. Java United FC: O/U 5.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Indonesia Liga 1 game between Persita Tangerang and Java United FC, scheduled for September 13 at 4:30 AM ET:\n\nThis market will resolve to \"Over\" if Persita Tangerang and Java United FC combine to score 6 or more goals in this game.\n\nIf the combined total is less than 6, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on ileague.id. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0\", \"1\"]",
+   "closed": true
+  },
+  "0xcba42ca23ed3f4fe0a56c34f86bd5cf9de46f2547168bbacd0893c96f6bc08d6": {
+   "conditionId": "0xcba42ca23ed3f4fe0a56c34f86bd5cf9de46f2547168bbacd0893c96f6bc08d6",
+   "question": "CA Lan\u00fas vs. Estudiantes de La Plata: O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Primera Divisi\u00f3n Argentina game between CA Lan\u00fas and Estudiantes de La Plata, scheduled for September 21 at 8:15 PM ET:\n\nThis market will resolve to \"Over\" if CA Lan\u00fas and Estudiantes de La Plata combine to score 1 or more goals in this game.\n\nIf the combined total is less than 1, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on afa.com.ar. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.875\", \"0.125\"]",
+   "closed": false
+  },
+  "0xce7c95c0f58dc04894a6bd0a24ac3b169abb20021d9509b36d80d319a5540d03": {
+   "conditionId": "0xce7c95c0f58dc04894a6bd0a24ac3b169abb20021d9509b36d80d319a5540d03",
+   "question": "Caldas da Rainha: Noma Noha Akugue vs Malaika Rapolu",
+   "outcomes": "[\"Noma Noha Akugue\", \"Malaika Rapolu\"]",
+   "description": "This market refers to the tennis match between Noma Noha Akugue and Malaika Rapolu in the Caldas da Rainha, originally scheduled for September 16, 2026 at 4:00AM ET.\n\nThis market will resolve to 'Noma Noha Akugue' if Noma Noha Akugue advances against Malaika Rapolu.\n\nThis market will resolve to 'Malaika Rapolu' if Malaika Rapolu advances against Noma Noha Akugue.\n\nIf the match is canceled (not played at all), ends in a tie, or a winner has not been determined by September 30, 2026, 11:59 PM ET (14 days after the scheduled start), this market will resolve to 50-50.\n\nIf the match begins but is not completed, and one player advances due to the opponent's retirement, default, or disqualification, this market will resolve to the player who advances.\n\nIf the match ends in a walkover (player withdraws before the start and the other advances automatically), this market will resolve to 50-50.\n\nThe primary resolution source will be official information from the WTA Tour. A consensus of credible reporting may also be used.",
+   "outcomePrices": "[\"0.58\", \"0.42\"]",
+   "closed": false
+  },
+  "0xd0568acd54e4a38da9d430ce51182cb700d32fa009c61ecc8addfdf6c30283b5": {
+   "conditionId": "0xd0568acd54e4a38da9d430ce51182cb700d32fa009c61ecc8addfdf6c30283b5",
+   "question": "FC Lahti vs. FF Jaro: O/U 0.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Veikkausliiga game between FC Lahti and FF Jaro, scheduled for September 18 at 11:00 AM ET:\n\nThis market will resolve to \"Over\" if FC Lahti and FF Jaro combine to score 1 or more goals in this game.\n\nIf the combined total is less than 1, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on veikkausliiga.com. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.94\", \"0.06\"]",
+   "closed": false
+  },
+  "0xe61c49af780d2b42d080c987f17ab2090da13b21b44243c325fe0c5ee7db9297": {
+   "conditionId": "0xe61c49af780d2b42d080c987f17ab2090da13b21b44243c325fe0c5ee7db9297",
+   "question": "1st Half Exact Score: Paris FC 0 - 0 RC Strasbourg Alsace?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming Ligue 1 game between Paris FC and RC Strasbourg Alsace, scheduled for September 19, 2026 at 11:15 AM ET: This market will resolve based on the halftime score of the Paris FC vs. RC Strasbourg Alsace match originally scheduled for September 19, 2026 at 11:15 AM ET, considering only goals scored within the first 45 minutes of regular play plus first-half stoppage time; second-half goals, extra time, and penalty shoot-outs are excluded. If the actual halftime score is not one of the explicitly listed outcomes, the market resolves to \"Any Other Score.\" If the match is postponed, the market will remain open until it is completed; if it is canceled with no make-up game, the market resolves to \"0-0.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.245\", \"0.755\"]",
+   "closed": false
+  },
+  "0xe91958bb969ba8fcf319a183422cb94e4b2b3141b1517beeff5c72087a68d5ea": {
+   "conditionId": "0xe91958bb969ba8fcf319a183422cb94e4b2b3141b1517beeff5c72087a68d5ea",
+   "question": "1st Half Exact Score: Nottingham Forest FC 0 - 0 Coventry City FC?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming Premier League game between Nottingham Forest FC and Coventry City FC, scheduled for September 19, 2026 at 12:30 PM ET: This market will resolve based on the halftime score of the Nottingham Forest FC vs. Coventry City FC match originally scheduled for September 19, 2026 at 12:30 PM ET, considering only goals scored within the first 45 minutes of regular play plus first-half stoppage time; second-half goals, extra time, and penalty shoot-outs are excluded. If the actual halftime score is not one of the explicitly listed outcomes, the market resolves to \"Any Other Score.\" If the match is postponed, the market will remain open until it is completed; if it is canceled with no make-up game, the market resolves to \"0-0.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.265\", \"0.735\"]",
+   "closed": false
+  },
+  "0xf52d05c6493b2f1ca69646c51aae20c05c1668759e9c139beed89c467558bf62": {
+   "conditionId": "0xf52d05c6493b2f1ca69646c51aae20c05c1668759e9c139beed89c467558bf62",
+   "question": "1st Half Exact Score: Leeds United FC 0 - 0 Crystal Palace FC?",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming Premier League game between Leeds United FC and Crystal Palace FC, scheduled for September 20, 2026 at 9:00 AM ET: This market will resolve based on the halftime score of the Leeds United FC vs. Crystal Palace FC match originally scheduled for September 20, 2026 at 9:00 AM ET, considering only goals scored within the first 45 minutes of regular play plus first-half stoppage time; second-half goals, extra time, and penalty shoot-outs are excluded. If the actual halftime score is not one of the explicitly listed outcomes, the market resolves to \"Any Other Score.\" If the match is postponed, the market will remain open until it is completed; if it is canceled with no make-up game, the market resolves to \"0-0.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.425\", \"0.575\"]",
+   "closed": false
+  },
+  "0xf61d60a29af4e32cda11055272983767c70e49c8d0a43e5c624f31f984b1d509": {
+   "conditionId": "0xf61d60a29af4e32cda11055272983767c70e49c8d0a43e5c624f31f984b1d509",
+   "question": "Estudiantes de Merida vs. Deportivo Tachira: O/U 5.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Primera Divisi\u00f3n (Venezuela) game between Estudiantes de Merida and Deportivo Tachira, scheduled for September 12 at 5:00 PM ET:\n\nThis market will resolve to \"Over\" if Estudiantes de Merida and Deportivo Tachira combine to score 6 or more goals in this game.\n\nIf the combined total is less than 6, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on fvf.org.ve. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0\", \"1\"]",
+   "closed": true
+  },
+  "0xfe55806ac07a11144656fd4915e6b4d6606545407bf4c83d215b717b6128a9e8": {
+   "conditionId": "0xfe55806ac07a11144656fd4915e6b4d6606545407bf4c83d215b717b6128a9e8",
+   "question": "Caldas da Rainha: Completed Match: Kylie Collins vs Kayla Cross",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "This market refers to the tennis match between Kylie Collins and Kayla Cross in the Caldas da Rainha, originally scheduled for September 16, 2026 at 4:00AM ET. This market will resolve to \"Yes\" if all games and sets required to determine a match winner under governing body or event organizer rules are played to completion through normal play. Otherwise, if the match is not completed for any reason, it will resolve to \"No.\" If a forfeit of any kind occurs, including but not limited to a walkover or retirement, this market will resolve \"No.\" If the match is canceled (not played at all), ends in a tie, or a winner has not been determined by September 30, 2026, 11:59 PM ET (14 days after the scheduled start), this market will resolve to \"No.\" The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, a consensus of credible reporting may be used instead.",
+   "outcomePrices": "[\"0\", \"1\"]",
+   "closed": true
+  },
+  "0xff66f56bda84a31d94bbf0712ce66ab4e97b2cae31a99e4af8f0007029dd2deb": {
+   "conditionId": "0xff66f56bda84a31d94bbf0712ce66ab4e97b2cae31a99e4af8f0007029dd2deb",
+   "question": "Spread: M\u00e1laga CF (-1.5)",
+   "outcomes": "[\"M\u00e1laga CF\", \"Villarreal CF\"]",
+   "description": "In the upcoming La Liga game, scheduled for September 17 at 3:30 PM ET:\n\nThis market will resolve to \"M\u00e1laga CF\" if M\u00e1laga CF win the game by 2 or more goals.\n\nOtherwise, this market will resolve to \"Villarreal CF\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nThis market will resolve according to the official final score published on laliga.com. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.105\", \"0.895\"]",
+   "closed": false
+  },
+  "0x58ad610095740adbd1fdfbd13f18dd4be803b54be826c3d304818c1067323761": {
+   "conditionId": "0x58ad610095740adbd1fdfbd13f18dd4be803b54be826c3d304818c1067323761",
+   "question": "Bologna FC 1909 vs. Torino FC: O/U 2.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Serie A game between Bologna FC 1909 and Torino FC, scheduled for September 19 at 9:00 AM ET:\n\nThis market will resolve to \"Over\" if Bologna FC 1909 and Torino FC combine to score 3 or more goals in this game.\n\nIf the combined total is less than 3, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on legaseriea.it. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.465\", \"0.535\"]",
+   "closed": false
+  },
+  "0xa54b3a66b7ae80dba1bc7959be2b3f2f8849e012c2ac4d3db72d3c0866822e0f": {
+   "conditionId": "0xa54b3a66b7ae80dba1bc7959be2b3f2f8849e012c2ac4d3db72d3c0866822e0f",
+   "question": "Bologna FC 1909 vs. Torino FC: Both Teams to Score",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming Serie A game between Bologna FC 1909 and Torino FC, scheduled for September 19 at 9:00 AM ET:\n\nThis market will resolve to \"Yes\" if both Bologna FC 1909 and Torino FC each score at least one goal during the game.\n\nThis market will resolve to \"No\" if either team fails to score (i.e., if one or both teams finish with zero goals).\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on legaseriea.it. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.51\", \"0.49\"]",
+   "closed": false
+  },
+  "0x29b10a8f3266857330c53bdc1782bbe6ca278a213799fc6e31ecce526a38375f": {
+   "conditionId": "0x29b10a8f3266857330c53bdc1782bbe6ca278a213799fc6e31ecce526a38375f",
+   "question": "Bologna FC 1909 vs. Torino FC: O/U 1.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Serie A game between Bologna FC 1909 and Torino FC, scheduled for September 19 at 9:00 AM ET:\n\nThis market will resolve to \"Over\" if Bologna FC 1909 and Torino FC combine to score 2 or more goals in this game.\n\nIf the combined total is less than 2, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on legaseriea.it. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.715\", \"0.285\"]",
+   "closed": false
+  },
+  "0x10b0c16ebc7e9709eb4b4dedc40f33be11a48fba142936c58b43a799eba57a0c": {
+   "conditionId": "0x10b0c16ebc7e9709eb4b4dedc40f33be11a48fba142936c58b43a799eba57a0c",
+   "question": "Bologna FC 1909 vs. Torino FC: 1st Half O/U 1.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Serie A game between Bologna FC 1909 and Torino FC, scheduled for September 19 at 9:00 AM ET: This market will resolve to \"Over\" if Bologna FC 1909 and Torino FC combine to score 2 or more goals in the first half (first 45 minutes of regular play plus first-half stoppage time). If the combined first-half total is less than 2 goals, this market will resolve to \"Under\". If the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50-50. This market refers only to the outcome within the first 45 minutes of regular play plus first-half stoppage time. Second-half goals, extra time, and penalty shoot-outs are excluded. The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.31\", \"0.69\"]",
+   "closed": false
+  },
+  "0xb493206dec81fd2ff5471a9897a448332d56efd5b60f61c2c6db68600b39361a": {
+   "conditionId": "0xb493206dec81fd2ff5471a9897a448332d56efd5b60f61c2c6db68600b39361a",
+   "question": "Yokohama FC vs. FC Imabari: O/U 2.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming J2 League game between Yokohama FC and FC Imabari, scheduled for September 19 at 6:00 AM ET:\n\nThis market will resolve to \"Over\" if Yokohama FC and FC Imabari combine to score 3 or more goals in this game.\n\nIf the combined total is less than 3, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on jleague.jp. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.55\", \"0.45\"]",
+   "closed": false
+  },
+  "0xac7110db0fd7ae9229db37326b2cfa40e3d9a077673aff2934976fbb2e90be80": {
+   "conditionId": "0xac7110db0fd7ae9229db37326b2cfa40e3d9a077673aff2934976fbb2e90be80",
+   "question": "Yokohama FC vs. FC Imabari: Both Teams to Score",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming J2 League game between Yokohama FC and FC Imabari, scheduled for September 19 at 6:00 AM ET:\n\nThis market will resolve to \"Yes\" if both Yokohama FC and FC Imabari each score at least one goal during the game.\n\nThis market will resolve to \"No\" if either team fails to score (i.e., if one or both teams finish with zero goals).\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on jleague.jp. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.535\", \"0.465\"]",
+   "closed": false
+  },
+  "0x62c43250932f03521d29054a65365d98956b82c90fa530ff22abc3ee2d37516b": {
+   "conditionId": "0x62c43250932f03521d29054a65365d98956b82c90fa530ff22abc3ee2d37516b",
+   "question": "Yokohama FC vs. FC Imabari: O/U 1.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming J2 League game between Yokohama FC and FC Imabari, scheduled for September 19 at 6:00 AM ET:\n\nThis market will resolve to \"Over\" if Yokohama FC and FC Imabari combine to score 2 or more goals in this game.\n\nIf the combined total is less than 2, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on jleague.jp. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.775\", \"0.225\"]",
+   "closed": false
+  },
+  "0x0dd9b49371eee039a95b08c958144e926524a51faceccfff57c884a7f7495486": {
+   "conditionId": "0x0dd9b49371eee039a95b08c958144e926524a51faceccfff57c884a7f7495486",
+   "question": "Yokohama FC vs. FC Imabari: 1st Half O/U 1.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming J2 League game between Yokohama FC and FC Imabari, scheduled for September 19 at 6:00 AM ET: This market will resolve to \"Over\" if Yokohama FC and FC Imabari combine to score 2 or more goals in the first half (first 45 minutes of regular play plus first-half stoppage time). If the combined first-half total is less than 2 goals, this market will resolve to \"Under\". If the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50-50. This market refers only to the outcome within the first 45 minutes of regular play plus first-half stoppage time. Second-half goals, extra time, and penalty shoot-outs are excluded. The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.35\", \"0.65\"]",
+   "closed": false
+  },
+  "0x4a69df0e80e197de68554599b134410b5b479c95296956b3f58b791def0d10f5": {
+   "conditionId": "0x4a69df0e80e197de68554599b134410b5b479c95296956b3f58b791def0d10f5",
+   "question": "Ascoli Calcio 1898 FC vs. US Avellino 1912: O/U 2.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Serie B game between Ascoli Calcio 1898 FC and US Avellino 1912, scheduled for September 19 at 1:30 PM ET:\n\nThis market will resolve to \"Over\" if Ascoli Calcio 1898 FC and US Avellino 1912 combine to score 3 or more goals in this game.\n\nIf the combined total is less than 3, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on legaserieb.it. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.495\", \"0.505\"]",
+   "closed": false
+  },
+  "0x00785839cb2a5d4a1043b6c80c08c73b04d304692425e23a8ac9fb7eacc1dfb1": {
+   "conditionId": "0x00785839cb2a5d4a1043b6c80c08c73b04d304692425e23a8ac9fb7eacc1dfb1",
+   "question": "Ascoli Calcio 1898 FC vs. US Avellino 1912: Both Teams to Score",
+   "outcomes": "[\"Yes\", \"No\"]",
+   "description": "In the upcoming Serie B game between Ascoli Calcio 1898 FC and US Avellino 1912, scheduled for September 19 at 1:30 PM ET:\n\nThis market will resolve to \"Yes\" if both Ascoli Calcio 1898 FC and US Avellino 1912 each score at least one goal during the game.\n\nThis market will resolve to \"No\" if either team fails to score (i.e., if one or both teams finish with zero goals).\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on legaserieb.it. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.555\", \"0.445\"]",
+   "closed": false
+  },
+  "0x2bbd0a928b7a266b92a22d52756482051a2a403c136623aa7745149282f44395": {
+   "conditionId": "0x2bbd0a928b7a266b92a22d52756482051a2a403c136623aa7745149282f44395",
+   "question": "Ascoli Calcio 1898 FC vs. US Avellino 1912: O/U 1.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Serie B game between Ascoli Calcio 1898 FC and US Avellino 1912, scheduled for September 19 at 1:30 PM ET:\n\nThis market will resolve to \"Over\" if Ascoli Calcio 1898 FC and US Avellino 1912 combine to score 2 or more goals in this game.\n\nIf the combined total is less than 2, this market will resolve to \"Under\".\n\nIf the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50\u201350.\n\nIf the game is started but not completed, this market will resolve according to the official final score published on legaserieb.it. This market refers only to the outcome within the first 90 minutes of regular play plus stoppage time.\n\nThe primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.75\", \"0.25\"]",
+   "closed": false
+  },
+  "0x20e514e49f644c970e4599eb2d581f00d90e3b2c4fecf4b801f7cd0fbd053df2": {
+   "conditionId": "0x20e514e49f644c970e4599eb2d581f00d90e3b2c4fecf4b801f7cd0fbd053df2",
+   "question": "Ascoli Calcio 1898 FC vs. US Avellino 1912: 1st Half O/U 1.5",
+   "outcomes": "[\"Over\", \"Under\"]",
+   "description": "In the upcoming Serie B game between Ascoli Calcio 1898 FC and US Avellino 1912, scheduled for September 19 at 1:30 PM ET: This market will resolve to \"Over\" if Ascoli Calcio 1898 FC and US Avellino 1912 combine to score 2 or more goals in the first half (first 45 minutes of regular play plus first-half stoppage time). If the combined first-half total is less than 2 goals, this market will resolve to \"Under\". If the game is postponed, this market will remain open until the game has been completed. If the game is canceled entirely, with no make-up game, this market will resolve 50-50. This market refers only to the outcome within the first 45 minutes of regular play plus first-half stoppage time. Second-half goals, extra time, and penalty shoot-outs are excluded. The primary resolution source for this market is the official statistics of the event as recognized by the governing body or event organizers. However, if the governing body or event organizers have not published final match statistics within 2 hours after the event's conclusion, data from Flashscore may be used; if Flashscore data is unavailable, data from Sofascore may be used; if neither is available, a consensus of credible reporting may be used instead. All markets will settle based on the official final result as recognized by the governing body or event organizers. Revisions to officially declared final scores made after market resolution will not be accounted for in determining the outcome. If no acceptable data is available within 24 hours of the event's conclusion, this market will resolve 50-50, or to \"Draw\" where applicable.",
+   "outcomePrices": "[\"0.31\", \"0.69\"]",
+   "closed": false
+  }
+ }
+}

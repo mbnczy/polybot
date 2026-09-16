@@ -36,7 +36,11 @@ _TTL_DAYS = 30.0
 #   2 — the prompt now states which outcome is YES outside Yes/No markets.
 #       Version-1 verdicts were given with that side ambiguous, and every
 #       WOULD ENTER in two days of running came from one read the wrong way.
-_VERSION = 2
+#   3 — the model now sees each market's resolution rules and must search for a
+#       counterexample first. Version-2 implications included "player advances
+#       ⊆ match completed", which walkovers break; they are re-judged. Version-2
+#       refusals are kept: a refusal can only cost an opportunity, never money.
+_VERSION = 3
 
 
 def _key(a_id: str, b_id: str) -> str:
@@ -62,6 +66,17 @@ class VerdictCache:
             logger.warning("verdict cache unreadable (%s): starting empty", exc)
             return self
         if isinstance(raw, dict):
+            if raw.get("version") == 2:
+                rows = {k: v for k, v in (raw.get("verdicts") or {}).items()
+                        if isinstance(v, dict)}
+                self._rows = {k: v for k, v in rows.items() if not v.get("narrow")}
+                logger.warning(
+                    "verdict cache %s is version 2 — keeping %d refusal(s), re-judging "
+                    "%d implication(s) under the rules-aware prompt", self._path,
+                    len(self._rows), len(rows) - len(self._rows),
+                )
+                self._dirty = True
+                return self
             if raw.get("version") != _VERSION:
                 logger.warning(
                     "verdict cache %s is version %s, not %s — discarding %d verdict(s) "

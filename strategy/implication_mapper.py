@@ -598,48 +598,78 @@ def build_candidates(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 SYSTEM_PROMPT = """\
-You classify logical relationships between prediction-market questions.
+You judge whether one prediction market STRICTLY IMPLIES another. Real money is
+placed on the answer.
 
-Given two markets A and B, decide whether one STRICTLY IMPLIES the other.
+"A implies B" means: in EVERY possible world where A resolves YES, B also
+resolves YES — under the two markets' own resolution rules. Not correlation, not
+"almost always", not "in practice".
 
-"A implies B" means: whenever A resolves YES, B must also resolve YES, as a
-matter of logical necessity — not correlation, not usually, not almost always.
-
-Examples that ARE implications:
-  "Team wins by 5+ points" implies "Team wins"          (a subset of outcomes)
-  "BTC above $150k by March" implies "BTC above $100k by March"  (stronger threshold)
-  "Candidate wins in a landslide" implies "Candidate wins"
-
-Examples that are NOT implications:
-  "Team wins game 1" and "Team wins the series"     — correlated, not necessary
-  "BTC above $100k in March" and "BTC above $100k in June" — different windows
-  "Candidate wins primary" and "Candidate wins general" — sequential, not implied
-  Two outcomes of the same race — mutually exclusive, not nested
-  Two similarly-named but DIFFERENT subjects (a person and their namesake)
+Each market comes with its title and an excerpt of its resolution rules. The
+rules decide, not the titles.
 
 Some markets are not phrased as yes/no questions — an over/under line, a spread,
-a pick between two teams. For those, the outcome that counts as YES is stated
-under the market. Judge the implication ONLY for that YES outcome:
+a pick between two players or teams. For those, the outcome that counts as YES
+is stated under the market. Judge the implication ONLY for that YES outcome:
   "Exact score 0-0" does NOT imply "O/U 5.5 (YES = Over)" — a 0-0 is Under.
   "Over 8.5 corners (YES = Over)" DOES imply "Over 7.5 corners (YES = Over)".
 
-Resolution details matter. Two markets that sound nested but settle on different
-events, dates, or data sources are NOT an implication.
+Decide in this order:
+1. Name the outcome that resolves each market YES.
+2. For each direction, look hard for a COUNTEREXAMPLE: one concrete, possible
+   scenario in which the first market resolves YES and the second resolves NO.
+   Check at least:
+   - the edge cases in the rules: cancellation, postponement, walkover,
+     retirement, forfeit, abandonment, a tie, a 50-50 split, a refund — wherever
+     the two markets resolve differently;
+   - different periods: a half, a set, regular time versus extra time. A lead or
+     a margin can be lost after the period ends; a count that only accumulates,
+     like goals scored, cannot fall;
+   - different scope: one team versus the whole match, one country versus the
+     world, one platform or data source versus another;
+   - different dates, deadlines or time zones.
+3. A direction with any counterexample is not an implication.
+4. Answer an implication only for a direction where no counterexample exists.
 
-This classification is used to place real money on the assumption that the
-implication cannot fail. A false positive loses money. A false negative costs
-nothing — the opportunity is simply skipped. When you are not certain, answer
-NONE.
+Examples that ARE implications:
+  "Team wins by 5+ points" implies "Team wins"                  (a subset of outcomes)
+  "BTC above $150k by March" implies "BTC above $100k by March"  (a stronger threshold)
+  "1st Half O/U 0.5 (YES = Over)" implies "O/U 0.5 (YES = Over)" (goals only accumulate)
 
-Reply with ONLY a JSON object, no prose and no code fence:
-{"relation": "A_IMPLIES_B" | "B_IMPLIES_A" | "NONE",
+Examples that are NOT implications:
+  "Team wins game 1" and "Team wins the series" — correlated, not necessary
+  "BTC above $100k in March" and "BTC above $100k in June" — different windows
+  "Candidate wins primary" and "Candidate wins general" — sequential, not implied
+  "Player A advances" and "Match completed" — a walkover or retirement advances a
+    player without the match being completed
+  "Leads at half-time by 2+" and "Wins by 2+" — a margin can be lost later
+  "Most-streamed song in the US" and "Most-streamed song worldwide" — a narrower
+    population is a different measurement, not a subset
+  Two outcomes of the same race — mutually exclusive, not nested
+  Two similarly-named but DIFFERENT subjects (a person and their namesake)
+
+A false positive loses money. A false negative costs nothing — the opportunity
+is simply skipped. When you are not certain, answer NONE.
+
+Reply with ONLY a JSON object, no prose and no code fence, keys in this order:
+{"yes_a": "<the outcome name that resolves market A YES, e.g. Yes, Over, or a player>",
+ "yes_b": "<the outcome name that resolves market B YES>",
+ "counterexample_a_to_b": "<a scenario where A resolves YES and B resolves NO, or none>",
+ "counterexample_b_to_a": "<a scenario where B resolves YES and A resolves NO, or none>",
+ "relation": "A_IMPLIES_B" | "B_IMPLIES_A" | "NONE",
  "confidence": <number 0-1>,
- "reasoning": "<one sentence>"}"""
+ "reasoning": "<one sentence, without double quotes>"}
+A_IMPLIES_B requires counterexample_a_to_b to be none; B_IMPLIES_A requires
+counterexample_b_to_a to be none."""
 
 
 _RESULT_SCHEMA = {
     "type": "object",
     "properties": {
+        "yes_a": {"type": "string"},
+        "yes_b": {"type": "string"},
+        "counterexample_a_to_b": {"type": "string"},
+        "counterexample_b_to_a": {"type": "string"},
         "relation": {
             "type": "string",
             "enum": ["A_IMPLIES_B", "B_IMPLIES_A", "NONE"],
@@ -647,7 +677,8 @@ _RESULT_SCHEMA = {
         "confidence": {"type": "number"},
         "reasoning": {"type": "string"},
     },
-    "required": ["relation", "confidence", "reasoning"],
+    "required": ["yes_a", "yes_b", "counterexample_a_to_b", "counterexample_b_to_a",
+                 "relation", "confidence", "reasoning"],
     "additionalProperties": False,
 }
 
@@ -660,12 +691,51 @@ def _outcome_note(label: str, outcomes: "tuple[str, str] | None") -> str:
             f'"{outcomes[1]}" resolves NO)')
 
 
-def _user_prompt(c: Candidate) -> str:
+def _user_prompt(c: Candidate, rules: "dict[str, str] | None" = None) -> str:
+    def market(label: str, title: str, outcomes, cid: str) -> str:
+        text = f"Market {label}: {title}{_outcome_note(label, outcomes)}"
+        excerpt = (rules or {}).get(cid)
+        return f"{text}\n  Rules: {excerpt}" if excerpt else text
     return (
-        f"Market A: {c.a_title}{_outcome_note('A', c.a_outcomes)}\n"
-        f"Market B: {c.b_title}{_outcome_note('B', c.b_outcomes)}\n"
+        f"{market('A', c.a_title, c.a_outcomes, c.a_id)}\n"
+        f"{market('B', c.b_title, c.b_outcomes, c.b_id)}\n"
         f"Same event: {'yes' if c.same_event else 'unknown'}"
     )
+
+
+_NO_COUNTEREXAMPLE = frozenset({"", "none", "none.", "n/a", "na", "no", "null", "nil",
+                                "no counterexample", "no counterexample."})
+
+
+def verdict_problem(c: Candidate, verdict: dict) -> "str | None":
+    """
+    Where a verdict contradicts itself, or None.
+
+    The model searches each direction for a counterexample before answering. An
+    implication claimed in a direction it found a counterexample for is the model
+    overruling its own search. A counterexample for the OTHER direction is
+    expected — it is what makes the answer a one-way implication.
+
+    Naming a market's NO outcome as its YES means the implication was judged for
+    the other side. A paraphrase of the YES condition ("FF Jaro scores 1 or
+    more") is fine; only naming the NO outcome and never the YES one is refused.
+    Fields a provider leaves out are not held against the verdict.
+    """
+    relation = str(verdict.get("relation", "NONE"))
+    if relation not in ("A_IMPLIES_B", "B_IMPLIES_A"):
+        return None
+    key = "counterexample_a_to_b" if relation == "A_IMPLIES_B" else "counterexample_b_to_a"
+    ce = verdict.get(key)
+    if ce is not None and str(ce).strip().lower().rstrip(".") not in _NO_COUNTEREXAMPLE:
+        return f"claims {relation} but found a counterexample for it: {str(ce)[:100]}"
+    for field, outcomes in (("yes_a", c.a_outcomes), ("yes_b", c.b_outcomes)):
+        named = verdict.get(field)
+        if named is None:
+            continue
+        wrong = contradicts_yes_side(str(named), outcomes)
+        if wrong is not None:
+            return f"named {wrong!r} — the NO outcome — as the YES of {field[-1].upper()}"
+    return None
 
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
@@ -743,16 +813,18 @@ def _to_implication(
 
 
 def classify_one(
-    client, provider: Provider, model: str, c: Candidate
+    client, provider: Provider, model: str, c: Candidate,
+    rules: "dict[str, str] | None" = None,
 ) -> Optional[Implication]:
     """Classify a single pair. Returns None on refusal, error, or NONE."""
     kwargs: dict = {
         "model": model,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": _user_prompt(c)},
+            {"role": "user",   "content": _user_prompt(c, rules)},
         ],
-        "max_completion_tokens": 512,
+        # Room for the YES outcomes and the counterexample before the answer.
+        "max_completion_tokens": 800,
     }
     if provider.strict_schema:
         kwargs["response_format"] = {
@@ -777,6 +849,10 @@ def classify_one(
             c.a_id[:10], c.b_id[:10], text[:120],
         )
         return None
+    problem = verdict_problem(c, verdict)
+    if problem is not None:
+        logger.info("implication mapper | refused %s / %s: %s", c.a_id[:10], c.b_id[:10], problem)
+        return None
     return _to_implication(
         c,
         str(verdict.get("relation", "NONE")),
@@ -792,6 +868,7 @@ def classify_candidates(
     model:       str = "",
     client=None,
     concurrency: int = 8,
+    rules:       "dict[str, str] | None" = None,
 ) -> list[Implication]:
     """
     Classify candidate pairs concurrently.
@@ -817,7 +894,7 @@ def classify_candidates(
 
     out: list[Implication] = []
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-        for rel in pool.map(lambda c: classify_one(cli, prov, mdl, c), candidates):
+        for rel in pool.map(lambda c: classify_one(cli, prov, mdl, c, rules), candidates):
             if rel:
                 out.append(rel)
 

@@ -218,6 +218,39 @@ def fetch_window(days: float, min_hours: float = 1.0, concurrency: int = 4,
     return kept
 
 
+_RULES: "dict[str, str]" = {}
+_RULES_MAX = 20_000
+
+
+def fetch_rules(cids, concurrency: int = 4) -> "dict[str, str]":
+    """
+    Resolution-rule digests (strategy/market_rules.py) for the markets about to be
+    classified.
+
+    Only for those: a discovery sends a few hundred markets to the model, and
+    carrying a digest for all ~70,000 in the window would add tens of megabytes
+    to a reader already peaking at 735 MB. Gamma answers up to 100 markets per
+    request, so this is a handful of requests; digests are kept between passes.
+    """
+    from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+    from strategy.market_rules import rules_digest    # noqa: PLC0415
+
+    want = [c for c in dict.fromkeys(cids) if c and c not in _RULES]
+    batches = [want[i:i + 50] for i in range(0, len(want), 50)]
+
+    def one(batch):
+        return _gamma_get([("condition_ids", c) for c in batch] + [("limit", "100")]) or []
+
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        for rows in pool.map(one, batches):
+            for m in rows:
+                if m.get("conditionId"):
+                    _RULES[str(m["conditionId"])] = rules_digest(m.get("description"))
+    while len(_RULES) > _RULES_MAX:
+        _RULES.pop(next(iter(_RULES)))
+    return {c: _RULES.get(c, "") for c in cids}
+
+
 def snapshot_yes_ask(market: dict) -> float | None:
     """
     P(YES) as the best YES ask in the fetched snapshot — no book read.
@@ -417,6 +450,15 @@ def discover(markets: list[dict], args) -> list:
         print(f"    {len(known)} from cache · {len(strong)} at/above {args.threshold}")
         return strong
     cands = fresh
+    # The rules decide an implication, not the titles (strategy/market_rules.py).
+    from strategy.market_rules import rules_digest  # noqa: PLC0415
+    by_id = {str(m.get("conditionId")): m for m in markets if m.get("conditionId")}
+    needed = {c.a_id for c in cands} | {c.b_id for c in cands}
+    rules = {cid: rules_digest(by_id[cid]["description"]) for cid in needed
+             if by_id.get(cid, {}).get("description")}
+    rules.update(fetch_rules([cid for cid in needed if cid not in rules],
+                             getattr(args, "fetch_concurrency", 4)))
+    print(f"  rules      : {sum(1 for cid in needed if rules.get(cid))}/{len(needed)} market(s)")
     print(f"  classifying on {provider.name}/{model}…")
     # Build the client here and close it here. Left to classify_candidates it
     # would make a fresh one per discovery round, each with its own connection
@@ -427,7 +469,7 @@ def discover(markets: list[dict], args) -> list:
     try:
         rels = im.classify_candidates(
             cands, provider=provider, model=model, client=client,
-            concurrency=args.concurrency,
+            concurrency=args.concurrency, rules=rules,
         )
     finally:
         close = getattr(client, "close", None)

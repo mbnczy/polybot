@@ -116,4 +116,4 @@ def test_version_one_verdicts_are_discarded(tmp_path):
     cache = VerdictCache(path).load()
     assert len(cache) == 0
     cache.save()
-    assert json.loads(path.read_text())["version"] == 2
+    assert json.loads(path.read_text())["version"] == 3
