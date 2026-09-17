@@ -48,6 +48,9 @@ class FakeGuardClient:
         self.taker_fill_status: str = "matched"
         # Price the naked leg sells at on unwind (proceeds = size × this).
         self.unwind_sell_price: float = 0.40
+        # Shares each successive unwind can sell (None = all of them): a thin
+        # book sells only part of a naked leg.
+        self.unwind_caps: list[float] = []
 
     async def share_balance(self, token_id: str):
         return self.share_balances.get(token_id, 0.0)
@@ -82,9 +85,10 @@ class FakeGuardClient:
     async def unwind_leg(self, token_id: str, size: float,
                          price: float = 0.0) -> dict:
         self.unwound.append((token_id, size))
-        proceeds = round(size * self.unwind_sell_price, 6)
-        return {"status": "matched", "making_amount": size,
-                "taking_amount": proceeds}
+        sold = min(size, self.unwind_caps.pop(0)) if self.unwind_caps else size
+        proceeds = round(sold * self.unwind_sell_price, 6)
+        return {"status": "matched", "making_amount": sold,
+                "taking_amount": proceeds, "partial": sold + 0.005 < size}
 
 
 class FakeBreaker:
@@ -97,6 +101,9 @@ class FakeBreaker:
 
     def release_open(self) -> None:
         self.releases += 1
+
+    def book_pnl(self, pnl: float) -> None:
+        self.booked = getattr(self, "booked", []) + [pnl]
 
 
 class FakeNotifier:
@@ -169,6 +176,8 @@ def _build_guard(client, inventory=None, hedge_timeout_s=0.0, order_ttl_s=60.0,
         # indexing grace window is exercised by its own tests, and leaving it on
         # here would make every other case pass by simply doing nothing.
         index_grace=index_grace,
+        residue_retry_s=0.0,
+        race_wait_s=0.0,
     )
     return guard, breaker, notifier
 
@@ -502,3 +511,97 @@ async def test_a_genuinely_paired_fill_still_reads_as_success():
     msgs = " ".join(notifier.messages)
     assert "✅" in msgs
     assert "FAILED" not in msgs
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2026-09-17, "Ripple Labs IPO before 2027?": five losing re-entries in forty
+# minutes, 5 shares a partial unwind forgot, 10 a cancel/fill race left behind.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _one_leg_filled(client, yes=10.0):
+    client.orders["oy"] = {"status": "matched", "size_matched": yes}
+    client.orders["on"] = {"status": "live", "size_matched": 0.0}
+    client.best_asks["tok-no"] = 0.60            # completion unprofitable → unwind
+
+
+@pytest.mark.asyncio
+async def test_a_partial_unwind_keeps_the_remainder_and_sells_it_later():
+    client = FakeGuardClient()
+    _one_leg_filled(client)
+    client.unwind_caps = [5.0]                   # the book held 5 of 10
+    guard, breaker, _ = _build_guard(client)
+    guard._residue_retry_s = 60.0                # the retry waits its turn
+    guard.watch_pair(_maker_signal(10.0), 10.0, _resting_resp("oy"), _resting_resp("on"))
+    await guard.poll_once()
+    await guard.poll_once()
+
+    assert client.unwound == [("tok-yes", 10.0)]
+    assert guard._residue["0xcond"]["shares"] == pytest.approx(5.0)
+    assert guard.is_watching("0xcond")           # no new pair while shares are naked
+    guard._residue["0xcond"]["next_try"] = 0.0
+    await guard.poll_once()                      # retry sells the other 5
+    assert client.unwound[-1] == ("tok-yes", 5.0)
+    assert "0xcond" not in guard._residue
+    # proceeds 5×0.40 − cost 5×0.479 = −0.395, booked without releasing a slot
+    assert breaker.booked == [pytest.approx(-0.395, abs=1e-6)]
+
+
+@pytest.mark.asyncio
+async def test_a_residue_below_the_minimum_order_is_reported_not_retried_forever():
+    client = FakeGuardClient()
+    _one_leg_filled(client)
+    client.unwind_caps = [7.0]                   # 3 left: below the 5-share minimum
+    guard, _, notifier = _build_guard(client)
+    guard.watch_pair(_maker_signal(10.0), 10.0, _resting_resp("oy"), _resting_resp("on"))
+    await guard.poll_once()
+    await guard.poll_once()
+    await guard.poll_once()
+    assert "0xcond" not in guard._residue
+    assert any("below the minimum order" in str(e) for e in notifier.events)
+
+
+@pytest.mark.asyncio
+async def test_a_fill_that_raced_the_cancel_is_found_in_the_trade_feed():
+    """The guard saw NO=5, YES=0 and cancelled YES; YES had matched 10 just before.
+    The cancelled order's status still says 0 matched — only the trade feed knows."""
+    client = FakeGuardClient()
+    client.orders["oy"] = {"status": "live", "size_matched": 0.0}
+    client.orders["on"] = {"status": "live", "size_matched": 5.0}
+    client.best_asks["tok-no"] = 0.60            # completing YES's excess is unprofitable
+    guard, breaker, _ = _build_guard(client)
+    guard.watch_pair(_maker_signal(10.0), 10.0, _resting_resp("oy"), _resting_resp("on"))
+    await guard.poll_once()                      # imbalance: NO 5, YES 0
+
+    client.order_fills["oy"] = 10.0              # matched just before the cancel lands
+    await guard.poll_once()                      # cancel YES (status: canceled, 0) → finalize
+
+    # YES 10 vs NO 5: five pairs, and the naked excess is 5 YES. Before the fix
+    # the guard unwound 5 NO and left 10 YES in the wallet unwatched.
+    assert client.unwound == [("tok-yes", 5.0)]
+
+
+@pytest.mark.asyncio
+async def test_a_losing_unwind_cools_the_market_down():
+    client = FakeGuardClient()
+    _one_leg_filled(client)
+    guard, _, _ = _build_guard(client)
+    guard.watch_pair(_maker_signal(10.0), 10.0, _resting_resp("oy"), _resting_resp("on"))
+    await guard.poll_once()
+    await guard.poll_once()
+    assert guard.watched_count == 0 and guard.is_watching("0xcond")
+    guard._cooldown["0xcond"] = 0.0              # the cooldown has run out
+    assert not guard.is_watching("0xcond")
+
+
+@pytest.mark.asyncio
+async def test_a_completed_pair_does_not_cool_the_market_down():
+    client = FakeGuardClient()
+    client.orders["oy"] = {"status": "matched", "size_matched": 10.0}
+    client.orders["on"] = {"status": "live", "size_matched": 0.0}
+    client.best_asks["tok-no"] = 0.50            # completion profitable
+    guard, _, _ = _build_guard(client)
+    guard.watch_pair(_maker_signal(10.0), 10.0, _resting_resp("oy"), _resting_resp("on"))
+    await guard.poll_once()
+    await guard.poll_once()
+    assert guard.watched_count == 0 and not guard.is_watching("0xcond")

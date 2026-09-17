@@ -451,6 +451,28 @@ class CircuitBreaker:
                 f"limit={DAILY_LOSS_LIMIT:.2f}"
             )
 
+    def book_pnl(self, pnl: float) -> None:
+        """
+        Realised P&L that belongs to no open slot: naked shares a partial unwind
+        left behind, sold later. on_fill would also release a reservation that
+        nobody holds any more.
+        """
+        self._state.session_pnl += pnl
+        with self._lock:
+            self._maybe_roll_window()
+            self._daily.daily_pnl += pnl
+            self._save_daily_state()
+            daily_pnl_snapshot = self._daily.daily_pnl
+        logger.info(
+            "Realised P&L booked | pnl=%.6f session_pnl=%.4f daily_pnl=%.4f",
+            pnl, self._state.session_pnl, daily_pnl_snapshot,
+        )
+        if daily_pnl_snapshot <= DAILY_LOSS_LIMIT:
+            raise CircuitBreakerTripped(
+                f"Daily loss limit hit: daily_pnl={daily_pnl_snapshot:.2f} "
+                f"limit={DAILY_LOSS_LIMIT:.2f}"
+            )
+
     # ──────────────────────────────────────────────────────────────────────────
     # Cross-market positions
     # ──────────────────────────────────────────────────────────────────────────

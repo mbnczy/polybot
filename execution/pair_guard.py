@@ -91,6 +91,23 @@ ORDER_INDEX_GRACE_S: float = float(os.environ.get("ORDER_INDEX_GRACE_S", 5.0))
 # Shares are quoted to 2 d.p.; anything below half an increment is noise.
 _SHARE_EPS: float = 0.005
 
+# A market whose pair was just unwound at a loss is left alone this long. On
+# 2026-09-17 the guard re-entered "Ripple Labs IPO before 2027?" five times in
+# forty minutes while its YES fell from 0.17 to 0.06: each time only the YES bid
+# filled — sellers dumping into a falling market — and each unwind lost.
+PAIR_LOSS_COOLDOWN_S: float = float(os.environ.get("PAIR_LOSS_COOLDOWN_S", 7200.0))
+# Naked shares a partial unwind could not sell are retried, with backoff, and
+# reported if they are still there after RESIDUE_ALERT_S. The same morning an
+# unwind sold 5 of 10 shares into a 5-share book and the other 5 were forgotten.
+RESIDUE_RETRY_S: float = float(os.environ.get("RESIDUE_RETRY_S", 30.0))
+RESIDUE_ALERT_S: float = float(os.environ.get("RESIDUE_ALERT_S", 1800.0))
+# Below the exchange's minimum order there is nothing a sell can do.
+RESIDUE_MIN_SHARES: float = 5.0
+# A cancel can race a fill, and the trade feed trails the match: a cancelled
+# leg's fills are looked up this many times, this far apart.
+CANCEL_RACE_CHECKS: int = 3
+CANCEL_RACE_WAIT_S: float = float(os.environ.get("CANCEL_RACE_WAIT_S", 1.5))
+
 # Order states considered still-resting on the CLOB.
 _OPEN_STATUSES:   frozenset[str] = frozenset({"live", "open", "pending", "delayed", "new"})
 _FILLED_STATUSES: frozenset[str] = frozenset({"matched", "filled", "paper"})
@@ -172,6 +189,9 @@ class MakerPairGuard:
         order_ttl_s:     float = MAKER_ORDER_TTL_S,
         taker_fee_est:   float = DEFAULT_TAKER_FEE,
         index_grace:     float = ORDER_INDEX_GRACE_S,
+        loss_cooldown_s: float = PAIR_LOSS_COOLDOWN_S,
+        residue_retry_s: float = RESIDUE_RETRY_S,
+        race_wait_s:     float = CANCEL_RACE_WAIT_S,
     ) -> None:
         self._client    = clob_client
         self._breaker   = circuit_breaker
@@ -183,6 +203,13 @@ class MakerPairGuard:
         self._fee_est   = taker_fee_est
         self._grace     = max(0.0, index_grace)
         self._pairs: dict[str, _WatchedPair] = {}
+        self._loss_cooldown_s = max(0.0, loss_cooldown_s)
+        self._residue_retry_s = max(0.0, residue_retry_s)
+        self._race_wait_s = max(0.0, race_wait_s)
+        # condition_id -> monotonic time until which no new pair is placed there
+        self._cooldown: dict[str, float] = {}
+        # condition_id -> naked shares a partial unwind left behind
+        self._residue: dict[str, dict] = {}
         logger.info(
             "MakerPairGuard init | poll=%.2fs hedge_timeout=%.1fs order_ttl=%.1fs",
             self._poll_s, self._hedge_s, self._ttl_s,
@@ -273,8 +300,20 @@ class MakerPairGuard:
 
         The strategy loop uses this to refuse a new entry on a market whose
         previous maker pair is unresolved (prevents pyramiding exposure and
-        double-booking against the same complementary set)."""
-        return any(p.condition_id == condition_id for p in self._pairs.values())
+        double-booking against the same complementary set).
+
+        Also true while naked shares from a partial unwind are still being
+        sold there, and for PAIR_LOSS_COOLDOWN_S after a losing unwind."""
+        if any(p.condition_id == condition_id for p in self._pairs.values()):
+            return True
+        if condition_id in self._residue:
+            return True
+        until = self._cooldown.get(condition_id)
+        if until is not None:
+            if time.monotonic() < until:
+                return True
+            del self._cooldown[condition_id]
+        return False
 
     # ──────────────────────────────────────────────────────────────────────────
     # Main loop
@@ -303,6 +342,52 @@ class MakerPairGuard:
             if pair.finalizing:
                 continue
             await self._update_pair(pair)
+        await self._retry_residue()
+
+    async def _retry_residue(self) -> None:
+        """Sell what a partial unwind left naked; book it; alert if it will not go."""
+        now = time.monotonic()
+        for cid, r in list(self._residue.items()):
+            if now < r["next_try"]:
+                continue
+            if r["shares"] < RESIDUE_MIN_SHARES:
+                del self._residue[cid]
+                self._cooldown[cid] = now + self._loss_cooldown_s
+                logger.warning(
+                    "PairGuard | %.2f naked %s shares on %s are below the exchange's "
+                    "minimum order — left in the wallet", r["shares"], r["label"], cid[:16])
+                self._notifier.arb_event(
+                    cid, f"⚠️ {r['shares']:.2f} naked {r['label']} shares on {cid[:16]} "
+                         f"are below the minimum order and could not be sold")
+                continue
+            sold = proceeds = 0.0
+            try:
+                resp = await self._client.unwind_leg(r["token_id"], r["shares"])
+                if str(resp.get("status", "")).strip().lower() in _FILLED_STATUSES:
+                    sold = float(resp.get("making_amount") or 0.0)
+                    proceeds = float(resp.get("taking_amount") or 0.0)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("PairGuard | residue unwind on %s failed: %s", cid[:16], exc)
+            if sold > _SHARE_EPS:
+                realised = round(proceeds - sold * r["bid"], 6)
+                r["shares"] = round(r["shares"] - sold, 6)
+                logger.warning(
+                    "PairGuard | residue on %s: sold %.2f more naked %s shares, "
+                    "realised %+.4f, %.2f left", cid[:16], sold, r["label"], realised,
+                    max(0.0, r["shares"]))
+                self._breaker.book_pnl(realised)
+            if r["shares"] <= _SHARE_EPS:
+                del self._residue[cid]
+                self._cooldown[cid] = now + self._loss_cooldown_s
+                continue
+            r["attempts"] += 1
+            r["next_try"] = now + min(300.0, self._residue_retry_s * (2 ** min(r["attempts"], 4)))
+            if not r["alerted"] and now - r["since"] >= RESIDUE_ALERT_S:
+                r["alerted"] = True
+                await self._notifier.send_critical_error(
+                    f"PAIR GUARD RESIDUE {cid[:16]} — {r['shares']:.2f} naked {r['label']} "
+                    f"shares still unsold after {(now - r['since']) / 60:.0f} min — "
+                    f"MANUAL INTERVENTION MAY BE REQUIRED")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Per-pair reconciliation
@@ -341,9 +426,10 @@ class MakerPairGuard:
                 lagging = yes if yes.matched < no.matched else no
                 if lagging.open:
                     await self._cancel_leg(pair, lagging)
-                # Re-check once — the cancel may have raced a fill.
-                if lagging.open:
-                    await self._refresh_leg(lagging)
+                # Re-check once — the cancel may have raced a fill. This used to
+                # run only if the leg still looked open, and a successful cancel
+                # had just marked it closed, so it never ran.
+                await self._refresh_leg(lagging)
                 if not lagging.open:
                     await self._finalize(pair)
             return
@@ -526,21 +612,34 @@ class MakerPairGuard:
         # the slot and abandons a leg that actually filled, which is the naked
         # position this guard exists to prevent. One trade-feed lookup per leg,
         # and only when we think there is nothing to book.
-        if yes.matched <= _SHARE_EPS and no.matched <= _SHARE_EPS:
-            for leg in pair.legs:
-                if not leg.order_id:
-                    continue
+        #
+        # A cancel can also race a fill. On 2026-09-17 the guard cancelled a YES
+        # leg it believed empty, unwound the NO side's 5 shares as the naked
+        # excess, and 10 YES shares that had matched just before the cancel were
+        # left in the wallet unwatched. So every cancelled leg is checked too,
+        # a few times, because the trade feed trails the match.
+        both_empty = yes.matched <= _SHARE_EPS and no.matched <= _SHARE_EPS
+        for leg in pair.legs:
+            if not leg.order_id or leg.fully_matched:
+                continue
+            if not (both_empty or leg.cancel_requested):
+                continue
+            tries = CANCEL_RACE_CHECKS if leg.cancel_requested else 1
+            for attempt in range(tries):
                 filled = await self._client.order_filled_size(
                     leg.order_id, leg.token_id
                 )
-                if filled is None or filled <= _SHARE_EPS:
-                    continue
-                leg.matched = max(leg.matched, min(leg.size, filled))
-                logger.warning(
-                    "PairGuard | leg %s filled %.2f share(s) that polling never "
-                    "saw — handling instead of releasing",
-                    leg.order_id[:12], leg.matched,
-                )
+                if filled is not None and filled > leg.matched + _SHARE_EPS:
+                    leg.matched = max(leg.matched, min(leg.size, filled))
+                    logger.warning(
+                        "PairGuard | leg %s filled %.2f share(s) that polling never "
+                        "saw — handling instead of %s",
+                        leg.order_id[:12], leg.matched,
+                        "releasing" if both_empty else "leaving them unwatched",
+                    )
+                    break
+                if attempt + 1 < tries and self._race_wait_s > 0:
+                    await asyncio.sleep(self._race_wait_s)
 
         paired  = pair.paired
         rich    = yes if yes.matched > no.matched else no
@@ -568,6 +667,11 @@ class MakerPairGuard:
                 hedged_note = f" ({excess:.2f} naked shares unwound, pnl={leg_pnl:+.4f})"
             else:  # "failed" — naked shares stuck, nothing realised on them
                 hedged_note = f" ({excess:.2f} naked shares STUCK — manual)"
+            if kind == "failed" or (kind == "unwound" and leg_pnl < 0):
+                self._cooldown[pair.condition_id] = time.monotonic() + self._loss_cooldown_s
+                logger.warning(
+                    "PairGuard | losing half-fill on %s — no new pair on this market "
+                    "for %.0f min", pair.condition_id[:16], self._loss_cooldown_s / 60)
 
         if realized_activity:
             # Book P&L (profit OR loss) and release the reservation. This is the
@@ -678,6 +782,23 @@ class MakerPairGuard:
                 sold, rich.label, pair.condition_id[:16],
                 proceeds, sold * rich.bid, realised,
             )
+            left = round(excess - sold, 6)
+            if left > _SHARE_EPS:
+                r = self._residue.get(pair.condition_id)
+                if r and r["token_id"] == rich.token_id:
+                    total = r["shares"] + left
+                    r["bid"] = (r["bid"] * r["shares"] + rich.bid * left) / total
+                    r["shares"] = total
+                else:
+                    now = time.monotonic()
+                    self._residue[pair.condition_id] = {
+                        "token_id": rich.token_id, "label": rich.label, "shares": left,
+                        "bid": rich.bid, "since": now, "next_try": now + self._residue_retry_s,
+                        "attempts": 0, "alerted": False}
+                logger.warning(
+                    "PairGuard | %.2f naked %s shares on %s left by a partial unwind — "
+                    "retrying, no new pair there meanwhile",
+                    left, rich.label, pair.condition_id[:16])
             return "unwound", realised
         except Exception as exc:  # noqa: BLE001
             ARB_UNWIND_FAILURES.inc()
