@@ -393,7 +393,8 @@ def _question_of(market: dict) -> str:
 
 def price_first(cands: list, markets: list[dict], share: float,
                 budget: int, max_spread: float = 0.05,
-                max_edge: float = PRICE_FIRST_MAX_EDGE) -> list:
+                max_edge: float = PRICE_FIRST_MAX_EDGE,
+                stats: "dict | None" = None) -> list:
     """
     Reorder the model's budget: the pairs whose prices would already pay first,
     then the prefilter's own ranking.
@@ -430,6 +431,12 @@ def price_first(cands: list, markets: list[dict], share: float,
     scored.sort(key=lambda x: -x[0])
     take = min(len(scored), int(budget * share))
     chosen = [c for _, c in scored[:take]]
+    if stats is not None:
+        # What the screen actually found, not what it was asked for. The share
+        # is a ceiling: after the edge ceiling and the spread gate there are
+        # often fewer priced pairs than the budget would allow.
+        stats["by_price"] = len(chosen)
+        stats["offered"] = len(scored)
     picked = {id(c) for c in chosen}
     chosen += [c for c in cands if id(c) not in picked][:budget - len(chosen)]
     return chosen
@@ -625,12 +632,14 @@ def discover(markets: list[dict], args) -> list:
                                    max_per_event=args.max_per_event)
     cache = VerdictCache(args.cache_file).load()
     known, unknown = cache.split(cands)
+    split: dict = {}
     fresh = price_first(unknown, markets, args.price_first_share, args.new_per_pass,
-                        max_edge=args.price_first_max_edge)
+                        max_edge=args.price_first_max_edge, stats=split)
     print(f"  prefilter  : {len(cands)} candidate pair(s) | "
           f"{len(cands) - len(unknown)} already judged ({len(cache)} in cache), "
           f"{len(unknown)} new → classifying {len(fresh)} "
-          f"({args.price_first_share:.0%} of them by price)")
+          f"({split.get('by_price', 0)} of them priced as if violated, "
+          f"out of {split.get('offered', 0)} the screen offered)")
     if not fresh:
         strong = [r for r in known if r.confidence >= args.threshold]
         print(f"    {len(known)} from cache · {len(strong)} at/above {args.threshold}")

@@ -161,3 +161,12 @@ def test_titles_that_do_not_state_a_direction_are_left_to_the_model():
                _mkt("b", 0.85, 0.86, q="Team wins the first half")]
     chosen = price_first([_Cand("a", "b")], markets, share=1.0, budget=1)
     assert [(c.a_id, c.b_id) for c in chosen] == [("a", "b")]
+
+
+def test_the_split_reported_is_the_one_that_happened():
+    """The log printed the share it was asked for, so a screen that found two
+    pairs and a screen that found forty both read "75% of them by price"."""
+    cands, markets = _universe()
+    split: dict = {}
+    price_first(cands, markets, share=0.75, budget=4, stats=split)
+    assert split == {"by_price": 2, "offered": 2}
