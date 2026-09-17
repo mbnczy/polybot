@@ -87,7 +87,8 @@ def _page(params: dict, limit: int) -> list[dict]:
 # across the whole one-week window (~40,000 markets) that is 280 MB raw and well
 # over the reader's 1 GB cap as Python objects. Slimmed, it is a few hundred bytes.
 _KEEP_FIELDS = ("conditionId", "question", "endDate", "outcomes", "clobTokenIds",
-                "negRiskMarketID", "outcomePrices", "bestBid", "bestAsk", "updatedAt")
+                "negRiskMarketID", "outcomePrices", "bestBid", "bestAsk", "updatedAt",
+                "orderPriceMinTickSize")
 
 
 def _slim(m: dict) -> dict:
@@ -303,6 +304,137 @@ def run_resolution_audit(args, cache: dict) -> "object":
     return audit
 
 
+def _tick_of(market: dict) -> "float | None":
+    try:
+        tick = float(market.get("orderPriceMinTickSize"))
+    except (TypeError, ValueError):
+        return None
+    return tick if tick > 0 else None
+
+
+def _num(v) -> "float | None":
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if 0.0 < x < 1.0 else None
+
+
+def screen_edge(narrow: dict, broad: dict) -> "float | None":
+    """
+    What this direction would pay right now, at the better of the two ways in:
+
+      • crossing:  NO on narrow at (1 − its bid) + YES on broad at its ask
+      • resting:   our own bids, a tick above each book, no fee
+
+    The snapshot is minutes old and says nothing about depth — it decides where
+    the model's budget goes, not what is traded.
+    """
+    nb, na = _num(narrow.get("bestBid")), _num(narrow.get("bestAsk"))
+    bb, ba = _num(broad.get("bestBid")), _num(broad.get("bestAsk"))
+    best = None
+    if nb is not None and ba is not None:
+        best = 1.0 - ((1.0 - nb) + ba)
+    if na is not None and bb is not None:
+        tn = _tick_of(narrow) or 0.01
+        tb = _tick_of(broad) or 0.01
+        maker = 1.0 - ((1.0 - na + tn) + (bb + tb))
+        best = maker if best is None else max(best, maker)
+    return best
+
+
+# No confirmed implication with a quotable book on both legs has ever been
+# priced above this, so a bigger number means the pair is not one.
+PRICE_FIRST_MAX_EDGE = 0.20
+
+
+def _spread(market: dict) -> "float | None":
+    bid, ask = _num(market.get("bestBid")), _num(market.get("bestAsk"))
+    return None if bid is None or ask is None else ask - bid
+
+
+def _backwards(narrow: dict, broad: dict) -> bool:
+    """
+    True when the two titles themselves refute "narrow implies broad".
+
+    Without this the screen scores both directions and keeps the better one, so
+    every wide-apart ladder pair looks violated: SPY above $780 at 0.001 against
+    SPY above $750 at 0.990 scored +0.989 on 2026-09-17 — read as "above 750
+    implies above 780", which is backwards. The prices there are right, and the
+    model would have spent its budget confirming it.
+
+    Only the titles' own words are allowed to decide. strategy.ladder_direction
+    can also read the direction off the family's prices, but this screen exists
+    to find the pairs whose prices are wrong, so it cannot take their word for
+    which way the implication runs.
+    """
+    from strategy.ladder_direction import (            # noqa: PLC0415
+        RISING, numbers, skeleton, stated_direction)
+
+    qn, qb = _question_of(narrow), _question_of(broad)
+    if skeleton(qn) != skeleton(qb):
+        return False
+    xn, xb = numbers(qn), numbers(qb)
+    if len(xn) != len(xb):
+        return False
+    diff = [i for i in range(len(xn)) if xn[i] != xb[i]]
+    if len(diff) != 1:
+        return False
+    stated = stated_direction(qn)
+    if stated is None:
+        return False
+    # A rising ladder ("above X") narrows as the threshold climbs.
+    return (xn[diff[0]] > xb[diff[0]]) != (stated == RISING)
+
+
+def _question_of(market: dict) -> str:
+    return str(market.get("question") or market.get("title") or "")
+
+
+def price_first(cands: list, markets: list[dict], share: float,
+                budget: int, max_spread: float = 0.05,
+                max_edge: float = PRICE_FIRST_MAX_EDGE) -> list:
+    """
+    Reorder the model's budget: the pairs whose prices would already pay first,
+    then the prefilter's own ranking.
+
+    Measured 2026-09-17: the budget went to shape-ranked pairs, 94% of them
+    over/under families whose median edge is −38% — the ones that can never pay.
+    Meanwhile 14,728 pairs in a 12-hour window were priced as if an implication
+    were violated, and none of them had ever been judged.
+
+    `max_edge` is what keeps the ranking honest. Of 2,143 implications the model
+    has confirmed, 320 had a quotable book on both legs, and not one of them was
+    violated: the best edge among them was −0.009 crossing and −0.010 resting.
+    A tight book showing +0.30 is therefore not a dislocation anyone can trade,
+    it is a pair that is not an implication — and ranking by the biggest number
+    hands the budget to exactly those. Above the ceiling a pair is dropped, not
+    demoted: 947 of the 1,209 the screen offered sat above it.
+    """
+    by_id = {str(m.get("conditionId")): m for m in markets if m.get("conditionId")}
+    scored = []
+    for c in cands:
+        a, b = by_id.get(c.a_id), by_id.get(c.b_id)
+        if not a or not b:
+            continue
+        sa, sb = _spread(a), _spread(b)
+        # 0.55 - 0.50 is 0.05000000000000004: a book at the cap has to pass.
+        if (sa is None or sb is None
+                or sa > max_spread + 1e-9 or sb > max_spread + 1e-9):
+            continue
+        edges = [screen_edge(n, b_) for n, b_ in ((a, b), (b, a))
+                 if not _backwards(n, b_)]
+        edge = max((e for e in edges if e is not None), default=None)
+        if edge is not None and 0.0 < edge <= max_edge:
+            scored.append((edge, c))
+    scored.sort(key=lambda x: -x[0])
+    take = min(len(scored), int(budget * share))
+    chosen = [c for _, c in scored[:take]]
+    picked = {id(c) for c in chosen}
+    chosen += [c for c in cands if id(c) not in picked][:budget - len(chosen)]
+    return chosen
+
+
 def snapshot_yes_ask(market: dict) -> float | None:
     """
     P(YES) as the best YES ask in the fetched snapshot — no book read.
@@ -493,10 +625,12 @@ def discover(markets: list[dict], args) -> list:
                                    max_per_event=args.max_per_event)
     cache = VerdictCache(args.cache_file).load()
     known, unknown = cache.split(cands)
-    fresh = unknown[:args.new_per_pass]
+    fresh = price_first(unknown, markets, args.price_first_share, args.new_per_pass,
+                        max_edge=args.price_first_max_edge)
     print(f"  prefilter  : {len(cands)} candidate pair(s) | "
           f"{len(cands) - len(unknown)} already judged ({len(cache)} in cache), "
-          f"{len(unknown)} new → classifying {len(fresh)}")
+          f"{len(unknown)} new → classifying {len(fresh)} "
+          f"({args.price_first_share:.0%} of them by price)")
     if not fresh:
         strong = [r for r in known if r.confidence >= args.threshold]
         print(f"    {len(known)} from cache · {len(strong)} at/above {args.threshold}")
@@ -580,6 +714,9 @@ def export_implications(rels: list, markets: list[dict], path: str, audit=None) 
             # Which outcome each YES token is. The bot refuses a leg whose first
             # token is not provably "Yes" (strategy/outcomes.py).
             "narrow_outcomes": market_outcomes(mn), "broad_outcomes": market_outcomes(mb),
+            # The bot rests its bids one tick above the book; the tick is a
+            # property of the market, 0.01 in the middle and 0.001 at the edges.
+            "narrow_tick": _tick_of(mn), "broad_tick": _tick_of(mb),
             "confidence": float(getattr(r, "confidence", 0.0)),
             "evidence": str(getattr(r, "evidence", ""))[:300],
         })
@@ -1151,6 +1288,13 @@ def main() -> int:
                     help="where model verdicts are remembered between passes")
     ap.add_argument("--new-per-pass", type=int,  default=60, metavar="N",
                     help="how many unseen pairs each discovery sends to the model")
+    ap.add_argument("--price-first-share", type=float, default=0.75, metavar="F",
+                    help="share of that budget spent on pairs the prices would already "
+                         "pay for; the rest follows the prefilter's ranking")
+    ap.add_argument("--price-first-max-edge", type=float, default=PRICE_FIRST_MAX_EDGE,
+                    metavar="E",
+                    help="apparent edge above which a pair is treated as not an "
+                         "implication at all rather than as a dislocation")
     ap.add_argument("--pairs",       type=int,   default=800,
                     help="candidate pairs sent to the model")
     ap.add_argument("--threshold",   type=float, default=0.90,
