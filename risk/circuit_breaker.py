@@ -336,6 +336,8 @@ class CircuitBreaker:
                 )
 
         reason = self._arb_blocking_reason(intent)
+        # Kept so the caller can say why in the episode summary.
+        self.last_block_reason = reason or ""
         if reason:
             self._state.orders_blocked += 1
             logger.warning("Arb pair BLOCKED [%s] | %s", reason, intent)

@@ -291,6 +291,18 @@ async def strategy_loop(
     # displaced the older one in per-condition registries.
     busy_conditions: set[str] = set()
 
+    def _busy_reason(cid: str) -> "str | None":
+        """Why a signal on this market is not placed, for the episode summary."""
+        if cid in busy_conditions:
+            return "an execution is already in flight"
+        if pair_guard is not None:
+            why = pair_guard.busy_reason(cid)
+            if why:
+                return why
+        if inventory is not None and inventory.is_tracking(cid):
+            return "a filled pair is still being merged"
+        return None
+
     def _condition_busy(cid: str) -> bool:
         if cid in busy_conditions:
             return True
@@ -344,6 +356,11 @@ async def strategy_loop(
                     USDC_BALANCE.set(
                         status["starting_balance"] + status["session_pnl"]
                     )
+                    notifier.arb_event(
+                        condition_id,
+                        f"✅ both legs filled at submission — {n_shares:.2f} pairs",
+                        net_profit,
+                    )
                     await notifier.send_trade_execution(
                         condition_id=condition_id, yes_token_id=yes_token_id,
                         no_token_id=no_token_id, yes_ask=yes_ask, no_ask=no_ask,
@@ -388,6 +405,11 @@ async def strategy_loop(
                     )
                     try:
                         await client.unwind_leg(naked_token, n_shares)
+                        notifier.arb_event(
+                            condition_id,
+                            f"⚠️ half-fill ({fill_state}) — naked leg flattened, "
+                            f"no profit booked",
+                        )
                         await notifier.notify(
                             f"⚠️ Half-fill on {condition_id[:16]} ({fill_state}) — "
                             f"naked leg flattened, no profit booked."
@@ -395,6 +417,10 @@ async def strategy_loop(
                     except Exception as uexc:  # noqa: BLE001
                         ARB_UNWIND_FAILURES.inc()
                         logger.error("Unwind failed for %s: %s", naked_token[:16], uexc)
+                        notifier.arb_event(
+                            condition_id,
+                            f"❌ half-fill ({fill_state}) — unwind FAILED, manual action needed",
+                        )
                         await notifier.send_critical_error(
                             f"HALF-FILL UNWIND FAILED {condition_id[:16]} "
                             f"({fill_state}) — MANUAL INTERVENTION REQUIRED"
@@ -406,17 +432,26 @@ async def strategy_loop(
                         "No fill for %s — FOK legs killed; no exposure.",
                         condition_id[:16],
                     )
+                    notifier.arb_event(
+                        condition_id, "no fill — both FOK legs killed, no exposure")
 
             except CircuitBreakerTripped:
                 raise   # captured by _on_exec_done → trip_future → main halt
             except Exception as exc:  # noqa: BLE001
                 breaker.release_open()
                 logger.error("Arb pair execution failed: %s", exc)
+                notifier.arb_event(
+                    condition_id, f"❌ execution failed — {str(exc)[:120]}")
                 await notifier.notify(f"ARB EXECUTION ERROR: {exc}")
 
     def _dispatch_exec(*args) -> None:
         cid: str = args[5]   # condition_id (see _execute_and_settle signature)
         busy_conditions.add(cid)
+        # The episode waits for this execution's outcome from now. Marking it
+        # only once the orders were acknowledged left 0.1–0.3 s in which a book
+        # update could close the window and send "no execution attempted" for
+        # orders that were on their way.
+        notifier.arb_execution_started(cid)
         t = asyncio.create_task(_execute_and_settle(*args))
         inflight.add(t)
 
@@ -823,11 +858,13 @@ async def strategy_loop(
             # One live position per market: skip while an execution is in
             # flight, a maker pair rests under PairGuard watch, or a filled
             # pair is still being merged back to USDC.
-            if _condition_busy(condition_id):
+            _why_busy = _busy_reason(condition_id)
+            if _why_busy is not None:
                 logger.debug(
-                    "Signal on busy market %s — skipping (in-flight/resting/settling)",
-                    condition_id[:16],
+                    "Signal on busy market %s — skipping (%s)",
+                    condition_id[:16], _why_busy,
                 )
+                notifier.arb_skipped(condition_id, f"market busy — {_why_busy}")
                 continue
 
             # ── 4. Size the position ──────────────────────────────────────────
@@ -841,6 +878,7 @@ async def strategy_loop(
                     "(yes=%.4f no=%.4f)",
                     n_shares, yes_ask, no_ask,
                 )
+                notifier.arb_skipped(condition_id, "position size below minimum")
                 continue
 
             combined_cost_usdc: float = round(n_shares * arb_signal.combined_cost, 6)
@@ -856,6 +894,11 @@ async def strategy_loop(
                 combined_cost_usdc=combined_cost_usdc,
             )
             if not breaker.check_arb(intent):
+                notifier.arb_skipped(
+                    condition_id,
+                    f"blocked by the circuit breaker — "
+                    f"{getattr(breaker, 'last_block_reason', '') or 'limit'}",
+                )
                 continue
 
             # ── 6. Reserve the slot + dispatch execution off the consumer ─────

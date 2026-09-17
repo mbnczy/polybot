@@ -440,7 +440,7 @@ class TelegramNotifier:
             "detections": 0, "best_edge": 0.0, "yes": 0.0, "no": 0.0,
             "cost": 0.0, "is_maker": False, "category": "",
             "fee_type": "", "fee_rate": None, "events": [],
-            "pending": False, "window": None,
+            "pending": False, "window": None, "skips": {},
         }
 
     def arb_detected(
@@ -487,14 +487,32 @@ class TelegramNotifier:
         ep = self._episodes.setdefault(condition_id, self._blank_episode())
         ep["pending"] = True
 
+    def arb_skipped(self, condition_id: str, reason: str) -> None:
+        """
+        Record why a signal was NOT turned into orders — a busy market, the
+        breaker, a size below minimum. Counted per reason rather than listed:
+        a busy market skips every tick of a window.
+
+        Without this the summary said "nothing — no execution attempted" for a
+        signal a gate had refused, which read as if nothing had been tried.
+        """
+        ep = self._episodes.setdefault(condition_id, self._blank_episode())
+        ep["skips"][reason] = ep["skips"].get(reason, 0) + 1
+
     def arb_event(self, condition_id: str, text: str,
                   pnl: "float | None" = None) -> None:
         """
-        Record something that happened to this market's opportunity — an
-        execution, a block, a flatten, a completion. Ordered, kept verbatim.
+        Record the outcome of this market's opportunity — a fill, a flatten, a
+        completion, an expiry, a failure. Ordered, kept verbatim.
+
+        An outcome ends the wait for one: the episode is no longer pending. That
+        used to be cleared only when the window had already closed, so an
+        outcome arriving while the price window was still open left the episode
+        pending for good, and its summary was withheld until some later outcome.
         """
         ep = self._episodes.setdefault(condition_id, self._blank_episode())
         ep["events"].append((text, pnl))
+        ep["pending"] = False
         # An outcome for an episode whose window already closed: that window was
         # deferred waiting for exactly this, so the story is now complete.
         if ep.get("window") is not None:
@@ -568,8 +586,11 @@ class TelegramNotifier:
                         f"  <code>both legs = {both:.5f} USDC/pair "
                         f"({both * 10_000:.1f} bps)</code>"
                     )
-        if ep and ep["events"]:
+        skips = (ep or {}).get("skips") or {}
+        if ep and (ep["events"] or skips):
             lines.append("<b>What happened:</b>")
+            for reason, n in sorted(skips.items(), key=lambda kv: -kv[1]):
+                lines.append(f"  • not placed {n}× — {_h(reason)}")
             total = 0.0
             for text, pnl in ep["events"]:
                 suffix = f" <code>{pnl:+.4f}</code>" if pnl is not None else ""
@@ -581,6 +602,20 @@ class TelegramNotifier:
         elif ep and ep["detections"]:
             lines.append("<b>What happened:</b> nothing — no execution attempted")
 
+        # One line per message sent, so what the channel said can be counted.
+        if ep and ep["events"]:
+            outcome = ep["events"][-1][0]
+        elif skips:
+            outcome = "not placed: " + ", ".join(f"{r} ×{n}" for r, n in skips.items())
+        elif ep and ep["detections"]:
+            outcome = "no execution attempted"
+        else:
+            outcome = "no signal"
+        logger.info(
+            "ARB EPISODE sent | %s %s | %.2fs peak %.1f bps | signals %d | %s",
+            path, condition_id[:16], duration_s, peak_edge_bps,
+            (ep or {}).get("detections", 0), str(outcome)[:160],
+        )
         self._fire("\n".join(lines), parse_mode="HTML")
 
     def send_arb_detected(

@@ -295,6 +295,19 @@ class MakerPairGuard:
     def watched_count(self) -> int:
         return len(self._pairs)
 
+    def busy_reason(self, condition_id: str) -> "str | None":
+        """Why this market takes no new pair right now, or None when it can."""
+        if any(p.condition_id == condition_id for p in self._pairs.values()):
+            return "maker pair still resting"
+        if condition_id in self._residue:
+            return "naked shares from a partial unwind still being sold"
+        until = self._cooldown.get(condition_id)
+        if until is not None:
+            if time.monotonic() < until:
+                return "cooling down after a losing unwind"
+            del self._cooldown[condition_id]
+        return None
+
     def is_watching(self, condition_id: str) -> bool:
         """True while any pair on this market is still being resolved.
 
@@ -304,16 +317,7 @@ class MakerPairGuard:
 
         Also true while naked shares from a partial unwind are still being
         sold there, and for PAIR_LOSS_COOLDOWN_S after a losing unwind."""
-        if any(p.condition_id == condition_id for p in self._pairs.values()):
-            return True
-        if condition_id in self._residue:
-            return True
-        until = self._cooldown.get(condition_id)
-        if until is not None:
-            if time.monotonic() < until:
-                return True
-            del self._cooldown[condition_id]
-        return False
+        return self.busy_reason(condition_id) is not None
 
     # ──────────────────────────────────────────────────────────────────────────
     # Main loop
@@ -711,8 +715,13 @@ class MakerPairGuard:
                 "PairGuard | pair on %s dissolved with no position%s",
                 pair.condition_id[:16], hedged_note,
             )
-            if hedged_note:
-                self._notifier.arb_event(pair.condition_id, f"⚠️ Maker pair on {pair.condition_id[:16]} dissolved{hedged_note}")
+            # Always an outcome, even with nothing to report beyond "no fill":
+            # without one the episode waited for an outcome that never came,
+            # and its summary was never sent.
+            self._notifier.arb_event(
+                pair.condition_id,
+                f"⏹ Maker pair on {pair.condition_id[:16]} rested {rested:.0f}s with no "
+                f"fill — cancelled{hedged_note}")
 
     async def _complete_or_unwind(
         self,
