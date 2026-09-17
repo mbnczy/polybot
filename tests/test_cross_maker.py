@@ -230,3 +230,16 @@ def test_a_book_exactly_at_the_cap_still_rests():
               "by": _book(asks=[(0.55, 50)], bids=[(0.50, 50)])}
     opp, why = evaluate_maker(_imp(), at_cap["nn"], at_cap["by"], now=NOW, max_spread=0.05)
     assert why == "ok" and opp is not None
+
+
+@pytest.mark.asyncio
+async def test_a_refused_book_does_not_get_to_claim_the_best_edge(tmp_path, monkeypatch):
+    """The heartbeat read "best edge +0.9600" off a 0.01/0.99 book on 2026-09-17,
+    on a pair the wide-book gate had already refused."""
+    wide = {"nn": _book(asks=[(0.99, 50)], bids=[(0.01, 50)]),
+            "by": _book(asks=[(0.99, 50)], bids=[(0.01, 50)])}
+    g, _, _, _ = _maker_guard(tmp_path, monkeypatch, books=wide)
+    await g.poll_once()
+    line = g.stop_summary()
+    assert "book_too_wide 1" in line
+    assert "+0.9" not in line

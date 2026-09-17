@@ -1081,17 +1081,22 @@ class CrossGuard:
                              taker_edge: "float | None") -> "tuple[str, float | None]":
         """What resting our own bids would cost, and — when it pays — resting them."""
         key = imp.key
-        quote = maker_entry(imp, no_book, yes_book)
-        edge = taker_edge
-        if quote is not None:
-            maker_edge = 1.0 - quote[2]
-            edge = maker_edge if edge is None else max(edge, maker_edge)
         opp, reason = evaluate_maker(
             imp, no_book, yes_book, now=now, max_lockup_days=self._max_lockup,
             min_edge=self._maker_min_edge, max_usdc=self._max_usdc,
             min_shares=self._min_shares, min_time_to_end_s=self._min_time_to_end,
             yes_no_only=self._yes_no_only)
         self.last_reason[key] = reason
+        # The same discipline the taker path keeps: a price only counts once the
+        # book it came from has passed the gates. Pricing first put the +0.9600
+        # of an 0.01/0.99 book into the heartbeat's "best edge" on 2026-09-17,
+        # on a pair the wide-book gate had already refused.
+        edge = taker_edge
+        if stop_key(reason) in _PRICED_STOPS:
+            quote = maker_entry(imp, no_book, yes_book)
+            if quote is not None:
+                maker_edge = 1.0 - quote[2]
+                edge = maker_edge if edge is None else max(edge, maker_edge)
         if opp is None:
             return (stop_key(reason) if reason != "ok" else taker_stop), edge
         if not self._breaker.check_cross(opp.committed):
