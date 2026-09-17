@@ -516,8 +516,9 @@ async def test_a_far_pair_is_not_priced_again_next_poll(tmp_path, monkeypatch):
     assert len(reads) == 2                      # deferred, not re-priced
     line = g.stop_summary()
     assert "1 not re-priced" in line
-    # and it still reports what it was when last priced
-    assert "edge_below_min 1" in line and "best edge -0.7900" in line
+    # It still reports what it was when last priced — at the better of the two
+    # prices: resting our own bids (0.81 + 0.95) beats crossing (0.83 + 0.96).
+    assert "maker_edge_below_min 1" in line and "best edge -0.7600" in line
 
 
 # ── only markets whose YES token is provably "Yes" ────────────────────────────

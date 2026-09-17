@@ -123,6 +123,22 @@ CROSS_MAX_POSITION_USDC: float = float(os.environ.get("CROSS_MAX_POSITION_USDC",
 CROSS_MIN_TIME_TO_END_S: float = float(os.environ.get("CROSS_MIN_TIME_TO_END_S", 1800.0))
 CROSS_SUSPICIOUS_EDGE: float = float(os.environ.get("CROSS_SUSPICIOUS_EDGE", 0.15))
 CROSS_SPIKE_CONFIRM_S: float = float(os.environ.get("CROSS_SPIKE_CONFIRM_S", 300.0))
+# Resting our own bids instead of crossing the spread. A taker pays the ask plus
+# the fee on both legs; measured on the live book that is 1.5–3.4 points of fee
+# and a spread on top, and the best edge the taker path has seen in six days is
+# −1%. A maker fill pays no fee and buys a tick above the bid, which is where
+# that same pair can become tradeable. The cost is queue risk: an order can rest
+# unfilled, or one leg fills and the other does not.
+CROSS_MAKER_ENABLED: bool = _flag("CROSS_MAKER_ENABLED", "true")
+CROSS_MAKER_TTL_S: float = float(os.environ.get("CROSS_MAKER_TTL_S", 180.0))
+CROSS_MAKER_MIN_EDGE: float = float(os.environ.get("CROSS_MAKER_MIN_EDGE", CROSS_MIN_EDGE))
+# A bid a tick above an almost empty book is not an offer anyone will take: on
+# 2026-09-17 that produced "+0.96 edge" pairs whose books stood at 0.01 / 0.50.
+# Only a book tight enough for our bid to be near the market can be rested in.
+CROSS_MAKER_MAX_SPREAD: float = float(os.environ.get("CROSS_MAKER_MAX_SPREAD", 0.05))
+# Polymarket's tick is 0.01 in the middle of the range and 0.001 at the extremes.
+# The reader exports each market's own; this is the fallback.
+CROSS_DEFAULT_TICK: float = 0.01
 # With a wide net the file holds hundreds of pairs, and pricing every one of
 # them every poll is two book reads each against the exchange's rate limit. A
 # pair 30 points from the threshold does not become tradeable in 30 seconds, so
@@ -165,6 +181,8 @@ class Implication:
     confidence:       float = 0.0
     narrow_outcomes:  "tuple[str, ...] | None" = None
     broad_outcomes:   "tuple[str, ...] | None" = None
+    narrow_tick:      "float | None" = None
+    broad_tick:       "float | None" = None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -207,6 +225,8 @@ def load_implications(path: "str | Path") -> list[Implication]:
                                  if r.get("narrow_outcomes") else None),
                 broad_outcomes=(tuple(str(o) for o in r["broad_outcomes"])
                                 if r.get("broad_outcomes") else None),
+                narrow_tick=(float(r["narrow_tick"]) if r.get("narrow_tick") else None),
+                broad_tick=(float(r["broad_tick"]) if r.get("broad_tick") else None),
             ))
         except (KeyError, TypeError, ValueError):
             continue
@@ -289,6 +309,9 @@ def quoted_entry(
 # Matched against evaluate()'s reasons in order; a test pins every refusal to
 # its key, so a reworded reason cannot silently fall through to "other".
 _STOP_KEYS: tuple[tuple[str, str], ...] = (
+    ("too wide a book to rest in", "book_too_wide"),
+    ("at our own bids", "maker_edge_below_min"),
+    ("nothing to rest above", "no_bid"),
     ("outcome labels are unknown", "outcomes_unknown"),
     ("not a Yes/No market", "not_yes_no"),
     ("different statistics", "different_statistic"),
@@ -303,7 +326,8 @@ _STOP_KEYS: tuple[tuple[str, str], ...] = (
 )
 # Stops reached with both asks priced on a genuine implication: only these
 # contribute to "best edge", so a pseudo-implication's fake edge cannot show.
-_PRICED_STOPS = frozenset({"edge_below_min", "thin_touch", "ok"})
+_PRICED_STOPS = frozenset({"edge_below_min", "thin_touch", "ok", "maker_edge_below_min"})
+_SHARE_EPS: float = 0.005
 
 
 def stop_key(reason: str) -> str:
@@ -313,6 +337,150 @@ def stop_key(reason: str) -> str:
         if needle in reason:
             return key
     return "other"
+
+
+def tick_of(token_id: str, stated: "float | None") -> float:
+    """The market's price increment: what the reader exported, else the client's cache."""
+    if stated and stated > 0:
+        return float(stated)
+    try:
+        from core.clob_client import peek_market_meta  # noqa: PLC0415
+        meta = peek_market_meta(token_id)
+        if meta and meta[0] > 0:
+            return float(meta[0])
+    except Exception:  # noqa: BLE001 — a missing cache is not an error
+        pass
+    return CROSS_DEFAULT_TICK
+
+
+def maker_price(book: dict, tick: float) -> "float | None":
+    """
+    Where to rest a BUY: one tick above the best bid, or alongside it when that
+    tick would cross the spread. None without a bid to rest above — a leg with
+    no bid has nobody to sell back to either.
+    """
+    bid, ask = best_level(book, "bids"), best_level(book, "asks")
+    if bid is None:
+        return None
+    price = round(bid.price + tick, 4)
+    if ask is not None and price >= ask.price - 1e-9:
+        price = round(bid.price, 4)
+    return price if 0.0 < price < 1.0 else None
+
+
+@dataclass
+class MakerAttempt:
+    """Two of our own bids resting on two different markets."""
+    narrow:        str
+    broad:         str
+    narrow_title:  str
+    broad_title:   str
+    no_token:      str
+    yes_token:     str
+    no_price:      float
+    yes_price:     float
+    shares:        float
+    no_order:      str
+    yes_order:     str
+    placed_at:     float
+    resolves_ts:   "float | None"
+    committed:     float
+    no_filled:     float = 0.0
+    yes_filled:    float = 0.0
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.narrow, self.broad)
+
+    def as_dict(self) -> dict:
+        return {k: getattr(self, k) for k in (
+            "narrow", "broad", "narrow_title", "broad_title", "no_token", "yes_token",
+            "no_price", "yes_price", "shares", "no_order", "yes_order", "placed_at",
+            "resolves_ts", "committed", "no_filled", "yes_filled")}
+
+
+@dataclass(frozen=True)
+class MakerOpportunity:
+    imp:            Implication
+    no_price:       float      # our bid for NO on narrow
+    yes_price:      float      # our bid for YES on broad
+    shares:         float
+    entry_per_pair: float      # no fee: a maker fill pays none
+    lockup_days:    float
+
+    @property
+    def edge_per_pair(self) -> float:
+        return 1.0 - self.entry_per_pair
+
+    @property
+    def committed(self) -> float:
+        return self.shares * self.entry_per_pair
+
+
+def maker_entry(imp: Implication, no_book: dict, yes_book: dict) -> "tuple[float, float, float] | None":
+    """(NO price, YES price, cost per pair) if both legs can be quoted, else None."""
+    no_price = maker_price(no_book, tick_of(imp.narrow_no_token, imp.narrow_tick))
+    yes_price = maker_price(yes_book, tick_of(imp.broad_yes_token, imp.broad_tick))
+    if no_price is None or yes_price is None:
+        return None
+    return no_price, yes_price, round(no_price + yes_price, 6)
+
+
+def evaluate_maker(
+    imp: Implication, no_book: dict, yes_book: dict, *,
+    now: float,
+    max_lockup_days: float = CROSS_MAX_LOCKUP_DAYS,
+    min_edge: float = CROSS_MAKER_MIN_EDGE,
+    max_usdc: float = CROSS_MAX_POSITION_USDC,
+    min_shares: float = CROSS_MIN_SHARES,
+    min_time_to_end_s: float = CROSS_MIN_TIME_TO_END_S,
+    yes_no_only: bool = CROSS_YES_NO_ONLY,
+    max_spread: float = CROSS_MAKER_MAX_SPREAD,
+) -> "tuple[MakerOpportunity | None, str]":
+    """The same gates as a taker entry, priced at the bids we would rest."""
+    gate = _entry_gates(imp, now, max_lockup_days, min_time_to_end_s, yes_no_only)
+    if gate is not None:
+        return None, gate
+    for book, leg in ((no_book, "NO on narrow"), (yes_book, "YES on broad")):
+        bid, ask = best_level(book, "bids"), best_level(book, "asks")
+        # A book exactly at the cap must pass: 0.55 - 0.50 is 0.05000000000000004.
+        if bid is not None and ask is not None and ask.price - bid.price > max_spread + 1e-9:
+            return None, (f"{leg} quotes {bid.price:.3f}/{ask.price:.3f} — too wide a "
+                          f"book to rest in")
+    quote = maker_entry(imp, no_book, yes_book)
+    if quote is None:
+        return None, "a leg has no bid — nothing to rest above"
+    no_price, yes_price, entry = quote
+    if 1.0 - entry < min_edge:
+        return None, (f"maker edge {1.0 - entry:+.4f} < {min_edge:.4f} at our own bids")
+    shares = math.floor(max_usdc / entry * 100.0) / 100.0 if entry > 0 else 0.0
+    if shares < min_shares:
+        return None, (f"depth at the best ask ({shares:.2f} shares) does not reach the "
+                      f"{min_shares:g}-share minimum")
+    lockup = ((imp.resolves_ts or now) - now) / 86_400.0
+    return MakerOpportunity(imp, no_price, yes_price, shares, entry, lockup), "ok"
+
+
+def _entry_gates(imp: Implication, now: float, max_lockup_days: float,
+                 min_time_to_end_s: float, yes_no_only: bool) -> "str | None":
+    """The gates that do not depend on how the legs are priced."""
+    if same_quantity(imp.narrow_title, imp.broad_title) is False:
+        return "the two markets count different statistics — not an implication"
+    if imp.narrow_outcomes is None or imp.broad_outcomes is None:
+        return "a leg's outcome labels are unknown — its YES token is not proven"
+    if yes_no_only and not (is_yes_no(imp.narrow_outcomes) and is_yes_no(imp.broad_outcomes)):
+        return "a leg is not a Yes/No market — its YES token is not proven"
+    ends = imp.resolves_ts
+    if ends is None:
+        return "resolution date unknown — cannot show it fits the window"
+    if (ends - now) <= 0.0:
+        return "already past its end date"
+    if (ends - now) / 86_400.0 > max_lockup_days:
+        return f"locks capital {(ends - now) / 86_400.0:.1f}d > {max_lockup_days:g}d window"
+    if ends - now < min_time_to_end_s:
+        return (f"resolves in {(ends - now) / 60.0:.0f} min, under the "
+                f"{min_time_to_end_s / 60.0:.0f} min floor — dying book")
+    return None
 
 
 def evaluate(
@@ -328,26 +496,9 @@ def evaluate(
     yes_no_only: bool = CROSS_YES_NO_ONLY,
 ) -> "tuple[Opportunity | None, str]":
     """Every entry gate, from the two books. Returns (opportunity, reason)."""
-    # Belt and braces: the reader's prefilter already drops these, but this guard
-    # trades whatever the file says, and the first pair ever to clear every
-    # other gate here was three corners "implying" three goals.
-    if same_quantity(imp.narrow_title, imp.broad_title) is False:
-        return None, "the two markets count different statistics — not an implication"
-    if imp.narrow_outcomes is None or imp.broad_outcomes is None:
-        return None, "a leg's outcome labels are unknown — its YES token is not proven"
-    if yes_no_only and not (is_yes_no(imp.narrow_outcomes) and is_yes_no(imp.broad_outcomes)):
-        return None, "a leg is not a Yes/No market — its YES token is not proven"
-    ends = imp.resolves_ts
-    if ends is None:
-        return None, "resolution date unknown — cannot show it fits the window"
-    lockup = (ends - now) / 86_400.0
-    if lockup <= 0.0:
-        return None, "already past its end date"
-    if lockup > max_lockup_days:
-        return None, f"locks capital {lockup:.1f}d > {max_lockup_days:g}d window"
-    if ends - now < min_time_to_end_s:
-        return None, (f"resolves in {(ends - now) / 60.0:.0f} min, under the "
-                      f"{min_time_to_end_s / 60.0:.0f} min floor — dying book")
+    gate = _entry_gates(imp, now, max_lockup_days, min_time_to_end_s, yes_no_only)
+    if gate is not None:
+        return None, gate
     quote = quoted_entry(no_book, yes_book, rate_narrow, rate_broad)
     if quote is None:
         return None, "a leg has no ask — nothing to buy"
@@ -364,6 +515,7 @@ def evaluate(
     if shares <= 0.0:
         return None, (f"depth at the best ask ({no_ask.size:.0f} / {yes_ask.size:.0f}) "
                       f"does not reach the {min_shares:g}-share minimum")
+    lockup = ((imp.resolves_ts or now) - now) / 86_400.0
     return Opportunity(imp, no_ask, yes_ask, rate_narrow, rate_broad, shares,
                        entry, lockup), "ok"
 
@@ -391,6 +543,9 @@ class CrossGuard:
         suspicious_edge:   "float | None" = None,
         yes_no_only:       "bool | None" = None,
         max_book_reads:    "int | None" = None,
+        maker_enabled:     "bool | None" = None,
+        maker_ttl_s:       "float | None" = None,
+        maker_min_edge:    "float | None" = None,
         resolution_lookup: "ResolutionLookup | None" = None,
     ) -> None:
         self._client = client
@@ -416,6 +571,14 @@ class CrossGuard:
         self._next_check: dict[tuple[str, str], float] = {}
         # What each pair was last judged to be, so a deferred pair still reports
         # its price rather than vanishing behind "deferred".
+        self._maker_enabled = CROSS_MAKER_ENABLED if maker_enabled is None else maker_enabled
+        self._maker_ttl = CROSS_MAKER_TTL_S if maker_ttl_s is None else maker_ttl_s
+        self._maker_min_edge = (CROSS_MAKER_MIN_EDGE if maker_min_edge is None
+                                else maker_min_edge)
+        self._attempts: dict[tuple[str, str], MakerAttempt] = {}
+        self._attempts_path = Path(positions_path or CROSS_POSITIONS_PATH).with_name(
+            Path(positions_path or CROSS_POSITIONS_PATH).stem + "_maker.json")
+        self._orphans: list[MakerAttempt] = []
         self._last_stop: dict[tuple[str, str], str] = {}
         self._last_edge: dict[tuple[str, str], "float | None"] = {}
         self._resolved = resolution_lookup or _gamma_resolution
@@ -424,15 +587,17 @@ class CrossGuard:
         self._stuck: set[tuple[str, str]] = set()
         self.last_reason: dict[tuple[str, str], str] = {}
         self.stats = {"evaluated": 0, "would_enter": 0, "entered": 0,
-                      "half_filled": 0, "exited": 0, "resolved": 0, "stuck": 0}
+                      "half_filled": 0, "exited": 0, "resolved": 0, "stuck": 0,
+                      "would_rest": 0, "rested": 0, "maker_filled": 0}
         # The last complete pass over the reader's file, for stop_summary():
         # (when, implications read, stops by key, (best edge, narrow title)).
         self._last_pass: ("tuple[float, int, dict[str, int], "
                           "tuple[float, str] | None, int] | None") = None
         logger.info(
-            "CrossGuard init | %s | window=%gd min_edge=%.3f max_pos=%.2f USDC "
-            "open=%d file=%s",
+            "CrossGuard init | %s | maker=%s (ttl %.0fs, min_edge %.3f) | window=%gd "
+            "min_edge=%.3f max_pos=%.2f USDC open=%d file=%s",
             "EXECUTING" if self._enabled else "evaluate only (disabled)",
+            "on" if self._maker_enabled else "off", self._maker_ttl, self._maker_min_edge,
             self._max_lockup, self._min_edge, self._max_usdc,
             len(self._book.open_positions()), self._imp_path,
         )
@@ -452,7 +617,30 @@ class CrossGuard:
             n += 1
         if n:
             logger.info("CrossGuard | restored %d open position(s) into the breaker", n)
+        # Orders we left resting belong to a process that is gone: nothing would
+        # watch them fill. They are cancelled on the first poll.
+        try:
+            raw = json.loads(self._attempts_path.read_text())
+        except (OSError, ValueError):
+            raw = []
+        for row in raw if isinstance(raw, list) else []:
+            try:
+                self._orphans.append(MakerAttempt(**row))
+            except TypeError:
+                continue
+        if self._orphans:
+            logger.warning("CrossGuard | %d maker order pair(s) left resting by the "
+                           "previous process — cancelling on the first poll",
+                           len(self._orphans))
         return n
+
+    def _save_attempts(self) -> None:
+        try:
+            tmp = self._attempts_path.with_suffix(self._attempts_path.suffix + ".tmp")
+            tmp.write_text(json.dumps([a.as_dict() for a in self._attempts.values()]))
+            tmp.replace(self._attempts_path)
+        except OSError as exc:
+            logger.warning("CrossGuard | cannot write %s: %s", self._attempts_path, exc)
 
     def _recent(self) -> list[CrossPosition]:
         cutoff = time.time() - CROSS_REDEEM_TAIL_DAYS * 86_400.0
@@ -462,11 +650,18 @@ class CrossGuard:
 
     def condition_ids(self) -> set[str]:
         """Markets AutoRedeemer should watch: held now, or resolved recently."""
-        return {c for p in self._recent() for c in (p.narrow, p.broad)}
+        out = {c for p in self._recent() for c in (p.narrow, p.broad)}
+        out |= {c for a in self._attempts.values() for c in (a.narrow, a.broad)}
+        return out
 
     def managed_titles(self) -> set[str]:
         """Titles whose inventory this guard owns, for WalletReconciler."""
-        return {t for p in self._recent() for t in (p.narrow_title, p.broad_title) if t}
+        out = {t for p in self._recent() for t in (p.narrow_title, p.broad_title) if t}
+        # A maker order that fills puts shares in the wallet before any position
+        # exists; without this the reconciler would call them an escape.
+        out |= {t for a in self._attempts.values()
+                for t in (a.narrow_title, a.broad_title) if t}
+        return out
 
     def open_positions(self) -> list[CrossPosition]:
         return self._book.open_positions()
@@ -516,8 +711,170 @@ class CrossGuard:
 
     async def poll_once(self) -> None:
         now = time.time()
+        await self._cancel_orphans()
+        await self._watch_maker(now)
         await self._watch_open(now)
         await self._scan_entries(now)
+
+    # ── resting our own bids ──────────────────────────────────────────────────
+
+    async def _cancel_orphans(self) -> None:
+        """Cancel maker orders a previous process left resting; nothing watches them."""
+        while self._orphans:
+            a = self._orphans.pop()
+            for order in (a.no_order, a.yes_order):
+                if not order:
+                    continue
+                try:
+                    await self._client.cancel_order(order)
+                    logger.warning("CrossGuard | cancelled orphaned maker order %s", order[:12])
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("CrossGuard | orphan cancel %s failed: %s", order[:12], exc)
+        if self._attempts_path.exists() and not self._attempts:
+            self._save_attempts()
+
+    async def _post_maker(self, token: str, price: float, shares: float) -> "str | None":
+        try:
+            resp = await self._client.post_maker_order(
+                token_id=token, side="BUY", desired_price=price, size=shares)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("CrossGuard | maker post failed on %s: %s", token[:12], exc)
+            return None
+        oid = str((resp or {}).get("order_id") or (resp or {}).get("orderID") or "")
+        return oid or None
+
+    async def _rest_maker(self, opp: MakerOpportunity, now: float) -> bool:
+        imp = opp.imp
+        self._breaker.on_cross_open(opp.committed)
+        no_id = await self._post_maker(imp.narrow_no_token, opp.no_price, opp.shares)
+        yes_id = await self._post_maker(imp.broad_yes_token, opp.yes_price, opp.shares)
+        if not no_id or not yes_id:
+            for oid in (no_id, yes_id):
+                if oid:
+                    try:
+                        await self._client.cancel_order(oid)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("CrossGuard | cancel after a failed pair: %s", exc)
+            self._breaker.release_cross(opp.committed)
+            self._cooldown[imp.key] = now + CROSS_ENTRY_COOLDOWN_S
+            logger.warning("CrossGuard | could not rest both legs on %s — nothing left open",
+                           imp.narrow_title[:40])
+            return False
+        self._attempts[imp.key] = MakerAttempt(
+            narrow=imp.narrow, broad=imp.broad, narrow_title=imp.narrow_title,
+            broad_title=imp.broad_title, no_token=imp.narrow_no_token,
+            yes_token=imp.broad_yes_token, no_price=opp.no_price, yes_price=opp.yes_price,
+            shares=opp.shares, no_order=no_id, yes_order=yes_id, placed_at=now,
+            resolves_ts=imp.resolves_ts, committed=opp.committed)
+        self._save_attempts()
+        self.stats["rested"] += 1
+        await self._say(
+            f"🪧 CROSS MAKER ORDERS RESTING\n"
+            f"  NO  {imp.narrow_title[:56]} @ {opp.no_price:.4f}\n"
+            f"  YES {imp.broad_title[:56]} @ {opp.yes_price:.4f}\n"
+            f"  {opp.shares:.2f} pairs · entry {opp.entry_per_pair:.4f} → "
+            f"{opp.edge_per_pair:+.4f}/pair if both fill · {self._maker_ttl:.0f}s to fill")
+        return True
+
+    async def _refresh_attempt(self, a: MakerAttempt) -> None:
+        for leg in ("no", "yes"):
+            order, token = getattr(a, f"{leg}_order"), getattr(a, f"{leg}_token")
+            if not order:
+                continue
+            try:
+                filled = await self._client.order_filled_size(order, token)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("CrossGuard | fill lookup failed for %s: %s", order[:12], exc)
+                continue
+            if filled is not None:
+                setattr(a, f"{leg}_filled",
+                        max(getattr(a, f"{leg}_filled"), min(a.shares, float(filled))))
+
+    async def _watch_maker(self, now: float) -> None:
+        for a in list(self._attempts.values()):
+            await self._refresh_attempt(a)
+            if min(a.no_filled, a.yes_filled) >= a.shares - _SHARE_EPS:
+                await self._settle_attempt(a, now)           # both legs filled
+                continue
+            if now - a.placed_at < self._maker_ttl:
+                continue
+            for order in (a.no_order, a.yes_order):
+                try:
+                    await self._client.cancel_order(order)
+                except Exception as exc:  # noqa: BLE001
+                    logger.info("CrossGuard | cancel %s failed (may have filled): %s",
+                                order[:12], exc)
+            # A cancel can race a fill, and the trade feed trails the match.
+            await self._refresh_attempt(a)
+            await self._settle_attempt(a, now)
+
+    async def _settle_attempt(self, a: MakerAttempt, now: float) -> None:
+        """What the resting pair actually became: a position, an excess, or nothing."""
+        self._attempts.pop(a.key, None)
+        self._save_attempts()
+        self._cooldown[a.key] = now + CROSS_ENTRY_COOLDOWN_S
+        pairs = math.floor(min(a.no_filled, a.yes_filled) * 100.0) / 100.0
+        self._breaker.release_cross(a.committed)
+        if pairs > _SHARE_EPS:
+            await self._open_from_maker(a, pairs, a.no_price, a.yes_price, now, "maker")
+        excess = round(abs(a.no_filled - a.yes_filled), 4)
+        if excess > _SHARE_EPS:
+            await self._resolve_excess(a, excess, now)
+        elif pairs <= _SHARE_EPS:
+            logger.info("CrossGuard | maker pair on %s expired unfilled — nothing held",
+                        a.narrow_title[:40])
+
+    async def _open_from_maker(self, a: MakerAttempt, size: float, no_paid: float,
+                               yes_paid: float, now: float, how: str) -> None:
+        imp_pos = CrossPosition(
+            narrow=a.narrow, broad=a.broad, narrow_title=a.narrow_title,
+            broad_title=a.broad_title, narrow_yes_token="", narrow_no_token=a.no_token,
+            broad_yes_token=a.yes_token, broad_no_token="", size=size,
+            narrow_no_paid=no_paid, broad_yes_paid=yes_paid, opened_ts=now,
+            resolves_ts=a.resolves_ts, paper=False)
+        self._breaker.on_cross_open(imp_pos.entry_cost * size)
+        self._book.open(imp_pos)
+        self._book.save()
+        self.stats["maker_filled"] += 1
+        await self._say(
+            f"💰 CROSS POSITION OPENED ({how})\n"
+            f"  NO  {a.narrow_title[:56]} @ {no_paid:.4f}\n"
+            f"  YES {a.broad_title[:56]} @ {yes_paid:.4f}\n"
+            f"  {size:.2f} pairs · entry {imp_pos.entry_cost:.4f} → guaranteed "
+            f"{imp_pos.guaranteed_edge:+.4f}/pair ({imp_pos.guaranteed_edge * size:+.2f} USDC)")
+
+    async def _resolve_excess(self, a: MakerAttempt, excess: float, now: float) -> None:
+        """One leg filled further than the other: complete it if that still pays, else sell it back."""
+        no_rich = a.no_filled > a.yes_filled
+        held_token = a.no_token if no_rich else a.yes_token
+        held_paid = a.no_price if no_rich else a.yes_price
+        other_token = a.yes_token if no_rich else a.no_token
+        ask = best_level(await self._client.get_orderbook(other_token), "asks")
+        if ask is not None and ask.size >= excess:
+            completed = held_paid + buy_cost(ask.price, None)
+            if completed < 1.0:
+                got = await self._buy(other_token, ask.price, excess)
+                if got:
+                    size = math.floor(min(excess, got) * 100.0) / 100.0
+                    no_paid = held_paid if no_rich else ask.price
+                    yes_paid = ask.price if no_rich else held_paid
+                    await self._open_from_maker(a, size, no_paid, yes_paid, now,
+                                                "maker + taker completion")
+                    return
+        self.stats["half_filled"] += 1
+        pnl = await self._sell(held_token, excess, held_paid)
+        if pnl is None:
+            self.stats["stuck"] += 1
+            self._stuck.add(a.key)
+            await self._say(
+                f"🚨 CROSS MAKER HALF-FILL STUCK — {excess:.2f} shares of "
+                f"{'NO ' + a.narrow_title[:50] if no_rich else 'YES ' + a.broad_title[:50]} "
+                f"filled alone and could not be sold back. Manual decision needed.")
+            return
+        self._breaker.book_pnl(pnl)
+        await self._say(
+            f"⚠️ CROSS MAKER HALF-FILL — {excess:.2f} shares filled on one leg only, "
+            f"sold back for {pnl:+.4f} USDC.\n  {a.narrow_title[:56]}\n  {a.broad_title[:56]}")
 
     # ── entries ───────────────────────────────────────────────────────────────
 
@@ -603,7 +960,7 @@ class CrossGuard:
         """
         if stop in ("held", "stuck", "cooldown", "past_end", "outside_window",
                     "end_unknown", "different_statistic", "too_close_to_end",
-                    "not_yes_no", "outcomes_unknown"):
+                    "not_yes_no", "outcomes_unknown", "resting"):
             return 0.0                      # judged without a book read anyway
         if edge is None:
             return CROSS_RECHECK_MID_S      # no ask, no bid, or no book at all
@@ -629,6 +986,8 @@ class CrossGuard:
         key = imp.key
         if self._book.has_open(*key):
             return "held"
+        if key in self._attempts:
+            return "resting"
         if key in self._stuck:
             return "stuck"
         if self._cooldown.get(key, 0.0) > now:
@@ -680,6 +1039,10 @@ class CrossGuard:
             quote = quoted_entry(no_book, yes_book, rate_narrow, rate_broad)
             edge = None if quote is None else 1.0 - quote[2]
         if opp is None:
+            # The taker path pays the ask plus a fee on both legs. Our own bid
+            # pays neither, and that is where these pairs can become tradeable.
+            if self._maker_enabled and stop in ("edge_below_min", "thin_touch", "no_ask"):
+                return await self._maker_attempt(imp, no_book, yes_book, now, stop, edge)
             return stop, edge
         if not self._breaker.check_cross(opp.committed):
             self.last_reason[key] = "blocked by the breaker"
@@ -712,6 +1075,50 @@ class CrossGuard:
             return "would_enter", edge
         await self._enter(opp, now)
         return "attempted", edge
+
+    async def _maker_attempt(self, imp: Implication, no_book: dict, yes_book: dict,
+                             now: float, taker_stop: str,
+                             taker_edge: "float | None") -> "tuple[str, float | None]":
+        """What resting our own bids would cost, and — when it pays — resting them."""
+        key = imp.key
+        quote = maker_entry(imp, no_book, yes_book)
+        edge = taker_edge
+        if quote is not None:
+            maker_edge = 1.0 - quote[2]
+            edge = maker_edge if edge is None else max(edge, maker_edge)
+        opp, reason = evaluate_maker(
+            imp, no_book, yes_book, now=now, max_lockup_days=self._max_lockup,
+            min_edge=self._maker_min_edge, max_usdc=self._max_usdc,
+            min_shares=self._min_shares, min_time_to_end_s=self._min_time_to_end,
+            yes_no_only=self._yes_no_only)
+        self.last_reason[key] = reason
+        if opp is None:
+            return (stop_key(reason) if reason != "ok" else taker_stop), edge
+        if not self._breaker.check_cross(opp.committed):
+            self.last_reason[key] = "blocked by the breaker"
+            return "breaker", edge
+        if opp.edge_per_pair >= self._suspicious_edge:
+            seen = self._spike.get(key, 0.0)
+            self._spike[key] = now
+            if now - seen > CROSS_SPIKE_CONFIRM_S:
+                logger.info(
+                    "CrossGuard | maker %+.4f/pair on %s is above %.2f — waiting for a "
+                    "second poll to confirm it is not a stale book",
+                    opp.edge_per_pair, imp.narrow_title[:40], self._suspicious_edge)
+                return "unconfirmed_spike", edge
+        if not self._enabled:
+            self.stats["would_rest"] += 1
+            self._cooldown[key] = now + CROSS_ENTRY_COOLDOWN_S
+            logger.info(
+                "CrossGuard | WOULD REST (disabled) %s ⊆ %s | %.2f pairs, bids "
+                "%.4f + %.4f = %.4f → edge %+.4f/pair · %.2f USDC · %.1fd "
+                "(taker was %s)",
+                imp.narrow_title[:40], imp.broad_title[:40], opp.shares, opp.no_price,
+                opp.yes_price, opp.entry_per_pair, opp.edge_per_pair, opp.committed,
+                opp.lockup_days, taker_stop)
+            return "maker_would_rest", edge
+        rested = await self._rest_maker(opp, now)
+        return ("maker_resting" if rested else "maker_failed"), edge
 
     async def _buy(self, token: str, price: float, shares: float) -> "float | None":
         """FOK buy. Returns shares received, or None when nothing filled."""
