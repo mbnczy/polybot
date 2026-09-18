@@ -13,6 +13,10 @@ record_ws_books.py:
     resting:   (1 − narrow YES ask + tick) + (broad YES bid + tick), no fee,
                only while both books are within --max-spread, as the guard does
 
+A crossed book (bid at or above ask) is dropped as stale: the exchange cannot
+hold one. --rest-only replays just the periodic REST reads, which cannot go
+stale, at their coarser cadence.
+
 An episode is a stretch during which the edge stays at or above --min-edge; it
 ends at the first update that takes it below. Depth is the smaller of the two
 touches the crossing would take (narrow YES bid size, broad YES ask size).
@@ -99,8 +103,10 @@ def main(args) -> int:
     for f in files:
         for line in _lines(f):
             lines += 1
-            snap = line.startswith("S")
-            parts = (line[1:] if snap else line).rstrip("\n").split(",")
+            mark = line[0] if line[0] in "SR" else ""
+            if args.rest_only and mark != "R":
+                continue
+            parts = (line[1:] if mark else line).rstrip("\n").split(",")
             if len(parts) != 6:
                 continue
             t = int(parts[0]) / 1000.0
@@ -108,6 +114,8 @@ def main(args) -> int:
             bid = float(parts[2]) if parts[2] else None
             ask = float(parts[3]) if parts[3] else None
             top[i] = (bid, ask, float(parts[4] or 0), float(parts[5] or 0))
+            if bid is not None and ask is not None and bid >= ask:
+                top.pop(i)           # a crossed book cannot exist: the state went stale
             for r in touching.get(i, ()):
                 n, b = top.get(idx[r.narrow]), top.get(idx[r.broad])
                 if not n or not b:
@@ -177,4 +185,6 @@ if __name__ == "__main__":
     ap.add_argument("--max-spread", type=float, default=0.05,
                     help="resting only in books this tight, as the guard does")
     ap.add_argument("--top", type=int, default=12)
+    ap.add_argument("--rest-only", action="store_true",
+                    help="replay only the REST reads (R lines): coarser, but the ground truth")
     sys.exit(main(ap.parse_args()))

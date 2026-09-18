@@ -23,8 +23,11 @@ when a token's best bid or best ask moves:
 
     epoch_ms,token_index,bid,ask,bid_size,ask_size
 
-and every --snapshot-s every token's current state is written again with an S
-in front, as an anchor. tokens.jsonl maps each index to its market. Files are
+and every --snapshot-s every book is read again from REST (POST /books) and
+written with an R in front. Those lines are the ground truth: the WebSocket
+state can go stale — on 2026-09-18 a consumed level stayed in a replayed book
+for thirteen minutes, showing a 0.99 bid against a 0.54 ask — and the REST read
+replaces it. tokens.jsonl maps each index to its market. Files are
 gzipped per hour, and recording stops at --max-mb on disk.
 
 It never builds a signing client and holds no key: market data only.
@@ -51,6 +54,7 @@ import aiohttp  # noqa: E402
 logger = logging.getLogger("recorder")
 
 _WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+_BOOKS_URL = "https://clob.polymarket.com/books"
 _EXACT = re.compile(r"exact score", re.I)
 
 
@@ -182,7 +186,7 @@ class Recorder:
             self._hour = hour
         return self._fh
 
-    def write(self, token: str, snapshot: bool = False) -> None:
+    def write(self, token: str, snapshot: bool = False, mark: str = "S") -> None:
         if self.full:
             return
         book = self.books.get(token)
@@ -194,7 +198,7 @@ class Recorder:
         self.last[token] = top
         bid, ask, bs, az = top
         self._file().write(
-            f"{'S' if snapshot else ''}{int(time.time() * 1000)},{self.index[token]},"
+            f"{mark if snapshot else ''}{int(time.time() * 1000)},{self.index[token]},"
             f"{'' if bid is None else bid},{'' if ask is None else ask},{bs:g},{az:g}\n")
         self.lines += 1
 
@@ -256,10 +260,25 @@ async def shard(tokens: list[str], rec: Recorder, sid: int) -> None:
 
 
 async def snapshots(rec: Recorder, every: float) -> None:
+    """Every `every` seconds, replace each book with a REST read and write it as R."""
     while True:
         await asyncio.sleep(every)
-        for token in list(rec.books):
-            rec.write(token, snapshot=True)
+        tokens = list(rec.books)
+        async with aiohttp.ClientSession() as s:
+            for i in range(0, len(tokens), 100):
+                part = tokens[i:i + 100]
+                try:
+                    async with s.post(_BOOKS_URL, json=[{"token_id": t} for t in part],
+                                      timeout=aiohttp.ClientTimeout(total=20)) as r:
+                        books = await r.json(content_type=None) if r.status == 200 else []
+                except Exception as exc:  # noqa: BLE001 — the next round tries again
+                    logger.warning("REST resync failed: %s", exc)
+                    books = []
+                for b in books or ():
+                    token = str(b.get("asset_id") or "")
+                    if token in rec.books:
+                        rec.books[token].load(b.get("bids"), b.get("asks"))
+                        rec.write(token, snapshot=True, mark="R")
         rec.flush()
         if rec.disk_bytes() > rec.max_bytes:
             rec.full = True
