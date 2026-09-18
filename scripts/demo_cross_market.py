@@ -353,6 +353,32 @@ def _spread(market: dict) -> "float | None":
     return None if bid is None or ask is None else ask - bid
 
 
+# Twice the guard's maker gate (CROSS_MAKER_MAX_SPREAD 0.05). A book is watched
+# while it is merely near tradeable, so a pair does not leave the file and come
+# back every time its spread brushes the gate.
+READER_MAX_SPREAD = 0.10
+
+
+def quotable(markets: list[dict], max_spread: float) -> list[dict]:
+    """
+    The markets someone actually quotes: a bid and an ask no wider than
+    `max_spread`.
+
+    Measured 2026-09-18 over the one-week window: 85,548 markets, 28,600 of them
+    within 0.10. The other two thirds filled 84% of the export with pairs the
+    guard refused as "book_too_wide", and at two book reads a pair they kept its
+    queue saturated — a full sweep took 19 minutes. Filtering here loses nothing
+    tradeable: pairs with a tight book on both legs went from 461 to 474,
+    because the prefilter's 20,000 slots go to quotable markets instead.
+    """
+    out = []
+    for m in markets:
+        spread = _spread(m)
+        if spread is not None and spread <= max_spread + 1e-9:
+            out.append(m)
+    return out
+
+
 def _backwards(narrow: dict, broad: dict) -> bool:
     """
     True when the two titles themselves refute "narrow implies broad".
@@ -1224,7 +1250,13 @@ def one_pass(args, markets_cache: dict) -> int:
         except Exception as exc:                    # noqa: BLE001 — never stops a pass
             logger.error("resolution audit failed: %s", exc)
     if fresh_discovery:
-        rels = _drop_backwards(discover(markets, args), markets)
+        universe = markets
+        cap = getattr(args, "max_spread", None)
+        if cap is not None:
+            universe = quotable(markets, cap)
+            print(f"  quotable   : {len(universe)} of {len(markets)} market(s) quoted "
+                  f"within {cap:.2f} — the rest never reach the model or the export")
+        rels = _drop_backwards(discover(universe, args), markets)
         markets_cache["rels"] = rels
 
         # Only announce relations we have not announced before.
@@ -1300,6 +1332,10 @@ def main() -> int:
     ap.add_argument("--price-first-share", type=float, default=0.75, metavar="F",
                     help="share of that budget spent on pairs the prices would already "
                          "pay for; the rest follows the prefilter's ranking")
+    ap.add_argument("--max-spread", type=float, default=READER_MAX_SPREAD, metavar="S",
+                    help="only markets quoted within this spread reach the model and "
+                         "the export (default %(default)s); pass a negative value to "
+                         "keep every market")
     ap.add_argument("--price-first-max-edge", type=float, default=PRICE_FIRST_MAX_EDGE,
                     metavar="E",
                     help="apparent edge above which a pair is treated as not an "
@@ -1359,6 +1395,8 @@ def main() -> int:
     ap.add_argument("--env-file",    default=str(REPO / ".env"))
     ap.add_argument("--bot-env",     default="/home/ubuntu/polybot/.env")
     args = ap.parse_args()
+    if args.max_spread is not None and args.max_spread < 0:
+        args.max_spread = None
 
     logging.basicConfig(level=logging.INFO, format="  %(levelname)s %(message)s")
     # httpx logs every request at INFO. Fetching the whole window is ~500 of them

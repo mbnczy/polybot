@@ -380,12 +380,13 @@ async def test_the_summary_names_where_each_pair_stopped(tmp_path, monkeypatch):
     assert "best edge +0.1500" in line
     assert client.buys == []
 
-    # Next pass the would-be entry sits out its cooldown and the pair 79 points
-    # from the threshold is deferred rather than re-priced: the snapshot moves
-    # on, the running count keeps it.
+    # Next pass the would-be entry sits out its cooldown. The pair 79 points
+    # from the threshold is not due, but the budget has room for it, so it is
+    # priced again rather than left to go stale.
     await g.poll_once()
     line = g.stop_summary()
-    assert "cooldown 1" in line and "1 not re-priced" in line
+    assert "cooldown 1" in line and "not re-priced" not in line
+    assert "stalest price 0s" in line
     assert line.endswith("would_enter 1 entered 0 open 0")
 
 
@@ -497,11 +498,17 @@ def test_a_pair_judged_without_a_book_read_is_not_deferred(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_a_far_pair_is_not_priced_again_next_poll(tmp_path, monkeypatch):
-    """Two book reads per pair per poll is what a wide net cannot afford."""
+async def test_a_far_pair_waits_behind_the_pairs_that_are_due(tmp_path, monkeypatch):
+    """Two book reads per pair per poll is what a wide net cannot afford: when
+    the budget is taken, a pair 79 points away is the one that waits."""
     far = {"nn": _book(asks=[(0.83, 50)], bids=[(0.80, 50)]),
-           "by": _book(asks=[(0.96, 50)], bids=[(0.94, 50)])}     # edge -0.79
-    g, client, _, _ = _guard(tmp_path, monkeypatch, far, [_imp()], enabled=False)
+           "by": _book(asks=[(0.96, 50)], bids=[(0.94, 50)]),      # edge -0.79
+           "nn2": _book(asks=[(0.83, 50)], bids=[(0.80, 50)]),
+           "by2": _book(asks=[(0.96, 50)], bids=[(0.94, 50)])}
+    second = _imp(narrow="0xn2", broad="0xb2", narrow_no_token="nn2",
+                  broad_yes_token="by2", narrow_yes_token="ny2", broad_no_token="bn2")
+    g, client, _, _ = _guard(tmp_path, monkeypatch, far, [_imp(), second],
+                             enabled=False, max_book_reads=2)
     reads = []
     inner = client.get_orderbook
 
@@ -511,14 +518,14 @@ async def test_a_far_pair_is_not_priced_again_next_poll(tmp_path, monkeypatch):
 
     client.get_orderbook = counting
     await g.poll_once()
-    assert len(reads) == 2
+    assert reads == ["nn", "by"]
     await g.poll_once()
-    assert len(reads) == 2                      # deferred, not re-priced
+    assert reads[2:] == ["nn2", "by2"]          # the unpriced pair went first
     line = g.stop_summary()
     assert "1 not re-priced" in line
     # It still reports what it was when last priced — at the better of the two
     # prices: resting our own bids (0.81 + 0.95) beats crossing (0.83 + 0.96).
-    assert "maker_edge_below_min 1" in line and "best edge -0.7600" in line
+    assert "maker_edge_below_min 2" in line and "best edge -0.7600" in line
 
 
 # ── only markets whose YES token is provably "Yes" ────────────────────────────

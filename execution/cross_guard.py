@@ -581,6 +581,10 @@ class CrossGuard:
         self._orphans: list[MakerAttempt] = []
         self._last_stop: dict[tuple[str, str], str] = {}
         self._last_edge: dict[tuple[str, str], "float | None"] = {}
+        # When each pair's books were last read, and when this guard first looked
+        # at the file: the stalest price is how late we can be to a dislocation.
+        self._priced_at: dict[tuple[str, str], float] = {}
+        self._first_scan: "float | None" = None
         self._resolved = resolution_lookup or _gamma_resolution
         self._book = PositionBook(positions_path or CROSS_POSITIONS_PATH).load()
         self._cooldown: dict[tuple[str, str], float] = {}
@@ -590,9 +594,10 @@ class CrossGuard:
                       "half_filled": 0, "exited": 0, "resolved": 0, "stuck": 0,
                       "would_rest": 0, "rested": 0, "maker_filled": 0}
         # The last complete pass over the reader's file, for stop_summary():
-        # (when, implications read, stops by key, (best edge, narrow title)).
+        # (when, implications read, stops by key, (best edge, narrow title),
+        #  pairs not priced this pass, age of the stalest price in seconds).
         self._last_pass: ("tuple[float, int, dict[str, int], "
-                          "tuple[float, str] | None, int] | None") = None
+                          "tuple[float, str] | None, int, float | None] | None") = None
         logger.info(
             "CrossGuard init | %s | maker=%s (ttl %.0fs, min_edge %.3f) | window=%gd "
             "min_edge=%.3f max_pos=%.2f USDC open=%d file=%s",
@@ -676,7 +681,7 @@ class CrossGuard:
         """
         if self._last_pass is None:
             return "no pass yet"
-        ts, total, stops, best, deferred = self._last_pass
+        ts, total, stops, best, deferred, stalest = self._last_pass
         head = f"last pass {time.time() - ts:.0f}s ago"
         if not total:
             return f"{head} | no implications in {self._imp_path}"
@@ -685,6 +690,8 @@ class CrossGuard:
         line = f"{head} | {total} implication(s): {parts}"
         if deferred:
             line += f" | {deferred} not re-priced this pass"
+        if stalest is not None:
+            line += f" | stalest price {stalest:.0f}s"
         if best is not None:
             line += f" | best edge {best[0]:+.4f} (min {self._min_edge:.4f}) {best[1][:50]}"
         return (f"{line} | would_enter {self.stats['would_enter']} "
@@ -901,7 +908,28 @@ class CrossGuard:
         sig = (st.st_mtime_ns, st.st_size)
         if self._imp_cache[0] != sig:
             self._imp_cache = (sig, load_implications(self._imp_path))
+            self._forget_departed({imp.key for imp in self._imp_cache[1]})
         return self._imp_cache[1]
+
+    def _forget_departed(self, present: "set[tuple[str, str]]") -> None:
+        """
+        Drop the schedule of pairs that left the file. The reader now exports
+        only quotable books, so pairs come and go with their spreads, and each
+        departure used to leave four entries behind for the life of the process.
+        A pair that returns is simply priced as new. Cooldowns and stuck pairs
+        are safety state and are kept whatever the file says.
+        """
+        for table in (self._last_stop, self._last_edge, self._next_check,
+                      self._priced_at, self.last_reason):
+            for key in [k for k in table if k not in present]:
+                del table[key]
+
+    def _spare_priority(self, imp: Implication) -> tuple:
+        """Which deferred pair gets a leftover read: books last seen tight before
+        books refused as too wide, then whichever has waited longest."""
+        key = imp.key
+        wide = self._last_stop.get(key) == "book_too_wide"
+        return (wide, self._priced_at.get(key, 0.0))
 
     def _priority(self, imp: Implication) -> tuple:
         """Where a book read is worth most: near the threshold, then never priced, then longest waiting."""
@@ -915,20 +943,41 @@ class CrossGuard:
 
     async def _scan_entries(self, now: float) -> None:
         imps = self._implications()
+        if self._first_scan is None:
+            self._first_scan = now
         judged: "list[tuple[Implication, str, float | None]]" = []
         due: list[Implication] = []
+        spare: list[Implication] = []
         for imp in imps:
             stop = self._cheap_stop(imp, now)
             if stop is None:
                 due.append(imp)
+            elif stop == "deferred":
+                spare.append(imp)
             else:
                 judged.append((imp, stop, None))
         due.sort(key=self._priority)
+        watched = due + spare                       # every pair a book read could price
         budget = max(1, self._max_reads // 2)
-        for imp in due[:budget]:
+        batch = due[:budget]
+        # What the due pairs leave of the budget goes to the deferred ones rather
+        # than unspent. A pair 30 points from the threshold is deferred for ten
+        # minutes, and a goal moves a match's over/under by that much at once.
+        # The load is unchanged: with the whole window in the file every read of
+        # the budget was already spent each poll.
+        if len(batch) < budget and spare:
+            spare.sort(key=self._spare_priority)
+            room = budget - len(batch)
+            batch += spare[:room]
+            spare = spare[room:]
+        for imp in batch:
             stop, edge = await self._priced(imp, now)
+            self._priced_at[imp.key] = now
             judged.append((imp, stop, edge))
         judged.extend((imp, "queued", None) for imp in due[budget:])
+        judged.extend((imp, "deferred", None) for imp in spare)
+        stalest = max((now - self._priced_at.get(imp.key, self._first_scan)
+                       for imp in watched), default=None)
 
         stops: dict[str, int] = {}
         best: "tuple[float, str] | None" = None
@@ -949,7 +998,7 @@ class CrossGuard:
             stops[stop] = stops.get(stop, 0) + 1
             if edge is not None and (best is None or edge > best[0]):
                 best = (edge, imp.narrow_title)
-        self._last_pass = (now, len(imps), stops, best, waiting)
+        self._last_pass = (now, len(imps), stops, best, waiting, stalest)
 
     def _recheck_delay(self, stop: str, edge: "float | None") -> float:
         """
