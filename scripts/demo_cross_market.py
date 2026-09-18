@@ -91,8 +91,32 @@ _KEEP_FIELDS = ("conditionId", "question", "endDate", "outcomes", "clobTokenIds"
                 "orderPriceMinTickSize")
 
 
+def _fee_rate(market: dict) -> "float | None":
+    """
+    The market's taker fee rate as Gamma publishes it, the way FeeEngine reads
+    it: 0 when fees are off, the schedule's rate otherwise, None when neither is
+    stated (the bot then asks FeeEngine itself).
+    """
+    if "feeRate" in market:
+        return market["feeRate"]
+    if market.get("feesEnabled") is False:
+        return 0.0
+    sched = market.get("feeSchedule")
+    if not isinstance(sched, dict):
+        return None
+    try:
+        rate = float(sched.get("rate"))
+    except (TypeError, ValueError):
+        return None
+    return rate if 0.0 <= rate <= 1.0 else None
+
+
 def _slim(m: dict) -> dict:
     out = {k: m[k] for k in _KEEP_FIELDS if m.get(k) is not None}
+    # One float, not the schedule dict: 85,000 of them are held at once.
+    rate = _fee_rate(m)
+    if rate is not None:
+        out["feeRate"] = rate
     ev = m.get("events")
     if isinstance(ev, list) and ev and isinstance(ev[0], dict) and ev[0].get("id") is not None:
         out["events"] = [{"id": str(ev[0]["id"])}]
@@ -752,6 +776,9 @@ def export_implications(rels: list, markets: list[dict], path: str, audit=None) 
             # The bot rests its bids one tick above the book; the tick is a
             # property of the market, 0.01 in the middle and 0.001 at the edges.
             "narrow_tick": _tick_of(mn), "broad_tick": _tick_of(mb),
+            # The bot prices hundreds of pairs a poll. Looking each fee up on
+            # Gamma would be a request per market; the reader already has it.
+            "narrow_fee_rate": _fee_rate(mn), "broad_fee_rate": _fee_rate(mb),
             "confidence": float(getattr(r, "confidence", 0.0)),
             "evidence": str(getattr(r, "evidence", ""))[:300],
         })

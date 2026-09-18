@@ -94,7 +94,8 @@ def _write_imps(tmp_path, imps):
             "narrow", "broad", "narrow_title", "broad_title", "narrow_yes_token",
             "narrow_no_token", "broad_yes_token", "broad_no_token",
             "narrow_end_ts", "broad_end_ts", "confidence",
-            "narrow_outcomes", "broad_outcomes")} for i in imps]}))
+            "narrow_outcomes", "broad_outcomes", "narrow_tick", "broad_tick",
+            "narrow_fee_rate", "broad_fee_rate")} for i in imps]}))
     return p
 
 

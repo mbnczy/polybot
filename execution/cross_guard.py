@@ -151,6 +151,18 @@ CROSS_NEAR_BAND: float = float(os.environ.get("CROSS_NEAR_BAND", 0.03))
 # there are more due pairs than a poll can price without leaning on the
 # exchange's rate limit; the rest wait for the next poll, nearest first.
 CROSS_MAX_BOOK_READS_PER_POLL: int = int(os.environ.get("CROSS_MAX_BOOK_READS_PER_POLL", 60))
+# When the client can, books come in batches instead (POST /books, 100 tokens a
+# request). One read at a time, the budget priced 87 pairs a minute and a sweep
+# of the file took ten; four batches a poll is up to 400 books in four requests,
+# against the 60 requests of the single reads it replaces. The single reads stay
+# as the fallback, at their old budget, for a poll whose batch read fails.
+CROSS_BOOK_BATCH: int = int(os.environ.get("CROSS_BOOK_BATCH", 100))
+CROSS_MAX_BOOK_BATCHES_PER_POLL: int = int(os.environ.get("CROSS_MAX_BOOK_BATCHES_PER_POLL", 4))
+# Fee lookups on Gamma, per poll, for pairs the reader exported without a rate.
+# Hundreds of pairs a poll would otherwise be hundreds of Gamma requests, and the
+# main strategy's market scanner shares that rate limit. Past the budget a pair
+# is priced at CROSS_TAKER_RATE until FeeEngine's cache has its market.
+CROSS_MAX_FEE_LOOKUPS_PER_POLL: int = int(os.environ.get("CROSS_MAX_FEE_LOOKUPS_PER_POLL", 20))
 CROSS_MID_BAND: float = float(os.environ.get("CROSS_MID_BAND", 0.10))
 # Gamma's orderMinSize on live markets.
 CROSS_MIN_SHARES: float = float(os.environ.get("CROSS_MIN_SHARES", 5.0))
@@ -183,6 +195,9 @@ class Implication:
     broad_outcomes:   "tuple[str, ...] | None" = None
     narrow_tick:      "float | None" = None
     broad_tick:       "float | None" = None
+    # Taker fee rates as the reader read them off Gamma; None means ask FeeEngine.
+    narrow_fee_rate:  "float | None" = None
+    broad_fee_rate:   "float | None" = None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -193,6 +208,28 @@ class Implication:
         if self.narrow_end_ts is None or self.broad_end_ts is None:
             return None
         return max(self.narrow_end_ts, self.broad_end_ts)
+
+
+def _take_batch(order: "list[Implication]", capacity: int) -> "list[Implication]":
+    """The pairs, in order, whose books fit in `capacity` distinct tokens. Pairs
+    share markets, so a token already in the batch costs nothing again."""
+    seen: set[str] = set()
+    batch: list[Implication] = []
+    for imp in order:
+        new = {imp.narrow_no_token, imp.broad_yes_token} - seen
+        if len(seen) + len(new) > capacity:
+            break
+        seen |= new
+        batch.append(imp)
+    return batch
+
+
+def _opt_rate(v) -> "float | None":
+    try:
+        rate = float(v)
+    except (TypeError, ValueError):
+        return None
+    return rate if 0.0 <= rate <= 1.0 else None
 
 
 def load_implications(path: "str | Path") -> list[Implication]:
@@ -227,6 +264,9 @@ def load_implications(path: "str | Path") -> list[Implication]:
                                 if r.get("broad_outcomes") else None),
                 narrow_tick=(float(r["narrow_tick"]) if r.get("narrow_tick") else None),
                 broad_tick=(float(r["broad_tick"]) if r.get("broad_tick") else None),
+                # 0.0 is a rate (fees off), so this one is tested against None.
+                narrow_fee_rate=_opt_rate(r.get("narrow_fee_rate")),
+                broad_fee_rate=_opt_rate(r.get("broad_fee_rate")),
             ))
         except (KeyError, TypeError, ValueError):
             continue
@@ -543,6 +583,7 @@ class CrossGuard:
         suspicious_edge:   "float | None" = None,
         yes_no_only:       "bool | None" = None,
         max_book_reads:    "int | None" = None,
+        book_batches:      "int | None" = None,
         maker_enabled:     "bool | None" = None,
         maker_ttl_s:       "float | None" = None,
         maker_min_edge:    "float | None" = None,
@@ -567,6 +608,12 @@ class CrossGuard:
         self._yes_no_only = CROSS_YES_NO_ONLY if yes_no_only is None else yes_no_only
         self._max_reads = (CROSS_MAX_BOOK_READS_PER_POLL if max_book_reads is None
                            else max_book_reads)
+        self._book_batches = (CROSS_MAX_BOOK_BATCHES_PER_POLL if book_batches is None
+                              else book_batches)
+        # This poll's batched books, token → book; None outside a scan or when
+        # the batch read failed and the pairs are read one at a time.
+        self._poll_books: "dict[str, dict] | None" = None
+        self._fee_lookups_left = CROSS_MAX_FEE_LOOKUPS_PER_POLL
         self._imp_cache: "tuple[tuple[int, int] | None, list[Implication]]" = (None, [])
         self._next_check: dict[tuple[str, str], float] = {}
         # What each pair was last judged to be, so a deferred pair still reports
@@ -885,6 +932,20 @@ class CrossGuard:
 
     # ── entries ───────────────────────────────────────────────────────────────
 
+    async def _pair_rate(self, condition_id: str, exported: "float | None") -> "float | None":
+        """The reader's rate, else FeeEngine's cache, else a lookup while this
+        poll's budget lasts, else None (priced at CROSS_TAKER_RATE)."""
+        if exported is not None:
+            return exported
+        peek = getattr(self._fees, "peek_taker_rate", None)
+        cached = peek(condition_id) if callable(peek) else None
+        if cached is not None:
+            return cached
+        if self._fee_lookups_left <= 0:
+            return None
+        self._fee_lookups_left -= 1
+        return await self._rate(condition_id)
+
     async def _rate(self, condition_id: str) -> "float | None":
         if self._fees is None:
             return None
@@ -945,6 +1006,7 @@ class CrossGuard:
         imps = self._implications()
         if self._first_scan is None:
             self._first_scan = now
+        self._fee_lookups_left = CROSS_MAX_FEE_LOOKUPS_PER_POLL
         judged: "list[tuple[Implication, str, float | None]]" = []
         due: list[Implication] = []
         spare: list[Implication] = []
@@ -957,25 +1019,36 @@ class CrossGuard:
             else:
                 judged.append((imp, stop, None))
         due.sort(key=self._priority)
+        spare.sort(key=self._spare_priority)
         watched = due + spare                       # every pair a book read could price
-        budget = max(1, self._max_reads // 2)
-        batch = due[:budget]
-        # What the due pairs leave of the budget goes to the deferred ones rather
-        # than unspent. A pair 30 points from the threshold is deferred for ten
-        # minutes, and a goal moves a match's over/under by that much at once.
-        # The load is unchanged: with the whole window in the file every read of
-        # the budget was already spent each poll.
-        if len(batch) < budget and spare:
-            spare.sort(key=self._spare_priority)
-            room = budget - len(batch)
-            batch += spare[:room]
-            spare = spare[room:]
-        for imp in batch:
-            stop, edge = await self._priced(imp, now)
-            self._priced_at[imp.key] = now
-            judged.append((imp, stop, edge))
-        judged.extend((imp, "queued", None) for imp in due[budget:])
-        judged.extend((imp, "deferred", None) for imp in spare)
+        # Due pairs first, then what the deferred ones can have of the budget
+        # rather than leaving it unspent. A pair 30 points from the threshold is
+        # deferred for ten minutes, and a goal moves a match's over/under by
+        # that much at once.
+        order = due + spare
+        single = order[:max(1, self._max_reads // 2)]
+        batch = single
+        if self._book_batches > 0 and hasattr(self._client, "get_orderbooks"):
+            batch = _take_batch(order, self._book_batches * CROSS_BOOK_BATCH)
+            tokens = [t for imp in batch for t in (imp.narrow_no_token, imp.broad_yes_token)]
+            try:
+                self._poll_books = await self._client.get_orderbooks(
+                    tokens, chunk=CROSS_BOOK_BATCH)
+            except Exception as exc:  # noqa: BLE001 — the single reads still work
+                logger.warning("CrossGuard | batched book read failed, reading %d pair(s) "
+                               "one at a time this poll: %s", len(single), exc)
+                self._poll_books = None
+                batch = single
+        try:
+            for imp in batch:
+                stop, edge = await self._priced(imp, now)
+                self._priced_at[imp.key] = now
+                judged.append((imp, stop, edge))
+        finally:
+            self._poll_books = None
+        taken = {id(imp) for imp in batch}
+        judged.extend((imp, "queued", None) for imp in due if id(imp) not in taken)
+        judged.extend((imp, "deferred", None) for imp in spare if id(imp) not in taken)
         stalest = max((now - self._priced_at.get(imp.key, self._first_scan)
                        for imp in watched), default=None)
 
@@ -1067,13 +1140,22 @@ class CrossGuard:
         # raise aborted the whole scan, and on 2026-09-12 the guard went 12
         # minutes without completing one, exits included.
         try:
-            no_book = await self._client.get_orderbook(imp.narrow_no_token)
-            yes_book = await self._client.get_orderbook(imp.broad_yes_token)
+            if self._poll_books is not None:
+                no_book = self._poll_books.get(imp.narrow_no_token)
+                yes_book = self._poll_books.get(imp.broad_yes_token)
+                if no_book is None or yes_book is None:
+                    # The batch leaves out a token with no book; a single read
+                    # would have raised for it.
+                    raise LookupError("no book for this token in the batch")
+            else:
+                no_book = await self._client.get_orderbook(imp.narrow_no_token)
+                yes_book = await self._client.get_orderbook(imp.broad_yes_token)
         except Exception as exc:  # noqa: BLE001
             logger.debug("CrossGuard | no book for %s: %s", imp.narrow_title[:40], exc)
             self.last_reason[key] = f"orderbook unavailable: {exc}"
             return "no_book", None
-        rate_narrow, rate_broad = await self._rate(imp.narrow), await self._rate(imp.broad)
+        rate_narrow = await self._pair_rate(imp.narrow, imp.narrow_fee_rate)
+        rate_broad = await self._pair_rate(imp.broad, imp.broad_fee_rate)
         opp, reason = evaluate(
             imp, no_book, yes_book, now=now,
             rate_narrow=rate_narrow, rate_broad=rate_broad,

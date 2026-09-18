@@ -1415,6 +1415,27 @@ class PolyClient:
         )
         return _normalise_book(book)
 
+    async def get_orderbooks(self, token_ids: "list[str]", chunk: int = 100) -> "dict[str, dict]":
+        """
+        Many books at once (POST /books), keyed by token id, `chunk` tokens a
+        request. A token the exchange has no book for is absent from the result
+        rather than failing the request — measured live on 2026-09-18 — so a
+        missing key means "no book", the same answer a single read raises.
+        """
+        ids = list(dict.fromkeys(str(t) for t in token_ids))   # pairs share markets
+        out: dict[str, dict] = {}
+        for i in range(0, len(ids), chunk):
+            part = ids[i:i + chunk]
+            books = await self._run_with_retry(
+                lambda part=part: self._client.get_order_books(token_ids=part)
+            )
+            for book in books or ():
+                tid = (book.get("token_id") or book.get("asset_id")
+                       if isinstance(book, dict) else getattr(book, "token_id", None))
+                if tid is not None:
+                    out[str(tid)] = _normalise_book(book)
+        return out
+
     # ──────────────────────────────────────────────────────────────────────────
     # Public async API — order management
     # ──────────────────────────────────────────────────────────────────────────
