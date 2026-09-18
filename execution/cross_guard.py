@@ -358,6 +358,7 @@ def quoted_entry(
 # its key, so a reworded reason cannot silently fall through to "other".
 _STOP_KEYS: tuple[tuple[str, str], ...] = (
     ("too wide a book to rest in", "book_too_wide"),
+    ("a one-sided book to rest in", "one_sided_book"),
     ("at our own bids", "maker_edge_below_min"),
     ("nothing to rest above", "no_bid"),
     ("outcome labels are unknown", "outcomes_unknown"),
@@ -491,6 +492,11 @@ def evaluate_maker(
         return None, gate
     for book, leg in ((no_book, "NO on narrow"), (yes_book, "YES on broad")):
         bid, ask = best_level(book, "bids"), best_level(book, "asks")
+        # No offer at all is the widest book there is, not a book the spread gate
+        # may skip: on 2026-09-18 such legs let "+0.959" through — a bid of 0.03
+        # for a NO worth 0.999, which only a fat finger would ever sell into.
+        if bid is not None and ask is None:
+            return None, f"{leg} has a bid and no offer — a one-sided book to rest in"
         # A book exactly at the cap must pass: 0.55 - 0.50 is 0.05000000000000004.
         if bid is not None and ask is not None and ask.price - bid.price > max_spread + 1e-9:
             return None, (f"{leg} quotes {bid.price:.3f}/{ask.price:.3f} — too wide a "

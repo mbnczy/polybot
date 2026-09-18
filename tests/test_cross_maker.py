@@ -256,3 +256,11 @@ async def test_a_disabled_rest_is_written_down_for_the_paper_fill_replay(tmp_pat
     assert (r["no_price"], r["yes_price"], r["shares"]) == (0.41, 0.51, 5.43)
     assert r["no_bid"] == [0.40, 50.0] and r["yes_ask"] == [0.55, 50.0]
     assert client.maker_orders == []                        # nothing was posted
+
+
+def test_a_leg_with_a_bid_and_no_offer_is_refused():
+    """The +0.959 of 2026-09-18: NO on narrow bid 0.02, nothing offered."""
+    one_sided = {"nn": _book(bids=[(0.02, 5)]), "by": MAKER["by"]}
+    opp, why = evaluate_maker(_imp(), one_sided["nn"], one_sided["by"], now=NOW)
+    assert opp is None and "one-sided" in why
+    assert cg.stop_key(why) == "one_sided_book"

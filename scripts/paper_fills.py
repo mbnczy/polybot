@@ -50,12 +50,17 @@ HORIZONS = (("3 min", 180.0), ("30 min", 1800.0), ("2 h", 7200.0), ("to kick-off
 
 
 def load_rests(path: Path) -> list[dict]:
+    """The rests, oldest first — bar those in a one-sided book, which the guard
+    stopped making on 2026-09-18 (a bid with no offer on a leg)."""
     out = []
     for line in path.read_text(encoding="utf-8").splitlines():
         try:
-            out.append(json.loads(line))
+            r = json.loads(line)
         except ValueError:
             continue
+        if r.get("no_ask", True) is None or r.get("yes_ask", True) is None:
+            continue
+        out.append(r)
     return sorted(out, key=lambda r: r["ts"])
 
 

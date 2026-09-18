@@ -65,3 +65,10 @@ def test_an_unresolved_fill_is_left_open(tmp_path, monkeypatch, capsys):
     trades = {"N": [_t(T0 + 5, "ny", 0.07, 10)], "B": [_t(T0 + 50, "by", 0.02, 10)]}
     _run(tmp_path, monkeypatch, trades, {})
     assert "1 filled rest(s) still waiting" in capsys.readouterr().out
+
+
+def test_a_rest_in_a_one_sided_book_is_not_replayed(tmp_path):
+    p = tmp_path / "rests.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in (
+        {**REST, "no_ask": None}, {**REST, "ts": T0 + 1, "no_ask": [0.98, 5]})))
+    assert [r["ts"] for r in pf.load_rests(p)] == [T0 + 1]
