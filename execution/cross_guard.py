@@ -153,11 +153,13 @@ CROSS_NEAR_BAND: float = float(os.environ.get("CROSS_NEAR_BAND", 0.03))
 CROSS_MAX_BOOK_READS_PER_POLL: int = int(os.environ.get("CROSS_MAX_BOOK_READS_PER_POLL", 60))
 # When the client can, books come in batches instead (POST /books, 100 tokens a
 # request). One read at a time, the budget priced 87 pairs a minute and a sweep
-# of the file took ten; four batches a poll is up to 400 books in four requests,
-# against the 60 requests of the single reads it replaces. The single reads stay
-# as the fallback, at their old budget, for a poll whose batch read fails.
+# of the file took ten. Eight batches a poll is up to 800 books in eight
+# requests, against the 60 requests of the single reads they replace — sized for
+# the ~8,700 pairs the file holds once the match over/unders' structural
+# implications are in it. The single reads stay as the fallback, at their old
+# budget, for a poll whose batch read fails.
 CROSS_BOOK_BATCH: int = int(os.environ.get("CROSS_BOOK_BATCH", 100))
-CROSS_MAX_BOOK_BATCHES_PER_POLL: int = int(os.environ.get("CROSS_MAX_BOOK_BATCHES_PER_POLL", 4))
+CROSS_MAX_BOOK_BATCHES_PER_POLL: int = int(os.environ.get("CROSS_MAX_BOOK_BATCHES_PER_POLL", 8))
 # Fee lookups on Gamma, per poll, for pairs the reader exported without a rate.
 # Hundreds of pairs a poll would otherwise be hundreds of Gamma requests, and the
 # main strategy's market scanner shares that rate limit. Past the budget a pair

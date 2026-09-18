@@ -682,6 +682,18 @@ def discover(markets: list[dict], args) -> list:
                                    max_per_event=args.max_per_event)
     cache = VerdictCache(args.cache_file).load()
     known, unknown = cache.split(cands)
+    if not getattr(args, "no_structural", False):
+        # A pair of one match's over/unders is settled by the titles either way —
+        # an implication the rule emits, or none — so the model's budget goes
+        # to the pairs only it can judge.
+        from strategy.structural_implications import decides  # noqa: PLC0415
+        at = {str(m.get("conditionId")): m for m in markets if m.get("conditionId")}
+        before = len(unknown)
+        unknown = [c for c in unknown
+                   if not (c.a_id in at and c.b_id in at and decides(at[c.a_id], at[c.b_id]))]
+        if before != len(unknown):
+            print(f"  structural : {before - len(unknown)} unjudged pair(s) settled by the "
+                  f"titles, not sent to the model")
     split: dict = {}
     fresh = price_first(unknown, markets, args.price_first_share, args.new_per_pass,
                         max_edge=args.price_first_max_edge, stats=split)
@@ -798,6 +810,25 @@ def export_implications(rels: list, markets: list[dict], path: str, audit=None) 
           + (f" ({expired} expired dropped)" if expired else "")
           + (f" ({blocked} refused by the resolution audit)" if blocked else ""))
     return len(rows)
+
+
+def with_structural(rels: list, markets: list[dict]) -> list:
+    """
+    Add the implications a match's over/under titles state outright
+    (strategy/structural_implications.py) to the model's.
+
+    On 2026-09-18 the rule produced 7,697 of them across 523 matches, where the
+    model's whole export was 1,087 pairs — and on the 954 over/under pairs both
+    could read, they agreed every time. Added after the ladder direction check:
+    their direction is the definition of the markets, not an inference.
+    """
+    from strategy.structural_implications import links  # noqa: PLC0415
+
+    have = {(r.narrow, r.broad) for r in rels}
+    extra = [r for r in links(markets) if (r.narrow, r.broad) not in have]
+    print(f"  structural : {len(extra)} implication(s) from match over/unders, "
+          f"{len(rels)} from the model")
+    return rels + extra
 
 
 def _drop_backwards(rels: list, markets: list[dict]) -> list:
@@ -1284,6 +1315,8 @@ def one_pass(args, markets_cache: dict) -> int:
             print(f"  quotable   : {len(universe)} of {len(markets)} market(s) quoted "
                   f"within {cap:.2f} — the rest never reach the model or the export")
         rels = _drop_backwards(discover(universe, args), markets)
+        if not getattr(args, "no_structural", False):
+            rels = with_structural(rels, universe)
         markets_cache["rels"] = rels
 
         # Only announce relations we have not announced before.
@@ -1416,6 +1449,8 @@ def main() -> int:
                          "capture (default CROSS_EXIT_MIN_CAPTURE, 1.0)")
     ap.add_argument("--no-paper", action="store_true",
                     help="do not open or track paper positions")
+    ap.add_argument("--no-structural", action="store_true",
+                    help="do not add the implications stated by match over/under titles")
     ap.add_argument("--no-implication-alerts", action="store_true",
                     help="only alert on price violations, not on discoveries")
     ap.add_argument("--dry-run",     action="store_true")
