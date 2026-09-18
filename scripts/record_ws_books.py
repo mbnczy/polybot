@@ -24,7 +24,8 @@ when a token's best bid or best ask moves:
     epoch_ms,token_index,bid,ask,bid_size,ask_size
 
 and every --snapshot-s every book is read again from REST (POST /books) and
-written with an R in front. Those lines are the ground truth: the WebSocket
+written with an R in front when it differs from its last R line, every book
+once per ten minutes. Those lines are the ground truth: the WebSocket
 state can go stale — on 2026-09-18 a consumed level stayed in a replayed book
 for thirteen minutes, showing a 0.99 bid against a 0.54 ask — and the REST read
 replaces it. tokens.jsonl maps each index to its market. Files are
@@ -154,6 +155,7 @@ class Recorder:
         self.index: dict[str, int] = {}
         self.books: dict[str, Book] = {}
         self.last: dict[str, tuple] = {}
+        self.last_r: dict[str, tuple] = {}      # the last REST top written per token
         self._fh = None
         self._hour = None
         self.lines = 0
@@ -186,7 +188,8 @@ class Recorder:
             self._hour = hour
         return self._fh
 
-    def write(self, token: str, snapshot: bool = False, mark: str = "S") -> None:
+    def write(self, token: str, snapshot: bool = False, mark: str = "S",
+              force: bool = False) -> None:
         if self.full:
             return
         book = self.books.get(token)
@@ -195,6 +198,10 @@ class Recorder:
         top = book.top()
         if not snapshot and self.last.get(token, (None, None))[:2] == top[:2]:
             return                               # size alone moved: not a line
+        if snapshot and not force and self.last_r.get(token, (None, None))[:2] == top[:2]:
+            return                               # the REST read says what it said before
+        if snapshot:
+            self.last_r[token] = top
         self.last[token] = top
         bid, ask, bs, az = top
         self._file().write(
@@ -259,10 +266,19 @@ async def shard(tokens: list[str], rec: Recorder, sid: int) -> None:
         backoff = min(backoff * 2.0, 30.0)
 
 
-async def snapshots(rec: Recorder, every: float) -> None:
-    """Every `every` seconds, replace each book with a REST read and write it as R."""
+async def snapshots(rec: Recorder, every: float, anchor_every: float = 600.0) -> None:
+    """
+    Every `every` seconds, replace each book with a REST read, and write it as R
+    when its top differs from the last R line — every book once per
+    `anchor_every`. Writing every book every minute was 16 MB an hour of lines
+    saying nothing had changed; the R timeline is the same without them.
+    """
+    last_anchor = 0.0
     while True:
         await asyncio.sleep(every)
+        force = time.time() - last_anchor >= anchor_every
+        if force:
+            last_anchor = time.time()
         tokens = list(rec.books)
         async with aiohttp.ClientSession() as s:
             for i in range(0, len(tokens), 100):
@@ -278,7 +294,7 @@ async def snapshots(rec: Recorder, every: float) -> None:
                     token = str(b.get("asset_id") or "")
                     if token in rec.books:
                         rec.books[token].load(b.get("bids"), b.get("asks"))
-                        rec.write(token, snapshot=True, mark="R")
+                        rec.write(token, snapshot=True, mark="R", force=force)
         rec.flush()
         if rec.disk_bytes() > rec.max_bytes:
             rec.full = True
@@ -300,6 +316,7 @@ async def main(args) -> int:
         for t in [t for t in rec.books if t not in live]:
             rec.books.pop(t, None)
             rec.last.pop(t, None)
+            rec.last_r.pop(t, None)
         events = len({r["ev"] for r in rows})
         chunks = [tokens[i:i + args.per_conn] for i in range(0, len(tokens), args.per_conn)]
         logger.info("watching %d market(s) in %d match(es) on %d connection(s)",
@@ -328,7 +345,7 @@ if __name__ == "__main__":
     ap.add_argument("--hours", type=float, default=80.0, help="how long to record")
     ap.add_argument("--behind-h", type=float, default=3.0,
                     help="matches that kicked off up to this long ago (in play)")
-    ap.add_argument("--ahead-h", type=float, default=4.0,
+    ap.add_argument("--ahead-h", type=float, default=6.0,
                     help="and matches kicking off within this long")
     ap.add_argument("--refresh-s", type=float, default=1800.0,
                     help="how often the set of matches is chosen again")
