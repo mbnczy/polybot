@@ -264,3 +264,32 @@ def test_a_leg_with_a_bid_and_no_offer_is_refused():
     opp, why = evaluate_maker(_imp(), one_sided["nn"], one_sided["by"], now=NOW)
     assert opp is None and "one-sided" in why
     assert cg.stop_key(why) == "one_sided_book"
+
+
+@pytest.mark.asyncio
+async def test_the_paper_rest_carries_the_one_leg_edges(tmp_path, monkeypatch):
+    """Rest NO at 0.41 and take YES at its 0.55 ask — the taker leg pays its fee:
+    1 − 0.41 − (0.55 + 0.05 × 0.55 × 0.45) = +0.0276."""
+    g, client, _, _ = _maker_guard(tmp_path, monkeypatch, enabled=False)
+    await g.poll_once()
+    (r,) = [json.loads(l) for l in (tmp_path / "positions_paper_rests.jsonl").read_text().splitlines()]
+    fee = 0.05 * 0.55 * 0.45
+    assert abs(r["one_leg_no_edge"] - (1 - 0.41 - 0.55 - fee)) < 1e-9
+    assert abs(r["one_leg_yes_edge"] - (1 - 0.45 - fee - 0.51)) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_a_pair_twenty_minutes_from_kick_off_can_still_rest(tmp_path, monkeypatch):
+    """The taker path stops thirty minutes out; the busiest hour for resting is the last."""
+    imp = _imp(days=20 / 1440)                              # kick-off in 20 minutes
+    g, client, _, _ = _maker_guard(tmp_path, monkeypatch, imps=[imp], enabled=False)
+    await g.poll_once()
+    assert g.stats["would_rest"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_pair_two_minutes_from_kick_off_does_not(tmp_path, monkeypatch):
+    imp = _imp(days=2 / 1440)
+    g, client, _, _ = _maker_guard(tmp_path, monkeypatch, imps=[imp], enabled=False)
+    await g.poll_once()
+    assert g.stats["would_rest"] == 0

@@ -136,6 +136,13 @@ CROSS_MAKER_MIN_EDGE: float = float(os.environ.get("CROSS_MAKER_MIN_EDGE", CROSS
 # 2026-09-17 that produced "+0.96 edge" pairs whose books stood at 0.01 / 0.50.
 # Only a book tight enough for our bid to be near the market can be rested in.
 CROSS_MAKER_MAX_SPREAD: float = float(os.environ.get("CROSS_MAKER_MAX_SPREAD", 0.05))
+# How close to its end a pair may still get a resting bid. The taker path keeps
+# thirty minutes: near a market's end its book is a few stale quotes. A match
+# market's end is its kick-off, and there the book is the busiest it will be —
+# of the trades before kick-off on finished matches' tail markets, 36% came in
+# the last hour. A rest is withdrawn at kick-off either way.
+CROSS_MAKER_MIN_TIME_TO_END_S: float = float(
+    os.environ.get("CROSS_MAKER_MIN_TIME_TO_END_S", 300.0))
 # Polymarket's tick is 0.01 in the middle of the range and 0.001 at the extremes.
 # The reader exports each market's own; this is the fallback.
 CROSS_DEFAULT_TICK: float = 0.01
@@ -1193,7 +1200,8 @@ class CrossGuard:
         if opp is None:
             # The taker path pays the ask plus a fee on both legs. Our own bid
             # pays neither, and that is where these pairs can become tradeable.
-            if self._maker_enabled and stop in ("edge_below_min", "thin_touch", "no_ask"):
+            if self._maker_enabled and stop in ("edge_below_min", "thin_touch", "no_ask",
+                                                "too_close_to_end"):
                 return await self._maker_attempt(imp, no_book, yes_book, now, stop, edge)
             return stop, edge
         if not self._breaker.check_cross(opp.committed):
@@ -1236,7 +1244,7 @@ class CrossGuard:
         opp, reason = evaluate_maker(
             imp, no_book, yes_book, now=now, max_lockup_days=self._max_lockup,
             min_edge=self._maker_min_edge, max_usdc=self._max_usdc,
-            min_shares=self._min_shares, min_time_to_end_s=self._min_time_to_end,
+            min_shares=self._min_shares, min_time_to_end_s=CROSS_MAKER_MIN_TIME_TO_END_S,
             yes_no_only=self._yes_no_only)
         self.last_reason[key] = reason
         # The same discipline the taker path keeps: a price only counts once the
@@ -1292,6 +1300,15 @@ class CrossGuard:
             lvl = best_level(book, side)
             return None if lvl is None else [lvl.price, lvl.size]
 
+        # The one-leg version: rest one side only and, the moment it fills, buy
+        # the other at its ask. One fill instead of two, and of the 289 pairs
+        # signalling on 2026-09-18, 32 cleared +2% that way — always by resting
+        # NO on narrow, i.e. offering the longshot that retail buys.
+        no_ask, yes_ask = best_level(no_book, "asks"), best_level(yes_book, "asks")
+        one_no = (None if yes_ask is None else
+                  1.0 - opp.no_price - buy_cost(yes_ask.price, imp.broad_fee_rate))
+        one_yes = (None if no_ask is None else
+                   1.0 - buy_cost(no_ask.price, imp.narrow_fee_rate) - opp.yes_price)
         row = {"ts": now, "narrow": imp.narrow, "broad": imp.broad,
                "narrow_title": imp.narrow_title, "broad_title": imp.broad_title,
                "narrow_yes_token": imp.narrow_yes_token, "narrow_no_token": imp.narrow_no_token,
@@ -1299,6 +1316,8 @@ class CrossGuard:
                "no_price": opp.no_price, "yes_price": opp.yes_price, "shares": opp.shares,
                "entry": opp.entry_per_pair, "edge": opp.edge_per_pair,
                "resolves_ts": imp.resolves_ts,
+               "one_leg_no_edge": one_no, "one_leg_yes_edge": one_yes,
+               "broad_fee_rate": imp.broad_fee_rate, "narrow_fee_rate": imp.narrow_fee_rate,
                "no_bid": touch(no_book, "bids"), "no_ask": touch(no_book, "asks"),
                "yes_bid": touch(yes_book, "bids"), "yes_ask": touch(yes_book, "asks")}
         try:
