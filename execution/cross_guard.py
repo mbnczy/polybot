@@ -163,6 +163,12 @@ CROSS_MAX_BOOK_BATCHES_PER_POLL: int = int(os.environ.get("CROSS_MAX_BOOK_BATCHE
 # main strategy's market scanner shares that rate limit. Past the budget a pair
 # is priced at CROSS_TAKER_RATE until FeeEngine's cache has its market.
 CROSS_MAX_FEE_LOOKUPS_PER_POLL: int = int(os.environ.get("CROSS_MAX_FEE_LOOKUPS_PER_POLL", 20))
+# How much longer a book too wide to rest in may wait for a spare read than a
+# tight one. An absolute preference starved them: with 504 tight pairs ahead,
+# the 471 wide ones were priced only when their ten-minute re-check fell due,
+# and the stalest price climbed a minute every minute. With a head start instead,
+# tight books are priced about every 40 s and wide ones about every 100 s.
+CROSS_WIDE_BOOK_PENALTY_S: float = float(os.environ.get("CROSS_WIDE_BOOK_PENALTY_S", 60.0))
 CROSS_MID_BAND: float = float(os.environ.get("CROSS_MID_BAND", 0.10))
 # Gamma's orderMinSize on live markets.
 CROSS_MIN_SHARES: float = float(os.environ.get("CROSS_MIN_SHARES", 5.0))
@@ -985,12 +991,15 @@ class CrossGuard:
             for key in [k for k in table if k not in present]:
                 del table[key]
 
-    def _spare_priority(self, imp: Implication) -> tuple:
-        """Which deferred pair gets a leftover read: books last seen tight before
-        books refused as too wide, then whichever has waited longest."""
+    def _spare_priority(self, imp: Implication) -> float:
+        """Which deferred pair gets a leftover read: whichever has waited longest,
+        a book last refused as too wide counted as if it had been priced
+        CROSS_WIDE_BOOK_PENALTY_S later than it was."""
         key = imp.key
-        wide = self._last_stop.get(key) == "book_too_wide"
-        return (wide, self._priced_at.get(key, 0.0))
+        at = self._priced_at.get(key, 0.0)
+        if self._last_stop.get(key) == "book_too_wide":
+            at += CROSS_WIDE_BOOK_PENALTY_S
+        return at
 
     def _priority(self, imp: Implication) -> tuple:
         """Where a book read is worth most: near the threshold, then never priced, then longest waiting."""

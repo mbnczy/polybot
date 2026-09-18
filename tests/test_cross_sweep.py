@@ -355,3 +355,25 @@ async def test_a_rate_fee_engine_already_holds_costs_no_lookup(tmp_path, monkeyp
     g, _, _, _ = _guard(tmp_path, monkeypatch, FAR, [_imp()], enabled=False, fee_engine=fees)
     await g.poll_once()
     assert fees.asked == []
+
+
+@pytest.mark.asyncio
+async def test_a_wide_book_is_not_starved_behind_tight_ones(tmp_path, monkeypatch):
+    """On 2026-09-18 the stalest price climbed a minute every minute: 504 tight
+    pairs always went ahead, and the 471 wide ones waited for their ten-minute
+    re-check. A wide book waits longer than a tight one, not forever."""
+    g, client, _, _ = _guard(tmp_path, monkeypatch, {**WIDE, **FAR}, [SECOND, _imp()],
+                             enabled=False, max_book_reads=2)
+    reads = _counting(client)
+    t = _clock(monkeypatch)
+    await g.poll_once()                                  # wide pair priced at NOW
+    t[0] = NOW + 5.0
+    await g.poll_once()                                  # tight pair priced at NOW+5
+    t[0] = NOW + 10.0
+    await g.poll_once()                                  # tight goes again: wide is "NOW+60"
+    assert reads[4:6] == ["nn", "by"]
+    t[0] = NOW + 80.0
+    await g.poll_once()                                  # tight priced at NOW+10 is older now
+    t[0] = NOW + 85.0
+    await g.poll_once()
+    assert reads[8:10] == ["nn2", "by2"]                 # the wide one gets its turn
