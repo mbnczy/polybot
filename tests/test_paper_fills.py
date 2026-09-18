@@ -7,6 +7,7 @@ import json
 import scripts.paper_fills as pf
 
 T0 = 1_000_000.0
+RECORDED: dict = {}
 REST = {"ts": T0, "narrow": "N", "broad": "B", "narrow_title": "n", "broad_title": "b",
         "narrow_yes_token": "ny", "narrow_no_token": "nn",
         "broad_yes_token": "by", "broad_no_token": "bn",
@@ -38,7 +39,9 @@ def _run(tmp_path, monkeypatch, trades, resolved):
     monkeypatch.setattr(pf, "trades_since", lambda cid, since: trades.get(cid, []))
     monkeypatch.setattr(pf, "resolutions", lambda cids: resolved)
     monkeypatch.setattr(pf.time, "time", lambda: T0 + 200_000)
-    return pf.main(type("A", (), {"rests": str(p), "show": 5})())
+    monkeypatch.setattr(pf, "recorded_asks", lambda d, toks: RECORDED)
+    return pf.main(type("A", (), {"rests": str(p), "show": 5, "recording": str(tmp_path),
+                                  "one_leg_min": 0.02})())
 
 
 def test_both_legs_filled_pay_the_locked_edge_and_block_the_re_rest(tmp_path, monkeypatch, capsys):
@@ -72,3 +75,62 @@ def test_a_rest_in_a_one_sided_book_is_not_replayed(tmp_path):
     p.write_text("\n".join(json.dumps(r) for r in (
         {**REST, "no_ask": None}, {**REST, "ts": T0 + 1, "no_ask": [0.98, 5]})))
     assert [r["ts"] for r in pf.load_rests(p)] == [T0 + 1]
+
+
+
+# ── one leg ──────────────────────────────────────────────────────────────────
+
+def test_the_ask_at_a_moment_is_the_last_one_recorded_before_it():
+    series = [(10.0, 0.05), (20.0, 0.04), (30.0, None)]
+    assert pf.ask_at(series, 15.0) == (0.05, True)
+    assert pf.ask_at(series, 25.0) == (0.04, True)
+    assert pf.ask_at(series, 35.0) == (None, True)          # the offer was gone
+    assert pf.ask_at(series, 5.0) == (None, False)          # before the recording
+
+
+def _one_leg_rest():
+    return {**REST, "one_leg_no_edge": 0.03, "broad_fee_rate": 0.0, "yes_ask": [0.03, 50]}
+
+
+def _run_one(tmp_path, monkeypatch, trades, recorded, resolved):
+    p = tmp_path / "rests.jsonl"
+    p.write_text(json.dumps(_one_leg_rest()))
+    monkeypatch.setattr(pf, "trades_since", lambda cid, since: trades.get(cid, []))
+    monkeypatch.setattr(pf, "resolutions", lambda cids: resolved)
+    monkeypatch.setattr(pf, "recorded_asks", lambda d, toks: recorded)
+    monkeypatch.setattr(pf.time, "time", lambda: T0 + 200_000)
+    pf.main(type("A", (), {"rests": str(p), "show": 5, "recording": str(tmp_path),
+                           "one_leg_min": 0.02})())
+
+
+def test_one_leg_completes_at_the_ask_of_the_moment_it_filled(tmp_path, monkeypatch, capsys):
+    trades = {"N": [_t(T0 + 60, "ny", 0.07, 10)]}               # a longshot buyer takes our offer
+    recorded = {"by": [(T0, 0.03), (T0 + 30, 0.02)]}            # the broad ask at the fill: 0.02
+    _run_one(tmp_path, monkeypatch, trades, recorded, {})
+    line = next(l for l in capsys.readouterr().out.splitlines() if l.strip().startswith("3 min"))
+    # 5 × (1 − 0.94 − 0.02) locked, fee off
+    assert "completed 1" in line and "locked +0.20" in line and "(0 priced off" in line
+
+
+def test_one_leg_holds_the_leg_when_completing_no_longer_pays(tmp_path, monkeypatch, capsys):
+    trades = {"N": [_t(T0 + 60, "ny", 0.07, 10)]}
+    recorded = {"by": [(T0 + 30, 0.08)]}                        # 0.94 + 0.08 > 1
+    _run_one(tmp_path, monkeypatch, trades, recorded, {"N": (0.0, 1.0), "B": (0.0, 1.0)})
+    line = next(l for l in capsys.readouterr().out.splitlines() if l.strip().startswith("3 min"))
+    # held alone; nine goals did not happen: 5 × (1 − 0.94)
+    assert "held alone 1" in line and "realised +0.30" in line
+
+
+def test_without_a_recording_the_rest_time_ask_is_used_and_said(tmp_path, monkeypatch, capsys):
+    trades = {"N": [_t(T0 + 60, "ny", 0.07, 10)]}
+    _run_one(tmp_path, monkeypatch, trades, {}, {})
+    line = next(l for l in capsys.readouterr().out.splitlines() if l.strip().startswith("3 min"))
+    assert "completed 1" in line and "(1 priced off" in line
+
+
+def test_fills_are_split_by_time_to_kick_off(tmp_path, monkeypatch, capsys):
+    trades = {"N": [_t(T0 + 60, "ny", 0.07, 10)]}
+    _run_one(tmp_path, monkeypatch, trades, {}, {})
+    out = capsys.readouterr().out
+    section = out.split("by time to kick-off")[1]
+    assert ">24h" in section and "100.0%" in section

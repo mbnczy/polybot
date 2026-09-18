@@ -25,9 +25,9 @@ touches the crossing would take (narrow YES bid size, broad YES ask size).
 from __future__ import annotations
 
 import argparse
-import gzip
 import json
 import sys
+import zlib
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -56,13 +56,47 @@ def load_tokens(path: Path) -> dict[int, dict]:
     return out
 
 
-def _lines(path: Path):
-    """The file's lines; the hour being recorded ends mid-block, which is not an error."""
+_GZIP_MAGIC = b"\x1f\x8b\x08"
+_PRINTABLE = frozenset(range(32, 127)) | {10, 13}
+
+
+def _is_member_start(data: bytes, at: int) -> bool:
+    """A real gzip member starts here: a trial decode gives text, not an error or noise.
+    The magic bytes also turn up by chance inside compressed data."""
+    d = zlib.decompressobj(31)
     try:
-        with gzip.open(path, "rt", encoding="ascii") as fh:
-            yield from fh
-    except EOFError:
-        return
+        out = d.decompress(data[at:at + 8192])
+    except zlib.error:
+        return False
+    return (bool(out) or d.eof) and all(b in _PRINTABLE for b in out[:4096])
+
+
+def _lines(path: Path):
+    """
+    The file's lines, member by member. The recorder appends a gzip member each
+    time it opens the hour's file, and one stopped mid-block leaves a member
+    truncated. Decoding straight on reads the next member's bytes as more of the
+    damaged one — sometimes failing, sometimes producing noise — and the rest of
+    the file is lost either way. So each member is found first and decoded only
+    up to where the next begins; a damaged or unfinished one gives up what it
+    decoded, less its cut last line.
+    """
+    data = path.read_bytes()
+    starts, at = [], data.find(_GZIP_MAGIC)
+    while at >= 0:
+        if _is_member_start(data, at):
+            starts.append(at)
+        at = data.find(_GZIP_MAGIC, at + 1)
+    for a, b in zip(starts, starts[1:] + [len(data)]):
+        d = zlib.decompressobj(31)
+        try:
+            text = d.decompress(data[a:b])
+        except zlib.error:
+            text = b""
+        text = text.decode("ascii", "replace")
+        if not d.eof:
+            text = text[:text.rfind("\n") + 1]              # a cut line is not a line
+        yield from text.splitlines(True)
 
 
 def fee(p: float, rate: float) -> float:
