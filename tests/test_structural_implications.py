@@ -113,3 +113,54 @@ def test_the_reader_adds_the_rules_pairs_once():
     keys = [(r.narrow, r.broad) for r in rels]
     assert keys.count(("c1", "c0")) == 1 and rels[0].evidence == "model"
     assert len(rels) == 9
+
+
+# ── spreads ───────────────────────────────────────────────────────────────────
+
+def _sp(cid, team, line, first=None, ev="E1"):
+    other = "FC Utrecht" if team != "FC Utrecht" else "Feyenoord Rotterdam"
+    return {"conditionId": cid, "question": f"Spread: {team} (-{line})",
+            "outcomes": json.dumps([first or team, other]), "events": [{"id": ev}]}
+
+
+def _with_event(markets, ev="E1"):
+    return [{**m, "events": [{"id": ev}]} for m in markets]
+
+
+def test_a_spread_reads_only_with_its_team_first_and_an_event():
+    assert si.parse_spread(_sp("s", "FC Utrecht", "1.5")).line == 1.5
+    assert si.parse_spread(_sp("s", "FC Utrecht", "1.5", first="Feyenoord Rotterdam")) is None
+    no_event = {k: v for k, v in _sp("s", "FC Utrecht", "1.5").items() if k != "events"}
+    assert si.parse_spread(no_event) is None
+
+
+def test_spread_links():
+    ms = _with_event(_match()) + [
+        _sp("s1", "FC Utrecht", "1.5"), _sp("s2", "FC Utrecht", "2.5"),
+        _sp("t1", "Feyenoord Rotterdam", "1.5")]
+    rels = {(r.narrow, r.broad) for r in si.links(ms) if "spread" in r.evidence}
+    assert rels == {
+        ("s2", "s1"),                # wins by 3 ⊆ wins by 2
+        ("s1", "c1"),                # Utrecht by 2 ⇒ two goals at least; no team 1.5 line: total
+        ("s2", "c2"),                # Utrecht by 3 ⇒ three goals
+        ("t1", "c1"),                # the same for Feyenoord
+    }
+
+
+def test_a_spread_prefers_its_own_teams_line():
+    ms = _with_event(_match() + [_m("u15", "FC Utrecht O/U 1.5")]) + [_sp("s1", "FC Utrecht", "1.5")]
+    rels = {(r.narrow, r.broad) for r in si.links(ms) if "spread-goals" in r.evidence}
+    assert rels == {("s1", "u15")}
+
+
+def test_spreads_of_different_events_never_meet():
+    ms = _with_event(_match(), ev="E1") + [_sp("s1", "FC Utrecht", "1.5", ev="E2")]
+    assert not [r for r in si.links(ms) if "spread-goals" in r.evidence]
+
+
+def test_the_rule_decides_spread_pairs_of_one_event():
+    ms = _with_event(_match())
+    a, b = _sp("s1", "FC Utrecht", "1.5"), _sp("t1", "Feyenoord Rotterdam", "1.5")
+    assert si.decides(a, b) and si.decides(a, ms[0])
+    assert not si.decides(a, _sp("x", "FC Utrecht", "1.5", ev="E2"))
+    assert not si.decides(a, ms[7])                           # corners: the model's

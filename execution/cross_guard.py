@@ -633,6 +633,10 @@ class CrossGuard:
         self._attempts: dict[tuple[str, str], MakerAttempt] = {}
         self._attempts_path = Path(positions_path or CROSS_POSITIONS_PATH).with_name(
             Path(positions_path or CROSS_POSITIONS_PATH).stem + "_maker.json")
+        # Every rest the guard would have made while disabled, one JSON line each,
+        # for scripts/paper_fills.py to replay against the public trade feed.
+        self._paper_path = Path(positions_path or CROSS_POSITIONS_PATH).with_name(
+            Path(positions_path or CROSS_POSITIONS_PATH).stem + "_paper_rests.jsonl")
         self._orphans: list[MakerAttempt] = []
         self._last_stop: dict[tuple[str, str], str] = {}
         self._last_edge: dict[tuple[str, str], "float | None"] = {}
@@ -1263,9 +1267,39 @@ class CrossGuard:
                 imp.narrow_title[:40], imp.broad_title[:40], opp.shares, opp.no_price,
                 opp.yes_price, opp.entry_per_pair, opp.edge_per_pair, opp.committed,
                 opp.lockup_days, taker_stop)
+            self._record_paper_rest(opp, no_book, yes_book, now)
             return "maker_would_rest", edge
         rested = await self._rest_maker(opp, now)
         return ("maker_resting" if rested else "maker_failed"), edge
+
+    def _record_paper_rest(self, opp: "MakerOpportunity", no_book: dict, yes_book: dict,
+                           now: float) -> None:
+        """
+        What would have rested, and the books it rested in. Whether a disabled
+        guard's rests would ever fill is the question no log line answered: on
+        2026-09-18, 35 of 48 pairs clearing every maker gate had not traded once
+        in seven days on either leg.
+        """
+        imp = opp.imp
+
+        def touch(book, side):
+            lvl = best_level(book, side)
+            return None if lvl is None else [lvl.price, lvl.size]
+
+        row = {"ts": now, "narrow": imp.narrow, "broad": imp.broad,
+               "narrow_title": imp.narrow_title, "broad_title": imp.broad_title,
+               "narrow_yes_token": imp.narrow_yes_token, "narrow_no_token": imp.narrow_no_token,
+               "broad_yes_token": imp.broad_yes_token, "broad_no_token": imp.broad_no_token,
+               "no_price": opp.no_price, "yes_price": opp.yes_price, "shares": opp.shares,
+               "entry": opp.entry_per_pair, "edge": opp.edge_per_pair,
+               "resolves_ts": imp.resolves_ts,
+               "no_bid": touch(no_book, "bids"), "no_ask": touch(no_book, "asks"),
+               "yes_bid": touch(yes_book, "bids"), "yes_ask": touch(yes_book, "asks")}
+        try:
+            with open(self._paper_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row) + "\n")
+        except OSError as exc:
+            logger.warning("CrossGuard | cannot append %s: %s", self._paper_path, exc)
 
     async def _buy(self, token: str, price: float, shares: float) -> "float | None":
         """FOK buy. Returns shares received, or None when nothing filled."""

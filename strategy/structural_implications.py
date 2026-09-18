@@ -26,6 +26,11 @@ event, so "Corners O/U 9.5" or a player's statistic never parses. The line must
 be a half: an integer line can land exactly and refund, and "over 2" is then
 not the event the rule reasons about.
 
+Spreads join them. "Spread: A (-k.5)" whose first outcome is A is "A wins by
+k+1 or more", which needs A to have scored k+1: it sits inside "A O/U k.5", and
+inside the same team's spread one line lower. A spread's title does not name the
+match, so it is tied to the match's over/unders by the market's event.
+
 Only the links are emitted: every dominance at the same line, and each family's
 ladder between neighbouring lines. "X over k ⊆ Y over j" is the chain X over k ⊆
 Y over k ⊆ Y over k−1 ⊆ … ⊆ Y over j, so when it is violated at least one link
@@ -50,7 +55,40 @@ _TITLE = re.compile(
     r"^(?P<a>.+?) vs\. (?P<b>.+?): (?:(?P<team>.+?) )??(?:(?P<period>1st Half|2nd Half) )?"
     r"O/U (?P<line>\d+\.5)$")
 
+_SPREAD = re.compile(r"^Spread: (?P<team>.+) \(-(?P<line>\d+\.5)\)$")
+
 TOTAL, FULL = "total", "full"
+
+
+def _event_id(market: dict) -> "str | None":
+    ev = market.get("events")
+    if isinstance(ev, list) and ev and isinstance(ev[0], dict) and ev[0].get("id") is not None:
+        return str(ev[0]["id"])
+    return None
+
+
+@dataclass(frozen=True)
+class Spread:
+    cid:   str
+    ev_id: str         # the market's event: a spread's title does not name the match
+    team:  str
+    line:  float       # wins by line + 0.5 or more
+
+
+def parse_spread(market: dict) -> "Spread | None":
+    """ "Spread: A (-k.5)" with A as the first outcome, else None."""
+    m = _SPREAD.match(str(market.get("question") or "").strip())
+    ev_id = _event_id(market)
+    if not m or ev_id is None or not market.get("conditionId"):
+        return None
+    raw = market.get("outcomes")
+    try:
+        outcomes = json.loads(raw) if isinstance(raw, str) else list(raw or [])
+    except (TypeError, ValueError):
+        return None
+    if not outcomes or str(outcomes[0]).strip() != m.group("team"):
+        return None                  # the YES token has to be the named team covering
+    return Spread(str(market["conditionId"]), ev_id, m.group("team"), float(m.group("line")))
 
 
 @dataclass(frozen=True)
@@ -108,17 +146,45 @@ def implies(x: OverUnder, y: OverUnder) -> bool:
 def decides(a: dict, b: dict) -> bool:
     """True when the rule settles this pair either way, so the model need not."""
     x, y = parse(a), parse(b)
-    return x is not None and y is not None and x.event == y.event
+    if x is not None and y is not None:
+        return x.event == y.event
+    sx, sy = parse_spread(a), parse_spread(b)
+    if (sx or x) is None or (sy or y) is None or (sx is None and sy is None):
+        return False
+    ea, eb = _event_id(a), _event_id(b)
+    return ea is not None and ea == eb
 
 
 def links(markets: list[dict]) -> list[Implication]:
-    """The linking implications of every match's over/under set."""
+    """The linking implications of every match's over/under and spread set."""
     by_event: dict[str, list[OverUnder]] = {}
+    by_ev_id: dict[str, list[OverUnder]] = {}
+    spreads: dict[tuple[str, str], list[Spread]] = {}
     for m in markets:
         ou = parse(m)
         if ou is not None:
             by_event.setdefault(ou.event, []).append(ou)
+            if _event_id(m) is not None:
+                by_ev_id.setdefault(_event_id(m), []).append(ou)
+            continue
+        sp = parse_spread(m)
+        if sp is not None:
+            spreads.setdefault((sp.ev_id, sp.team), []).append(sp)
     out: list[Implication] = []
+    for (ev_id, team), sps in spreads.items():
+        sps.sort(key=lambda s_: s_.line)
+        for lower, upper in zip(sps, sps[1:]):
+            out.append(Implication(upper.cid, lower.cid, 1.0,
+                                   f"{SOURCE}:spread-ladder: {team} -{upper.line:g} ⊆ "
+                                   f"{team} -{lower.line:g}"))
+        goals = {(o.scope, o.period, o.line): o for o in by_ev_id.get(ev_id, ())}
+        for sp in sps:
+            tgt = goals.get((team, FULL, sp.line)) or goals.get((TOTAL, FULL, sp.line))
+            if tgt is not None:
+                out.append(Implication(sp.cid, tgt.cid, 1.0,
+                                       f"{SOURCE}:spread-goals: {team} -{sp.line:g} ⊆ "
+                                       f"{'match' if tgt.scope == TOTAL else team} over "
+                                       f"{tgt.line:g}"))
     for event, ous in by_event.items():
         by_family: dict[tuple[str, str], list[OverUnder]] = {}
         for ou in ous:

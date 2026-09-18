@@ -243,3 +243,16 @@ async def test_a_refused_book_does_not_get_to_claim_the_best_edge(tmp_path, monk
     line = g.stop_summary()
     assert "book_too_wide 1" in line
     assert "+0.9" not in line
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_rest_is_written_down_for_the_paper_fill_replay(tmp_path, monkeypatch):
+    g, client, _, _ = _maker_guard(tmp_path, monkeypatch, enabled=False)
+    await g.poll_once()
+    rows = [json.loads(l) for l in (tmp_path / "positions_paper_rests.jsonl").read_text().splitlines()]
+    assert len(rows) == 1
+    r = rows[0]
+    assert (r["narrow"], r["broad"]) == ("0xn", "0xb")
+    assert (r["no_price"], r["yes_price"], r["shares"]) == (0.41, 0.51, 5.43)
+    assert r["no_bid"] == [0.40, 50.0] and r["yes_ask"] == [0.55, 50.0]
+    assert client.maker_orders == []                        # nothing was posted
