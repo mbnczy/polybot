@@ -145,6 +145,10 @@ def implies(x: OverUnder, y: OverUnder) -> bool:
 
 def decides(a: dict, b: dict) -> bool:
     """True when the rule settles this pair either way, so the model need not."""
+    pa, pb = parse_strike(a), parse_strike(b)
+    if pa is not None and pb is not None and pa.group == pb.group:
+        narrow, broad = ((pa, pb) if (pa.strike > pb.strike) == pa.rising else (pb, pa))
+        return _creation_safe(narrow, broad)
     x, y = parse(a), parse(b)
     if x is not None and y is not None:
         return x.event == y.event
@@ -170,7 +174,7 @@ def links(markets: list[dict]) -> list[Implication]:
         sp = parse_spread(m)
         if sp is not None:
             spreads.setdefault((sp.ev_id, sp.team), []).append(sp)
-    out: list[Implication] = []
+    out: list[Implication] = price_links(markets)
     for (ev_id, team), sps in spreads.items():
         sps.sort(key=lambda s_: s_.line)
         for lower, upper in zip(sps, sps[1:]):
@@ -214,3 +218,122 @@ def _imp(narrow: OverUnder, broad: OverUnder, kind: str) -> Implication:
     return Implication(narrow.cid, broad.cid, 1.0,
                        f"{SOURCE}:{kind}: {name(narrow)} over {narrow.line:g} ⊆ "
                        f"{name(broad)} over {broad.line:g}")
+
+
+# ── price ladders ─────────────────────────────────────────────────────────────
+#
+# The model's own maker signals on 2026-09-18 were mostly weekly stock ladders —
+# "hit (HIGH) $X", "finish week above $X" — found a pair at a time. Their rules
+# make them ladders outright:
+#
+#   hit (HIGH) $X     any 1-minute candle's High ≥ X during the week's regular
+#   hit (LOW) $X      hours, after the market was created (Low ≤ X)
+#   finish/close/     one observation: the week's (the day's) close, or the
+#   price above $X    price at a stated time, above X
+#
+# so a higher strike sits inside a lower one (a lower one inside a higher, for
+# LOW). "After the market was created" is the catch for the hit ladders: a
+# broader strike created later could have missed a move the narrower one
+# caught. They are linked only when the broader strike existed before the
+# narrower one did, or before the week's first session opened — ladders are
+# created together on the Friday before, and that is the normal case.
+
+_PRICE = r"\$(?P<x>\d[\d,]*(?:\.\d+)?)"
+_DAY = r"(?P<p>[A-Z][a-z]+ \d{1,2}(?:,? \d{4})?)"
+_PRICE_TITLES = (
+    ("hit", re.compile(rf"^Will (?P<u>.+?) \((?P<t>[A-Z][A-Z0-9.\-]*)\) hit \((?P<d>HIGH|LOW)\) "
+                       rf"{_PRICE} Week of {_DAY}\?$")),
+    ("finish", re.compile(rf"^Will (?P<u>.+?) \((?P<t>[A-Z][A-Z0-9.\-]*)\) finish week of "
+                          rf"{_DAY} above {_PRICE}\?$")),
+    ("close", re.compile(rf"^Will (?P<u>.+?) \((?P<t>[A-Z][A-Z0-9.\-]*)\) close above "
+                         rf"{_PRICE} on {_DAY}\?$")),
+    ("closes", re.compile(rf"^(?P<u>.+?) \((?P<t>[A-Z]+)\) closes above {_PRICE} on {_DAY}\?$")),
+    ("price", re.compile(rf"^Will the price of (?P<u>[A-Za-z][A-Za-z .]*) be above {_PRICE} "
+                         rf"on {_DAY}\?$")),
+)
+_WEEK_OPEN_UTC_H = 13          # 09:30 New York is 13:30 UTC in summer; earlier is stricter
+
+
+@dataclass(frozen=True)
+class Strike:
+    cid:     str
+    group:   tuple             # (kind, underlying, period, end date, HIGH/LOW)
+    strike:  float
+    rising:  bool              # a higher strike is the narrower event
+    created: "float | None"
+    opens:   "float | None"    # when prices start to count, for path-dependent kinds
+
+
+def _ts(raw) -> "float | None":
+    from datetime import datetime  # noqa: PLC0415
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _week_open(period: str) -> "float | None":
+    from datetime import datetime, timezone  # noqa: PLC0415
+    for fmt in ("%B %d %Y", "%B %d, %Y"):
+        try:
+            d = datetime.strptime(period, fmt).replace(tzinfo=timezone.utc)
+            return d.replace(hour=_WEEK_OPEN_UTC_H).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def parse_strike(market: dict) -> "Strike | None":
+    """The market as one strike of a price ladder, or None."""
+    q = str(market.get("question") or "").strip()
+    if not market.get("conditionId") or _first_outcome(market) != "yes":
+        return None
+    for kind, rx in _PRICE_TITLES:
+        m = rx.match(q)
+        if not m:
+            continue
+        d = m.groupdict().get("d")
+        under = (m.groupdict().get("t") or m.group("u")).strip()
+        try:
+            x = float(m.group("x").replace(",", ""))
+        except ValueError:
+            return None
+        return Strike(cid=str(market["conditionId"]),
+                      group=(kind, under, m.group("p"), str(market.get("endDate") or ""), d),
+                      strike=x, rising=(d != "LOW"),
+                      created=_ts(market.get("createdAt")),
+                      opens=_week_open(m.group("p")) if kind == "hit" else None)
+    return None
+
+
+def _creation_safe(narrow: Strike, broad: Strike) -> bool:
+    """For a path-dependent ladder: did the broad strike exist whenever the narrow could have been hit?"""
+    if narrow.opens is None and narrow.group[0] != "hit":
+        return True                              # one observation: creation cannot matter
+    if narrow.created is None or broad.created is None:
+        return False
+    since = max(narrow.created, narrow.opens or narrow.created)
+    return broad.created <= since
+
+
+def price_links(markets: list[dict]) -> list[Implication]:
+    groups: dict[tuple, list[Strike]] = {}
+    for m in markets:
+        s = parse_strike(m)
+        if s is not None:
+            groups.setdefault(s.group, []).append(s)
+    out: list[Implication] = []
+    for group, strikes in groups.items():
+        strikes.sort(key=lambda s: s.strike)
+        for lo, hi in zip(strikes, strikes[1:]):
+            if lo.strike == hi.strike:
+                continue
+            narrow, broad = (hi, lo) if lo.rising else (lo, hi)
+            if not _creation_safe(narrow, broad):
+                continue
+            kind, under = group[0], group[1]
+            label = f"{kind} {group[4]}" if group[4] else kind
+            out.append(Implication(narrow.cid, broad.cid, 1.0,
+                                   f"{SOURCE}:price-ladder: {under} {label} {narrow.strike:g} ⊆ "
+                                   f"{broad.strike:g}"))
+    return out

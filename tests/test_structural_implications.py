@@ -164,3 +164,80 @@ def test_the_rule_decides_spread_pairs_of_one_event():
     assert si.decides(a, b) and si.decides(a, ms[0])
     assert not si.decides(a, _sp("x", "FC Utrecht", "1.5", ev="E2"))
     assert not si.decides(a, ms[7])                           # corners: the model's
+
+
+# ── price ladders ─────────────────────────────────────────────────────────────
+
+FRI = "2026-09-11T22:00:02Z"                 # the ladder is created the Friday before
+MID = "2026-09-16T15:00:00Z"                 # Wednesday, in the middle of the session
+
+
+def _p(cid, q, created=FRI, end="2026-09-18T20:00:00Z", first="Yes"):
+    return {"conditionId": cid, "question": q, "createdAt": created, "endDate": end,
+            "outcomes": json.dumps([first, "No" if first == "Yes" else "Yes"])}
+
+
+def _hit(cid, d, x, created=FRI, tkr="AAPL"):
+    return _p(cid, f"Will Apple ({tkr}) hit ({d}) ${x} Week of September 14 2026?", created)
+
+
+def test_every_price_shape_reads():
+    for q in ("Will Apple (AAPL) hit (HIGH) $360 Week of September 14 2026?",
+              "Will Apple (AAPL) hit (LOW) $328 Week of September 14 2026?",
+              "Will Apple (AAPL) finish week of September 14 above $300?",
+              "Will NVIDIA (NVDA) close above $190 on September 18?",
+              "S&P 500 (SPY) closes above $750 on September 18?",
+              "Will the price of Bitcoin be above $82,000 on September 18?"):
+        assert si.parse_strike(_p("c", q)) is not None, q
+
+
+def test_a_strike_whose_first_outcome_is_not_yes_does_not_read():
+    assert si.parse_strike(_p("c", "Will Apple (AAPL) finish week of September 14 above $300?",
+                              first="No")) is None
+
+
+def _rels(ms):
+    return {(r.narrow, r.broad) for r in si.links(ms) if "price-ladder" in r.evidence}
+
+
+def test_a_high_ladder_nests_upwards_and_a_low_one_downwards():
+    ms = [_hit("h1", "HIGH", 350), _hit("h2", "HIGH", 360), _hit("l1", "LOW", 320), _hit("l2", "LOW", 310)]
+    assert _rels(ms) == {("h2", "h1"), ("l2", "l1")}
+
+
+def test_thousands_separators_read_as_one_number():
+    ms = [_p(f"b{x}", f"Will the price of Bitcoin be above ${x:,} on September 18?")
+          for x in (80000, 82000)]
+    assert _rels(ms) == {("b82000", "b80000")}
+
+
+def test_a_broader_strike_added_mid_week_is_not_linked():
+    """$350 created on Wednesday cannot vouch for a $360 touch on Monday."""
+    ms = [_hit("h1", "HIGH", 350, created=MID), _hit("h2", "HIGH", 360)]
+    assert _rels(ms) == set()
+
+
+def test_a_narrower_strike_added_mid_week_still_is():
+    """$360 created on Wednesday: whenever it is hit, $350 already existed."""
+    ms = [_hit("h1", "HIGH", 350), _hit("h2", "HIGH", 360, created=MID)]
+    assert _rels(ms) == {("h2", "h1")}
+
+
+def test_a_single_observation_ignores_creation():
+    ms = [_p("f1", "Will Apple (AAPL) finish week of September 14 above $300?", created=MID),
+          _p("f2", "Will Apple (AAPL) finish week of September 14 above $310?")]
+    assert _rels(ms) == {("f2", "f1")}
+
+
+def test_different_tickers_weeks_or_ends_never_pair():
+    ms = [_hit("a", "HIGH", 350), _hit("b", "HIGH", 360, tkr="MSFT"),
+          _p("c", "Will Apple (AAPL) hit (HIGH) $370 Week of September 21 2026?"),
+          {**_hit("d", "HIGH", 380), "endDate": "2026-09-25T20:00:00Z"}]
+    assert _rels(ms) == set()
+
+
+def test_the_rule_decides_a_ladder_pair_but_not_an_unsafe_one():
+    safe = (_hit("h1", "HIGH", 350), _hit("h2", "HIGH", 360))
+    unsafe = (_hit("h1", "HIGH", 350, created=MID), _hit("h2", "HIGH", 360))
+    assert si.decides(*safe) and si.decides(*reversed(safe))
+    assert not si.decides(*unsafe)

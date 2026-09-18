@@ -88,7 +88,7 @@ def _page(params: dict, limit: int) -> list[dict]:
 # over the reader's 1 GB cap as Python objects. Slimmed, it is a few hundred bytes.
 _KEEP_FIELDS = ("conditionId", "question", "endDate", "outcomes", "clobTokenIds",
                 "negRiskMarketID", "outcomePrices", "bestBid", "bestAsk", "updatedAt",
-                "orderPriceMinTickSize")
+                "orderPriceMinTickSize", "createdAt")
 
 
 def _fee_rate(market: dict) -> "float | None":
