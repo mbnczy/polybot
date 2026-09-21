@@ -812,6 +812,39 @@ def export_implications(rels: list, markets: list[dict], path: str, audit=None) 
     return len(rows)
 
 
+_SPORT_TITLE = re.compile(r"^(?:Spread: |Exact Score: |[^:]+ vs\.? [^:]+: )")
+_FIXTURE_TOLERANCE_S = 600.0
+
+
+def same_fixture(a: dict, b: dict) -> bool:
+    """
+    False when two sports markets belong to different games. A title does not
+    say which game: a baseball series, a cup tie and a league match list the
+    same two teams under identical titles days apart, and the model, seeing
+    titles only, paired them — "Spread: Chicago Cubs (-2.5) ⊆ (-1.5)" across
+    two games, violated at resolution. A match market's end date is its
+    kick-off, so markets of one game share it; anything else passes.
+    """
+    if not (_SPORT_TITLE.match(str(a.get("question") or ""))
+            and _SPORT_TITLE.match(str(b.get("question") or ""))):
+        return True
+    ta, tb = _market_end_ts(a), _market_end_ts(b)
+    if ta is None or tb is None:
+        return False
+    return abs(ta - tb) <= _FIXTURE_TOLERANCE_S
+
+
+def drop_cross_fixture(rels: list, markets: list[dict]) -> list:
+    by_id = {str(m.get("conditionId")): m for m in markets if m.get("conditionId")}
+    kept = [r for r in rels
+            if r.narrow not in by_id or r.broad not in by_id
+            or same_fixture(by_id[r.narrow], by_id[r.broad])]
+    if len(kept) != len(rels):
+        print(f"  fixtures   : {len(rels) - len(kept)} pair(s) dropped — two different "
+              f"games under the same titles")
+    return kept
+
+
 def with_structural(rels: list, markets: list[dict]) -> list:
     """
     Add the implications a match's over/under titles state outright
@@ -1317,6 +1350,7 @@ def one_pass(args, markets_cache: dict) -> int:
         rels = _drop_backwards(discover(universe, args), markets)
         if not getattr(args, "no_structural", False):
             rels = with_structural(rels, universe)
+        rels = drop_cross_fixture(rels, markets)
         markets_cache["rels"] = rels
 
         # Only announce relations we have not announced before.

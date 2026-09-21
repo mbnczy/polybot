@@ -117,7 +117,9 @@ def main(args) -> int:
     by_cid = {}
     for i, row in tokens.items():
         by_cid.setdefault(row["cid"], (i, row))
-    markets = [{"conditionId": cid, "question": row["q"], "outcomes": row["outcomes"]}
+    # The event and kick-off go in too: a match is its event, not its title.
+    markets = [{"conditionId": cid, "question": row["q"], "outcomes": row["outcomes"],
+                "events": [{"id": row.get("ev")}], "endDate": row.get("kick")}
                for cid, (i, row) in by_cid.items()]
     links = si.links(markets)
     idx = {cid: i for cid, (i, _) in by_cid.items()}
@@ -187,6 +189,16 @@ def main(args) -> int:
     for key, ep in open_ep.items():
         done.append((key, ep))
     print(f"{lines} lines replayed from {len(files)} file(s)\n")
+    if args.dump:
+        with open(args.dump, "w", encoding="utf-8") as fh:
+            for (nc, bc, kind), e in done:
+                fh.write(json.dumps({"narrow": nc, "broad": bc, "kind": kind, "start": e.start,
+                                     "end": e.end, "best": e.best, "depth": e.depth,
+                                     "inplay": e.inplay,
+                                     "narrow_token": tokens[idx[nc]]["token"],
+                                     "broad_token": tokens[idx[bc]]["token"],
+                                     "narrow_q": tokens[idx[nc]]["q"],
+                                     "broad_q": tokens[idx[bc]]["q"]}) + "\n")
 
     for kind in kinds:
         eps = [(k, e) for k, e in done if k[2] == kind]
@@ -219,6 +231,7 @@ if __name__ == "__main__":
     ap.add_argument("--max-spread", type=float, default=0.05,
                     help="resting only in books this tight, as the guard does")
     ap.add_argument("--top", type=int, default=12)
+    ap.add_argument("--dump", help="write every episode as a JSON line here")
     ap.add_argument("--rest-only", action="store_true",
                     help="replay only the REST reads (R lines): coarser, but the ground truth")
     sys.exit(main(ap.parse_args()))

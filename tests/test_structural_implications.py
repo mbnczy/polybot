@@ -241,3 +241,40 @@ def test_the_rule_decides_a_ladder_pair_but_not_an_unsafe_one():
     unsafe = (_hit("h1", "HIGH", 350, created=MID), _hit("h2", "HIGH", 360))
     assert si.decides(*safe) and si.decides(*reversed(safe))
     assert not si.decides(*unsafe)
+
+
+# ── one match is one event ────────────────────────────────────────────────────
+
+def test_two_games_of_a_series_never_link():
+    """Twins–Angels on Friday and on Saturday: identical titles, different events."""
+    title = "Minnesota Twins vs. Los Angeles Angels: O/U {}"
+    fri = [{**_m(f"f{x}", f"O/U {x}"), "question": title.format(x), "events": [{"id": "FRI"}]}
+           for x in ("7.5", "8.5")]
+    sat = [{**_m(f"s{x}", f"O/U {x}"), "question": title.format(x), "events": [{"id": "SAT"}]}
+           for x in ("7.5", "8.5")]
+    rels = {(r.narrow, r.broad) for r in si.links(fri + sat)}
+    assert rels == {("f8.5", "f7.5"), ("s8.5", "s7.5")}
+
+
+def test_a_listed_twin_is_not_a_ladder_step():
+    ms = [{**_m("a", "O/U 2.5"), "events": [{"id": "E"}]},
+          {**_m("b", "O/U 2.5"), "events": [{"id": "E"}]}]
+    assert si.links(ms) == []
+
+
+def test_the_reader_drops_a_pair_from_two_different_games():
+    import scripts.demo_cross_market as reader
+    from strategy.cross_market import Implication
+    fri = {"conditionId": "a", "question": "Spread: Chicago Cubs (-2.5)", "endDate": "2026-09-18T23:05:00Z"}
+    sat = {"conditionId": "b", "question": "Spread: Chicago Cubs (-1.5)", "endDate": "2026-09-19T23:05:00Z"}
+    same = {**sat, "conditionId": "c", "endDate": "2026-09-18T23:05:00Z"}
+    rels = [Implication("a", "b", 0.97, "model"), Implication("a", "c", 0.97, "model")]
+    kept = reader.drop_cross_fixture(rels, [fri, sat, same])
+    assert [(r.narrow, r.broad) for r in kept] == [("a", "c")]
+
+
+def test_the_fixture_guard_leaves_other_markets_alone():
+    import scripts.demo_cross_market as reader
+    a = {"question": "Will the price of XRP be above $1.90 on September 21?", "endDate": "2026-09-21T16:00:00Z"}
+    b = {"question": "Will the price of XRP be above $1.80 on September 22?", "endDate": "2026-09-22T16:00:00Z"}
+    assert reader.same_fixture(a, b)

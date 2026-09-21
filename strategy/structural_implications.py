@@ -115,8 +115,14 @@ def parse(market: dict) -> "OverUnder | None":
         return None                  # "Corners", a player, a statistic
     if _first_outcome(market) != "over":
         return None                  # the YES token has to be Over
+    # The match is the event, not the title. A baseball series lists the same
+    # two teams on consecutive days under identical titles: keyed on the title,
+    # "O/U 8.5 ⊆ O/U 7.5" linked Saturday's game to Friday's, 35 of those pairs
+    # were violated at resolution in September 2026, and their "+5.5% taker
+    # edges" were two different games' prices.
+    fixture = _event_id(market) or str(market.get("endDate") or "")
     return OverUnder(cid=str(market["conditionId"]),
-                     event=f"{m.group('a')} vs. {m.group('b')}",
+                     event=f"{m.group('a')} vs. {m.group('b')}#{fixture}",
                      scope=team or TOTAL, period=m.group("period") or FULL,
                      line=float(m.group("line")))
 
@@ -197,7 +203,8 @@ def links(markets: list[dict]) -> list[Implication]:
         for fam in by_family.values():
             fam.sort(key=lambda o: o.line)
             for lower, upper in zip(fam, fam[1:]):
-                out.append(_imp(upper, lower, "ladder"))
+                if upper.line > lower.line:          # a listed twin is no ladder step
+                    out.append(_imp(upper, lower, "ladder"))
         # Across families at the same line, wherever one count bounds the other.
         by_line: dict[float, list[OverUnder]] = {}
         for ou in ous:

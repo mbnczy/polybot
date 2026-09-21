@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -79,14 +80,37 @@ def load_rests(path: Path) -> list[dict]:
     return sorted(out, key=lambda r: r["ts"])
 
 
+_LOCAL = threading.local()
+
+
+def _get(url: str, params) -> "httpx.Response | None":
+    """GET on this thread's client, retrying what a moment fixes. A client per
+    call was a DNS lookup per market, and over a weekend of rests one failed
+    lookup among thousands ended the whole run."""
+    client = getattr(_LOCAL, "client", None)
+    if client is None:
+        client = _LOCAL.client = httpx.Client(timeout=30)
+    for attempt in range(4):
+        try:
+            r = client.get(url, params=params)
+        except httpx.HTTPError:
+            time.sleep(1.0 + 2.0 * attempt)
+            continue
+        if r.status_code == 429 or r.status_code >= 500:
+            time.sleep(1.0 + 2.0 * attempt)
+            continue
+        return r
+    return None
+
+
 def trades_since(cid: str, since: float) -> list[dict]:
     """Every trade on the market since `since`, oldest first."""
     out: list[dict] = []
-    with httpx.Client(timeout=30) as c:
+    if True:
         offset = 0
         while offset < 10_000:
-            r = c.get(_TRADES, params={"market": cid, "limit": 500, "offset": offset})
-            if r.status_code != 200:
+            r = _get(_TRADES, {"market": cid, "limit": 500, "offset": offset})
+            if r is None or r.status_code != 200:
                 break
             page = r.json()
             out += page
@@ -98,11 +122,11 @@ def trades_since(cid: str, since: float) -> list[dict]:
 
 def resolutions(cids: list[str]) -> dict[str, "tuple[float, float] | None"]:
     out: dict[str, "tuple[float, float] | None"] = {}
-    with httpx.Client(timeout=30) as c:
+    if True:
         for i in range(0, len(cids), 50):
             part = cids[i:i + 50]
-            r = c.get(_GAMMA, params=[("condition_ids", x) for x in part] + [("closed", "true")])
-            for m in (r.json() if r.status_code == 200 else []):
+            r = _get(_GAMMA, [("condition_ids", x) for x in part] + [("closed", "true")])
+            for m in (r.json() if r is not None and r.status_code == 200 else []):
                 out[str(m.get("conditionId"))] = resolved_prices(m)
     return out
 
@@ -183,7 +207,7 @@ def main(args) -> int:
         first[r["narrow"]] = min(first[r["narrow"]], r["ts"])
         first[r["broad"]] = min(first[r["broad"]], r["ts"])
     cids = list(first)
-    with ThreadPoolExecutor(6) as ex:
+    with ThreadPoolExecutor(4) as ex:
         # a day earlier than the first rest: the activity before each rest is a column
         trades = dict(zip(cids, ex.map(lambda c: trades_since(c, first[c] - 86_400.0), cids)))
     resolved = resolutions(cids)
