@@ -1713,8 +1713,19 @@ class PolyClient:
                 else:
                     safe_price = desired_price
 
-            # Clamp to the valid CLOB price tick range [0.01, 0.99]
-            safe_price = round(max(0.01, min(safe_price, 0.99)), 3)
+            # The widest range any market has; each market's own tick grid is
+            # checked when the order is signed, and an off-grid price is refused
+            # there, never rounded. The old [0.01, 0.99] clamp moved prices
+            # itself: on 2026-09-23 a pair priced at 0.992 + 0.003 (+0.5%) on
+            # 0.001-tick books was posted at 0.99 + 0.01 — no edge at all.
+            safe_price = round(max(0.001, min(safe_price, 0.999)), 3)
+            # A maker order may improve on the price it was asked for, never
+            # worsen it: the caller priced its edge at desired_price.
+            if ((side_upper == "BUY" and safe_price > desired_price + 1e-9)
+                    or (side_upper == "SELL" and safe_price < desired_price - 1e-9)):
+                raise ValueError(
+                    f"maker {side_upper} at {desired_price:.4f} would have to post at "
+                    f"{safe_price:.4f} — refusing a worse price than was priced")
 
         if _PAPER_TRADE:
             logger.info(

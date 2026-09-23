@@ -335,3 +335,67 @@ async def test_no_reserve_lets_the_maker_path_use_every_slot(tmp_path, monkeypat
     breaker.on_cross_open(5.0)
     await g.poll_once()
     assert len(client.maker_orders) == 2
+
+
+# ── PolyClient.post_maker_order: the price posted is never worse than priced ──
+
+def _maker_client(monkeypatch, asks, bids=()):
+    import core.clob_client as cc
+    monkeypatch.setattr(cc, "_PAPER_TRADE", False)
+    c = cc.PolyClient.__new__(cc.PolyClient)
+    c.posted = []
+
+    async def _get_orderbook(token_id):
+        return {"bids": [{"price": p, "size": 100.0} for p in bids],
+                "asks": [{"price": p, "size": 100.0} for p in asks]}
+    c.get_orderbook = _get_orderbook
+    c._touch = lambda *t: None
+    c._remember_orders = lambda tokens, resp: None
+
+    async def _run_with_retry(fn, *a, **kw):
+        if "price" in kw:
+            c.posted.append(kw["price"])
+            return "signed"
+        return {"status": "live", "order_id": "0xabc"}
+    c._run_with_retry = _run_with_retry
+    c._create_limit = lambda **kw: kw
+    c._post = lambda signed: signed
+    return c
+
+
+@pytest.mark.asyncio
+async def test_a_bid_below_one_cent_is_posted_where_it_was_priced(monkeypatch):
+    """2026-09-23 15:10: a 0.003 bid on a 0.001-tick book went out at 0.01."""
+    c = _maker_client(monkeypatch, asks=[0.009])
+    await c.post_maker_order("T", "BUY", 0.003, 5.02)
+    assert c.posted == [0.003]
+
+
+@pytest.mark.asyncio
+async def test_a_bid_above_ninety_nine_cents_is_posted_where_it_was_priced(monkeypatch):
+    c = _maker_client(monkeypatch, asks=[0.995])
+    await c.post_maker_order("T", "BUY", 0.992, 5.02)
+    assert c.posted == [0.992]
+
+
+@pytest.mark.asyncio
+async def test_a_bid_at_the_ask_is_lowered_below_it_not_raised(monkeypatch):
+    c = _maker_client(monkeypatch, asks=[0.50])
+    await c.post_maker_order("T", "BUY", 0.50, 5.0)
+    assert c.posted == [0.499]
+
+
+@pytest.mark.asyncio
+async def test_an_offer_under_the_bid_is_raised_above_it(monkeypatch):
+    c = _maker_client(monkeypatch, asks=[], bids=[0.40])
+    await c.post_maker_order("T", "SELL", 0.39, 5.0)
+    assert c.posted == [0.401]
+
+
+@pytest.mark.asyncio
+async def test_a_price_outside_every_grid_is_refused_not_moved(monkeypatch):
+    c = _maker_client(monkeypatch, asks=[])
+    with pytest.raises(ValueError, match="worse price"):
+        await c.post_maker_order("T", "BUY", 0.0005, 5.0)     # only 0.001 exists
+    await c.post_maker_order("T", "BUY", 0.9995, 5.0)         # 0.999 is cheaper: fine
+    assert c.posted == [0.999]
