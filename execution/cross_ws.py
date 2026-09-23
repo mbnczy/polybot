@@ -234,7 +234,10 @@ class CrossBookWatch:
                 await asyncio.gather(*tasks, return_exceptions=True)
                 tokens = sorted(self._by_token)
                 self._subscribed = set(tokens)
-                self._resub_at = time.monotonic()
+                if tokens:
+                    # Only a real subscription starts the clock: an empty one at
+                    # start-up held the first real set back five minutes.
+                    self._resub_at = time.monotonic()
                 for t in [t for t in self._tops if t not in self._subscribed]:
                     del self._tops[t]
                 chunks = [tokens[i:i + self._per_conn]

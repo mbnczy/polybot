@@ -186,3 +186,26 @@ def test_a_subscribed_token_keeps_its_book_while_unwatched():
     w.watch([WatchPair(("n", "b"), "NO", "YES", 0.0, 0.0)])
     w.handle(json.dumps(_snap("YES", [(0.45, 10)], [(0.43, 10)])))
     assert fired and fired[-1][0] == ("n", "b")        # priced at once on return
+
+
+@pytest.mark.asyncio
+async def test_the_first_set_is_subscribed_as_soon_as_it_arrives(monkeypatch):
+    """2026-09-23 13:51: run() started before the first watch(), subscribed to
+    nothing, and that empty subscription held the real one back five minutes."""
+    w = CrossBookWatch(lambda k, e: None, min_edge=0.02, resub_s=300.0)
+    opened = []
+
+    async def _socket(tokens, sid):
+        opened.append(sorted(tokens))
+        await asyncio.sleep(3600)
+    monkeypatch.setattr(w, "_socket", _socket)
+    task = asyncio.create_task(w.run())
+    await asyncio.sleep(0.05)
+    w.watch([WatchPair(("a", "b"), "A1", "B1")])
+    for _ in range(40):
+        await asyncio.sleep(0.05)
+        if opened:
+            break
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert opened == [["A1", "B1"]]
