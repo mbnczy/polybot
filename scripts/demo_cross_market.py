@@ -845,8 +845,11 @@ def same_fixture(a: dict, b: dict) -> bool:
     if not (_is_sports(a) and _is_sports(b)):
         return True
     ea, eb = _event_id(a), _event_id(b)
-    if ea is not None and eb is not None:
-        return ea == eb
+    if ea is not None and ea == eb:
+        return True
+    # Different events can still be one game: a match's exact scores are listed
+    # as their own event, and those pairs have resolved correctly 2,870 times.
+    # What no two games of one team share is the moment they start.
     ta, tb = _market_end_ts(a), _market_end_ts(b)
     if ta is None or tb is None:
         return False

@@ -322,3 +322,14 @@ def test_dated_event_ladders_are_not_fixtures():
     b = {"question": "US x Yemen ceasefire continues through September 22?",
          "endDate": "2026-09-22T12:00:00Z", "outcomes": '["Yes", "No"]'}
     assert reader.same_fixture(a, b) and reader.same_side(a, b)
+
+
+def test_a_matchs_exact_scores_are_its_own_fixture():
+    """They are listed as a separate event, and those pairs resolve correctly."""
+    import scripts.demo_cross_market as reader
+    match = _sports("a", "AS Monaco vs. RC Lens: O/U 2.5", "900", outcomes=("Over", "Under"))
+    exact = _sports("b", "Exact Score: AS Monaco 1 - 0 RC Lens?", "901")
+    assert reader.same_fixture(match, exact)
+    next_night = _sports("c", "Exact Score: AS Monaco 1 - 0 RC Lens?", "902",
+                         end="2026-09-23T01:45:00Z")
+    assert not reader.same_fixture(match, next_night)
