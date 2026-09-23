@@ -56,6 +56,7 @@ before any money depends on them.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import math
@@ -63,7 +64,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from core.clob_client import _FILLED_STATUSES
 from risk.circuit_breaker import CircuitBreakerTripped
@@ -80,6 +81,9 @@ from strategy.cross_exit import (
     should_exit,
     taker_fee_per_share,
 )
+
+if TYPE_CHECKING:
+    from execution.cross_ws import CrossBookWatch, WatchPair
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +135,14 @@ CROSS_SPIKE_CONFIRM_S: float = float(os.environ.get("CROSS_SPIKE_CONFIRM_S", 300
 # that same pair can become tradeable. The cost is queue risk: an order can rest
 # unfilled, or one leg fills and the other does not.
 CROSS_MAKER_ENABLED: bool = _flag("CROSS_MAKER_ENABLED", "true")
+# Push the books of the pairs nearest their threshold (execution/cross_ws.py) and
+# price a pair the moment its asks add up, instead of at its turn in the sweep.
+CROSS_WS_ENABLED: bool = _flag("CROSS_WS_ENABLED", "true")
+# Pairs watched that way, nearest first: two tokens each, 250 to a socket.
+CROSS_WS_MAX_PAIRS: int = int(os.environ.get("CROSS_WS_MAX_PAIRS", 400))
+# Pairs one push may price at once, and how soon the same pair may be pushed again.
+CROSS_WS_MAX_URGENT: int = int(os.environ.get("CROSS_WS_MAX_URGENT", 20))
+CROSS_WS_MIN_GAP_S: float = float(os.environ.get("CROSS_WS_MIN_GAP_S", 2.0))
 CROSS_MAKER_TTL_S: float = float(os.environ.get("CROSS_MAKER_TTL_S", 180.0))
 CROSS_MAKER_MIN_EDGE: float = float(os.environ.get("CROSS_MAKER_MIN_EDGE", CROSS_MIN_EDGE))
 # A bid a tick above an almost empty book is not an offer anyone will take: on
@@ -616,6 +628,7 @@ class CrossGuard:
         maker_ttl_s:       "float | None" = None,
         maker_min_edge:    "float | None" = None,
         taker_reserve:     "int | None" = None,
+        ws_enabled:        "bool | None" = None,
         resolution_lookup: "ResolutionLookup | None" = None,
     ) -> None:
         self._client = client
@@ -652,6 +665,12 @@ class CrossGuard:
         self._maker_min_edge = (CROSS_MAKER_MIN_EDGE if maker_min_edge is None
                                 else maker_min_edge)
         self._taker_reserve = CROSS_TAKER_RESERVE_SLOTS if taker_reserve is None else taker_reserve
+        self._ws_enabled = CROSS_WS_ENABLED if ws_enabled is None else ws_enabled
+        self._ws: "CrossBookWatch | None" = None
+        # Pairs the socket says are at their threshold now: key → its edge there.
+        self._urgent: dict[tuple[str, str], float] = {}
+        self._urgent_at: dict[tuple[str, str], float] = {}
+        self._wake: "asyncio.Event | None" = None
         self._attempts: dict[tuple[str, str], MakerAttempt] = {}
         self._attempts_path = Path(positions_path or CROSS_POSITIONS_PATH).with_name(
             Path(positions_path or CROSS_POSITIONS_PATH).stem + "_maker.json")
@@ -673,7 +692,8 @@ class CrossGuard:
         self.last_reason: dict[tuple[str, str], str] = {}
         self.stats = {"evaluated": 0, "would_enter": 0, "entered": 0,
                       "half_filled": 0, "exited": 0, "resolved": 0, "stuck": 0,
-                      "would_rest": 0, "rested": 0, "maker_filled": 0}
+                      "would_rest": 0, "rested": 0, "maker_filled": 0,
+                      "ws_pushed": 0, "ws_priced": 0}
         # The last complete pass over the reader's file, for stop_summary():
         # (when, implications read, stops by key, (best edge, narrow title),
         #  pairs not priced this pass, age of the stalest price in seconds).
@@ -781,27 +801,116 @@ class CrossGuard:
             line += f" | stalest price {stalest:.0f}s"
         if best is not None:
             line += f" | best edge {best[0]:+.4f} (min {self._min_edge:.4f}) {best[1][:50]}"
+        if self._ws is not None:
+            line += (f" | ws {len(self._ws.tokens)} token(s), {self.stats['ws_pushed']} "
+                     f"push(es), {self.stats['ws_priced']} priced")
         return (f"{line} | would_enter {self.stats['would_enter']} "
                 f"entered {self.stats['entered']} open {len(self._book.open_positions())}")
 
     # ── loop ──────────────────────────────────────────────────────────────────
 
     async def run(self) -> None:
-        logger.info("CrossGuard started | poll=%.0fs", self._poll)
+        logger.info("CrossGuard started | poll=%.0fs | ws %s", self._poll,
+                    "on" if self._enabled and self._ws_enabled else "off")
+        self._wake = asyncio.Event()
+        ws_task = None
+        if self._enabled and self._ws_enabled:
+            from execution.cross_ws import CrossBookWatch  # noqa: PLC0415
+            self._ws = CrossBookWatch(self.nudge, min_edge=self._min_edge)
+            ws_task = asyncio.create_task(self._ws.run())
+        loop = asyncio.get_running_loop()
+        next_poll = 0.0
         try:
             while True:
                 try:
-                    await self.poll_once()
+                    if loop.time() >= next_poll:
+                        await self.poll_once()
+                        next_poll = loop.time() + self._poll
+                        if self._ws is not None:
+                            self._ws.watch(self._watch_pairs(time.time()))
+                    if self._urgent:
+                        await self._urgent_pass()
                 except CircuitBreakerTripped:
                     raise
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001
                     logger.error("CrossGuard poll failed: %s", exc)
-                await asyncio.sleep(self._poll)
+                    next_poll = loop.time() + self._poll
+                if not self._urgent:
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(self._wake.wait(),
+                                               max(0.0, next_poll - loop.time()))
+                self._wake.clear()
         except asyncio.CancelledError:
             logger.info("CrossGuard stopped")
             raise
+        finally:
+            if ws_task is not None:
+                ws_task.cancel()
+                await asyncio.gather(ws_task, return_exceptions=True)
+
+    # ── pushed books ──────────────────────────────────────────────────────────
+
+    def nudge(self, key: "tuple[str, str]", edge: float) -> None:
+        """The socket's word that a pair's asks add up: price it now."""
+        self.stats["ws_pushed"] += 1
+        self._urgent[key] = edge
+        if self._wake is not None:
+            self._wake.set()
+
+    def _watch_pairs(self, now: float) -> "list[WatchPair]":
+        """The pairs last priced nearest their threshold, that a pass could still enter."""
+        from execution.cross_ws import WatchPair  # noqa: PLC0415
+        near = []
+        for imp in self._implications():
+            edge = self._last_edge.get(imp.key)
+            if edge is None or self._cheap_stop(imp, now) not in (None, "deferred"):
+                continue
+            near.append((edge, imp))
+        near.sort(key=lambda x: -x[0])
+        return [WatchPair(imp.key, imp.narrow_no_token, imp.broad_yes_token,
+                          imp.narrow_fee_rate, imp.broad_fee_rate)
+                for _, imp in near[:max(0, CROSS_WS_MAX_PAIRS)]]
+
+    async def _urgent_pass(self) -> None:
+        """Price the pushed pairs from fresh books, through every gate a pass has."""
+        now = time.time()
+        pushed, self._urgent = self._urgent, {}
+        by_key = {imp.key: imp for imp in self._implications()}
+        todo = []
+        for key, ws_edge in sorted(pushed.items(), key=lambda kv: -kv[1]):
+            imp = by_key.get(key)
+            if imp is None or now - self._urgent_at.get(key, 0.0) < CROSS_WS_MIN_GAP_S:
+                continue
+            # A deferral is the sweep's guess that nothing will change soon; the
+            # socket has just said otherwise. Every other cheap stop still holds.
+            if self._cheap_stop(imp, now) not in (None, "deferred"):
+                continue
+            todo.append((imp, ws_edge))
+            if len(todo) >= CROSS_WS_MAX_URGENT:
+                break
+        if not todo:
+            return
+        for imp, _ in todo:
+            self._urgent_at[imp.key] = now
+        tokens = [t for imp, _ in todo for t in (imp.narrow_no_token, imp.broad_yes_token)]
+        self._fee_lookups_left = CROSS_MAX_FEE_LOOKUPS_PER_POLL
+        try:
+            if hasattr(self._client, "get_orderbooks"):
+                self._poll_books = await self._client.get_orderbooks(tokens,
+                                                                      chunk=CROSS_BOOK_BATCH)
+            for imp, ws_edge in todo:
+                stop, edge = await self._priced(imp, now)
+                self.stats["ws_priced"] += 1
+                self._priced_at[imp.key] = now
+                self._last_stop[imp.key] = stop
+                self._last_edge[imp.key] = edge
+                logger.info("CrossGuard | pushed %s: socket %+.4f → books %s%s",
+                            imp.narrow_title[:48], ws_edge, stop,
+                            "" if edge is None else f" {edge:+.4f}")
+        finally:
+            self._poll_books = None
 
     async def poll_once(self) -> None:
         now = time.time()
