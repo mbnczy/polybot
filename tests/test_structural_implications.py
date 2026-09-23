@@ -278,3 +278,47 @@ def test_the_fixture_guard_leaves_other_markets_alone():
     a = {"question": "Will the price of XRP be above $1.90 on September 21?", "endDate": "2026-09-21T16:00:00Z"}
     b = {"question": "Will the price of XRP be above $1.80 on September 22?", "endDate": "2026-09-22T16:00:00Z"}
     assert reader.same_fixture(a, b)
+
+
+# ── the reader's fixture and side guards ──────────────────────────────────────
+
+def _sports(cid, q, ev, kind="team_totals", outcomes=("Yes", "No"), end="2026-09-22T01:45:00Z"):
+    return {"conditionId": cid, "question": q, "sportsMarketType": kind, "endDate": end,
+            "events": [{"id": ev}], "outcomes": json.dumps(list(outcomes))}
+
+
+def test_two_nights_of_team_totals_are_different_fixtures():
+    """The title says the team, not the night: both were exported, and violated."""
+    import scripts.demo_cross_market as reader
+    mon = _sports("a", "San Francisco Giants Team Total: O/U 4.5", "1028090")
+    tue = _sports("b", "San Francisco Giants Team Total: O/U 3.5", "1033073",
+                  end="2026-09-23T01:45:00Z")
+    assert not reader.same_fixture(mon, tue)
+    assert reader.same_fixture(mon, _sports("c", "San Francisco Giants Team Total: O/U 3.5", "1028090"))
+
+
+def test_a_yes_token_naming_the_other_player_is_refused():
+    import scripts.demo_cross_market as reader
+    handicap = _sports("a", "Set Handicap: Kasintseva (-1.5) vs Bains (+1.5)", "1059390",
+                       kind="tennis_set_handicap", outcomes=("Kasintseva", "Bains"))
+    hers = _sports("b", "Porto: Kasintseva vs Bains", "1059390", kind="moneyline",
+                   outcomes=("Kasintseva", "Bains"))
+    his = _sports("c", "Porto: Kasintseva vs Bains", "1059390", kind="moneyline",
+                  outcomes=("Bains", "Kasintseva"))
+    assert reader.same_side(handicap, hers) and not reader.same_side(handicap, his)
+
+
+def test_yes_no_and_over_under_legs_are_left_alone():
+    import scripts.demo_cross_market as reader
+    ou = _sports("a", "A vs. B: O/U 2.5", "1", outcomes=("Over", "Under"))
+    yn = _sports("b", "A vs. B: Both Teams to Score", "1", outcomes=("Yes", "No"))
+    assert reader.same_side(ou, yn)
+
+
+def test_dated_event_ladders_are_not_fixtures():
+    import scripts.demo_cross_market as reader
+    a = {"question": "US x Yemen ceasefire continues through September 25?",
+         "endDate": "2026-09-25T12:00:00Z", "outcomes": '["Yes", "No"]'}
+    b = {"question": "US x Yemen ceasefire continues through September 22?",
+         "endDate": "2026-09-22T12:00:00Z", "outcomes": '["Yes", "No"]'}
+    assert reader.same_fixture(a, b) and reader.same_side(a, b)

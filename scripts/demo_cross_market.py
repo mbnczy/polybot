@@ -88,7 +88,7 @@ def _page(params: dict, limit: int) -> list[dict]:
 # over the reader's 1 GB cap as Python objects. Slimmed, it is a few hundred bytes.
 _KEEP_FIELDS = ("conditionId", "question", "endDate", "outcomes", "clobTokenIds",
                 "negRiskMarketID", "outcomePrices", "bestBid", "bestAsk", "updatedAt",
-                "orderPriceMinTickSize", "createdAt")
+                "orderPriceMinTickSize", "createdAt", "sportsMarketType")
 
 
 def _fee_rate(market: dict) -> "float | None":
@@ -814,34 +814,83 @@ def export_implications(rels: list, markets: list[dict], path: str, audit=None) 
 
 _SPORT_TITLE = re.compile(r"^(?:Spread: |Exact Score: |[^:]+ vs\.? [^:]+: )")
 _FIXTURE_TOLERANCE_S = 600.0
+_YES_NO_LABELS = frozenset({"yes", "no", "over", "under", "draw"})
+
+
+def _is_sports(market: dict) -> bool:
+    return bool(market.get("sportsMarketType")) or bool(
+        _SPORT_TITLE.match(str(market.get("question") or "")))
+
+
+def _side(market: dict) -> "str | None":
+    """The YES token's own label, when it names a team or a player rather than Yes."""
+    try:
+        raw = market.get("outcomes")
+        first = str((json.loads(raw) if isinstance(raw, str) else list(raw or []))[0]).strip()
+    except (TypeError, ValueError, IndexError):
+        return None
+    return None if first.lower() in _YES_NO_LABELS else first.lower()
 
 
 def same_fixture(a: dict, b: dict) -> bool:
     """
     False when two sports markets belong to different games. A title does not
     say which game: a baseball series, a cup tie and a league match list the
-    same two teams under identical titles days apart, and the model, seeing
-    titles only, paired them — "Spread: Chicago Cubs (-2.5) ⊆ (-1.5)" across
-    two games, violated at resolution. A match market's end date is its
-    kick-off, so markets of one game share it; anything else passes.
+    same two teams days apart, and the model, seeing titles only, paired them —
+    "Spread: Chicago Cubs (-2.5) ⊆ (-1.5)" across two games, "San Francisco
+    Giants Team Total: O/U 4.5" against the next night's, both violated at
+    resolution. Markets of one game share its event; where an event is missing,
+    a game's markets still share its start.
     """
-    if not (_SPORT_TITLE.match(str(a.get("question") or ""))
-            and _SPORT_TITLE.match(str(b.get("question") or ""))):
+    if not (_is_sports(a) and _is_sports(b)):
         return True
+    ea, eb = _event_id(a), _event_id(b)
+    if ea is not None and eb is not None:
+        return ea == eb
     ta, tb = _market_end_ts(a), _market_end_ts(b)
     if ta is None or tb is None:
         return False
     return abs(ta - tb) <= _FIXTURE_TOLERANCE_S
 
 
+def same_side(a: dict, b: dict) -> bool:
+    """
+    False when the two YES tokens are not the same competitor. A moneyline or
+    handicap market's outcomes are names, not Yes/No, and which one the YES
+    token is decides what the trade holds: "Set Handicap: Kasintseva (-1.5) ⊆
+    Porto: Kasintseva vs Bains" was exported where the second market's YES is
+    Bains, and it resolved violated.
+    """
+    sa, sb = _side(a), _side(b)
+    if sa is None or sb is None:
+        return True                      # a Yes/No or Over/Under leg says nothing here
+    return sa == sb
+
+
+def _event_id(market: dict) -> "str | None":
+    ev = market.get("events")
+    if isinstance(ev, list) and ev and isinstance(ev[0], dict) and ev[0].get("id") is not None:
+        return str(ev[0]["id"])
+    return None
+
+
 def drop_cross_fixture(rels: list, markets: list[dict]) -> list:
     by_id = {str(m.get("conditionId")): m for m in markets if m.get("conditionId")}
-    kept = [r for r in rels
-            if r.narrow not in by_id or r.broad not in by_id
-            or same_fixture(by_id[r.narrow], by_id[r.broad])]
-    if len(kept) != len(rels):
-        print(f"  fixtures   : {len(rels) - len(kept)} pair(s) dropped — two different "
-              f"games under the same titles")
+    kept, fixtures, sides = [], 0, 0
+    for r in rels:
+        a, b = by_id.get(r.narrow), by_id.get(r.broad)
+        if a is None or b is None:
+            kept.append(r)
+            continue
+        if not same_fixture(a, b):
+            fixtures += 1
+        elif not same_side(a, b):
+            sides += 1
+        else:
+            kept.append(r)
+    if fixtures or sides:
+        print(f"  fixtures   : {fixtures} pair(s) dropped — two different games; "
+              f"{sides} — the two YES tokens are different competitors")
     return kept
 
 
