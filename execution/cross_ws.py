@@ -45,6 +45,10 @@ CROSS_WS_PER_CONN: int = int(os.environ.get("CROSS_WS_PER_CONN", 250))
 CROSS_WS_SLACK: float = float(os.environ.get("CROSS_WS_SLACK", 0.01))
 # The same quotes on a pair are not news again for this long.
 CROSS_WS_REPEAT_S: float = float(os.environ.get("CROSS_WS_REPEAT_S", 30.0))
+# New tokens wait at most this long for a resubscription. The nearest pairs
+# shift a little every pass; resubscribing on each shift reconnected all the
+# sockets every 15 s on the first live start.
+CROSS_WS_RESUB_S: float = float(os.environ.get("CROSS_WS_RESUB_S", 300.0))
 
 
 @dataclass(frozen=True)
@@ -118,7 +122,8 @@ class CrossBookWatch:
 
     def __init__(self, on_edge: Callable[[tuple, float], None], *, min_edge: float,
                  slack: float = CROSS_WS_SLACK, per_conn: int = CROSS_WS_PER_CONN,
-                 repeat_s: float = CROSS_WS_REPEAT_S, url: str = _WS_URL) -> None:
+                 repeat_s: float = CROSS_WS_REPEAT_S, resub_s: float = CROSS_WS_RESUB_S,
+                 url: str = _WS_URL) -> None:
         self._on_edge = on_edge
         self._min_edge = min_edge
         self._slack = slack
@@ -130,6 +135,12 @@ class CrossBookWatch:
         self._tops: dict[str, _Top] = {}
         self._fired: dict[tuple, tuple[float, float, float]] = {}   # key → (no, yes, when)
         self._changed = asyncio.Event()
+        self._resub_s = resub_s
+        self._resub_at = float("-inf")
+        # Tokens on the live sockets. Books of tokens no longer watched stay
+        # current until the next resubscription drops them, so a pair that
+        # comes back is priced at once rather than after a new snapshot.
+        self._subscribed: set[str] = set()
         self.stats = {"frames": 0, "fired": 0, "reconnects": 0}
 
     # ── the set ──────────────────────────────────────────────────────────────
@@ -148,10 +159,14 @@ class CrossBookWatch:
             by_token.setdefault(p.yes_token, []).append(p)
         self._by_token = by_token
         self._fired = {k: v for k, v in self._fired.items() if k in self._pairs}
-        if set(by_token) != before:
-            for t in before - set(by_token):
-                self._tops.pop(t, None)
+        for t in before - set(by_token) - self._subscribed:
+            self._tops.pop(t, None)
+        if (set(by_token) - self._subscribed
+                and time.monotonic() - self._resub_at >= self._resub_s):
             self._changed.set()
+
+    def _tracked(self, token: str) -> bool:
+        return token in self._by_token or token in self._subscribed
 
     # ── events ───────────────────────────────────────────────────────────────
 
@@ -168,7 +183,7 @@ class CrossBookWatch:
                 continue
             if str(e.get("event_type") or "").lower() == "book":
                 token = str(e.get("asset_id") or "")
-                if token in self._by_token:
+                if self._tracked(token):
                     self._tops.setdefault(token, _Top()).load(e.get("bids"), e.get("asks"))
                     moved.add(token)
                 continue
@@ -176,7 +191,7 @@ class CrossBookWatch:
             if isinstance(changes, list):
                 for ch in changes:
                     token = str(ch.get("asset_id") or "")
-                    if token not in self._by_token:
+                    if not self._tracked(token):
                         continue
                     self._tops.setdefault(token, _Top()).change(
                         str(ch.get("side") or ""), ch.get("price"), ch.get("size"),
@@ -218,6 +233,10 @@ class CrossBookWatch:
                     t.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
                 tokens = sorted(self._by_token)
+                self._subscribed = set(tokens)
+                self._resub_at = time.monotonic()
+                for t in [t for t in self._tops if t not in self._subscribed]:
+                    del self._tops[t]
                 chunks = [tokens[i:i + self._per_conn]
                           for i in range(0, len(tokens), self._per_conn)]
                 tasks = [asyncio.create_task(self._socket(c, i)) for i, c in enumerate(chunks)]

@@ -159,3 +159,30 @@ async def test_run_wakes_on_a_push_without_waiting_for_the_poll(tmp_path, monkey
     await asyncio.gather(task, return_exceptions=True)
     assert {t for t, _, _ in client.buys} == {"nn", "by"}
     assert polls == [1]                                # no second poll was needed
+
+
+def test_new_tokens_wait_for_the_resubscription_interval(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr("execution.cross_ws.time.monotonic", lambda: clock[0])
+    w = CrossBookWatch(lambda k, e: None, min_edge=0.02, resub_s=300.0)
+    w.watch([WatchPair(("a", "b"), "A1", "B1")])
+    assert w._changed.is_set()                         # the first set: subscribe now
+    w._changed.clear()
+    w._subscribed, w._resub_at = {"A1", "B1"}, clock[0]
+    w.watch([WatchPair(("c", "d"), "C1", "D1")])
+    assert not w._changed.is_set()                     # 0 s later: wait
+    clock[0] += 301.0
+    w.watch([WatchPair(("c", "d"), "C1", "D1")])
+    assert w._changed.is_set()
+
+
+def test_a_subscribed_token_keeps_its_book_while_unwatched():
+    w, fired = _watch()
+    w._subscribed = {"NO", "YES"}
+    w.handle(json.dumps(_snap("NO", [(0.40, 10)], [(0.38, 10)])))
+    w.watch([])                                        # not watched for a pass
+    w.handle(json.dumps(_change("NO", "SELL", 0.39, 5, 0.38, 0.39)))
+    assert w._tops["NO"].ask == 0.39
+    w.watch([WatchPair(("n", "b"), "NO", "YES", 0.0, 0.0)])
+    w.handle(json.dumps(_snap("YES", [(0.45, 10)], [(0.43, 10)])))
+    assert fired and fired[-1][0] == ("n", "b")        # priced at once on return
