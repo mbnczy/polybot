@@ -815,8 +815,9 @@ class TestNegRiskBundleGuard:
 
         assert client.cancelled == ["o2"]
         assert sorted(client.unwound) == [("T0", 10.0), ("T1", 10.0)]
-        # Realised loss: sold at 0.25, bought at 0.30 → −0.05 × 10 × 2 legs
-        assert breaker.filled == [pytest.approx(-1.0)]
+        # Realised loss: sold at 0.25, bought at 0.30 → −0.05 × 10 × 2 legs, and
+        # the taker fee on each sale: 10 × 0.04 × 0.25 × 0.75 = 0.075 × 2 legs
+        assert breaker.filled == [pytest.approx(-1.15)]
         assert breaker.released == 0
         assert "🔻" in notifier.messages[0]
 

@@ -257,9 +257,10 @@ async def test_one_leg_fill_unwinds_when_completion_unprofitable():
     assert client.taker_buys == []
     assert client.unwound == [("tok-yes", 10.0)]
     # The unwind's REALISED loss must be booked (not silently dropped):
-    # proceeds 10×0.40 − cost 10×0.479 = 4.0 − 4.79 = −0.79
+    # proceeds 10×0.40 − cost 10×0.479 = 4.0 − 4.79 = −0.79, less the taker fee
+    # the wallet pays on the sale: 10 × 0.04 × 0.40 × 0.60 = 0.096
     assert len(breaker.fills) == 1
-    assert breaker.fills[0] == pytest.approx(-0.79, abs=1e-6)
+    assert breaker.fills[0] == pytest.approx(-0.886, abs=1e-6)
     assert breaker.releases == 0          # on_fill released the reservation
     assert guard.watched_count == 0
     assert any("unwound" in m for m in notifier.messages)
@@ -347,8 +348,9 @@ async def test_partial_pair_merges_paired_portion_only():
     assert client.unwound == [("tok-yes", 6.0)]
     assert len(breaker.fills) == 1
     # paired pnl = 4 × (1 − 0.978) = 0.088; naked unwind realised =
-    # 6×0.40 − 6×0.479 = 2.4 − 2.874 = −0.474; total = −0.386
-    assert breaker.fills[0] == pytest.approx(-0.386, abs=1e-6)
+    # 6×0.40 − 6×0.479 = 2.4 − 2.874 = −0.474; total = −0.386, less the fee on
+    # the 6-share sale: 6 × 0.04 × 0.40 × 0.60 = 0.0576
+    assert breaker.fills[0] == pytest.approx(-0.4436, abs=1e-6)
     assert inventory.paired == []                    # not a full pair
     assert inventory.merged == [("0xcond", 4.0)]     # merge only what's paired
 
@@ -543,8 +545,9 @@ async def test_a_partial_unwind_keeps_the_remainder_and_sells_it_later():
     await guard.poll_once()                      # retry sells the other 5
     assert client.unwound[-1] == ("tok-yes", 5.0)
     assert "0xcond" not in guard._residue
-    # proceeds 5×0.40 − cost 5×0.479 = −0.395, booked without releasing a slot
-    assert breaker.booked == [pytest.approx(-0.395, abs=1e-6)]
+    # proceeds 5×0.40 − cost 5×0.479 = −0.395, less the fee 5 × 0.04 × 0.40 × 0.60
+    # = 0.048, booked without releasing a slot
+    assert breaker.booked == [pytest.approx(-0.443, abs=1e-6)]
 
 
 @pytest.mark.asyncio

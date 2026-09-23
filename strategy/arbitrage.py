@@ -1515,6 +1515,21 @@ def effective_taker_fee(
     return (_LIVE_TAKER_RATE if rate is None else rate) * (1.0 - price)
 
 
+def taker_sell_fee(proceeds: float, sold: float, rate: float | None = None) -> float:
+    """
+    The fee a taker SELL pays, in collateral, from what its order response says.
+
+    An order's taking_amount is what the book paid, before the fee. On 2026-09-23
+    a 10.21-share unwind at 0.274 reported 2.7975 and the wallet received 2.7163:
+    0.0812, rate x (1 - p) of the notional at 0.04. Realised P&L that stops at
+    taking_amount under-counted three unwinds that day by 0.26 USDC between
+    them, and the daily loss limit counted with it.
+    """
+    if proceeds <= 0.0 or sold <= 0.0:
+        return 0.0
+    return proceeds * effective_taker_fee(proceeds / sold, rate)
+
+
 def maker_fee(price: float) -> float:
     """Makers are not charged. Measured over 175 settled maker fills: 0.0000%."""
     return 0.0

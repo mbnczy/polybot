@@ -244,3 +244,73 @@ async def test_an_announcement_is_consumed_not_reusable():
     report = await r.check_once()
     assert report is not None, "the unannounced one must still be reported"
     assert any("B" in k for k in report["moves"])
+
+
+# ── the bot's own orders, settling after the position closed ─────────────────
+
+class _TradingClient(_Client):
+    """A client that remembers which tokens the bot traded, as PolyClient does."""
+
+    def __init__(self, rows, cash=100.0, traded=None):
+        super().__init__(rows, cash)
+        self.traded = dict(traded or {})          # token -> unix time
+
+    def traded_since(self, ts):
+        return {t for t, at in self.traded.items() if at >= ts}
+
+
+def _arow(title, outcome, size, asset):
+    return {**_row(title, outcome, size), "asset": asset}
+
+
+@pytest.mark.asyncio
+async def test_the_bots_own_completion_landing_a_read_late_is_not_an_escape():
+    """
+    2026-09-23 10:16: a NegRisk bundle completed and closed; the completion's
+    10.30 Republicans NO reached the data API at the next read, with nothing
+    open, and was reported as an escaped order.
+    """
+    import time as _time
+    c = _TradingClient([_arow("Texas governor D", "No", 10.28, "tokD")])
+    r = WalletReconciler(c, _Breaker(0), _Notifier(), poll_s=120.0)
+    await r.check_once()
+    c.rows = c.rows + [_arow("Texas governor R", "No", 10.30, "tokR")]
+    c.cash -= 3.1765
+    c.traded["tokR"] = _time.time() - 125.0      # bought two minutes ago
+    assert await r.check_once() is None
+    assert r.unexplained_events == 0
+
+
+@pytest.mark.asyncio
+async def test_a_move_on_a_token_the_bot_did_not_trade_still_alarms():
+    import time as _time
+    c = _TradingClient([_arow("Market A", "No", 10.0, "tokA")],
+                       traded={"tokA": _time.time()})
+    r = WalletReconciler(c, _Breaker(0), _Notifier(), poll_s=120.0)
+    await r.check_once()
+    c.rows = [_arow("Market A", "No", 10.0, "tokA"), _arow("Market B", "Yes", 20.0, "tokB")]
+    report = await r.check_once()
+    assert report is not None and list(report["moves"]) == ["Market B|Yes"]
+
+
+@pytest.mark.asyncio
+async def test_a_token_traded_long_ago_does_not_explain_a_new_move():
+    import time as _time
+    c = _TradingClient([_arow("Market A", "No", 10.0, "tokA")],
+                       traded={"tokA": _time.time() - 3_600.0})
+    r = WalletReconciler(c, _Breaker(0), _Notifier(), poll_s=120.0)
+    await r.check_once()
+    c.rows = [_arow("Market A", "No", 30.0, "tokA")]
+    assert await r.check_once() is not None
+
+
+@pytest.mark.asyncio
+async def test_a_sale_that_empties_a_position_is_attributed_by_its_last_token():
+    """2026-09-23 11:46: the unwind sold all 10.30 TX-35 NO; the row vanished."""
+    import time as _time
+    c = _TradingClient([_arow("TX-35 R", "No", 10.30, "tok35")])
+    r = WalletReconciler(c, _Breaker(0), _Notifier(), poll_s=120.0)
+    await r.check_once()
+    c.rows = []
+    c.traded["tok35"] = _time.time() - 110.0
+    assert await r.check_once() is None

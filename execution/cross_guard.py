@@ -78,6 +78,7 @@ from strategy.cross_exit import (
     resolution_profit,
     sell_proceeds,
     should_exit,
+    taker_fee_per_share,
 )
 
 logger = logging.getLogger(__name__)
@@ -136,6 +137,12 @@ CROSS_MAKER_MIN_EDGE: float = float(os.environ.get("CROSS_MAKER_MIN_EDGE", CROSS
 # 2026-09-17 that produced "+0.96 edge" pairs whose books stood at 0.01 / 0.50.
 # Only a book tight enough for our bid to be near the market can be rested in.
 CROSS_MAKER_MAX_SPREAD: float = float(os.environ.get("CROSS_MAKER_MAX_SPREAD", 0.05))
+# Cross slots the maker path may never take. On 2026-09-23 its resting pairs held
+# the single cross slot nearly all day, 62 rests without one fill, and 37,794
+# entries were refused behind them — a taker arbitrage like that morning's
+# NVDA +2.13% would have been one of them. A slot kept free for the taker path
+# (and one position's capital with it) means resting never blocks crossing.
+CROSS_TAKER_RESERVE_SLOTS: int = int(os.environ.get("CROSS_TAKER_RESERVE_SLOTS", 1))
 # How close to its end a pair may still get a resting bid. The taker path keeps
 # thirty minutes: near a market's end its book is a few stale quotes. A match
 # market's end is its kick-off, and there the book is the busiest it will be —
@@ -608,6 +615,7 @@ class CrossGuard:
         maker_enabled:     "bool | None" = None,
         maker_ttl_s:       "float | None" = None,
         maker_min_edge:    "float | None" = None,
+        taker_reserve:     "int | None" = None,
         resolution_lookup: "ResolutionLookup | None" = None,
     ) -> None:
         self._client = client
@@ -643,6 +651,7 @@ class CrossGuard:
         self._maker_ttl = CROSS_MAKER_TTL_S if maker_ttl_s is None else maker_ttl_s
         self._maker_min_edge = (CROSS_MAKER_MIN_EDGE if maker_min_edge is None
                                 else maker_min_edge)
+        self._taker_reserve = CROSS_TAKER_RESERVE_SLOTS if taker_reserve is None else taker_reserve
         self._attempts: dict[tuple[str, str], MakerAttempt] = {}
         self._attempts_path = Path(positions_path or CROSS_POSITIONS_PATH).with_name(
             Path(positions_path or CROSS_POSITIONS_PATH).stem + "_maker.json")
@@ -671,13 +680,19 @@ class CrossGuard:
         self._last_pass: ("tuple[float, int, dict[str, int], "
                           "tuple[float, str] | None, int, float | None] | None") = None
         logger.info(
-            "CrossGuard init | %s | maker=%s (ttl %.0fs, min_edge %.3f) | window=%gd "
-            "min_edge=%.3f max_pos=%.2f USDC open=%d file=%s",
+            "CrossGuard init | %s | maker=%s (ttl %.0fs, min_edge %.3f, %d slot(s) kept "
+            "for takers) | window=%gd min_edge=%.3f max_pos=%.2f USDC open=%d file=%s",
             "EXECUTING" if self._enabled else "evaluate only (disabled)",
             "on" if self._maker_enabled else "off", self._maker_ttl, self._maker_min_edge,
-            self._max_lockup, self._min_edge, self._max_usdc,
+            self._taker_reserve, self._max_lockup, self._min_edge, self._max_usdc,
             len(self._book.open_positions()), self._imp_path,
         )
+        headroom = getattr(breaker, "cross_headroom", None)
+        if (self._enabled and self._maker_enabled and self._taker_reserve > 0
+                and callable(headroom) and headroom()[0] <= self._taker_reserve):
+            logger.warning(
+                "CrossGuard | maker path can never rest: CROSS_MAX_POSITIONS leaves no "
+                "slot beyond the %d kept for taker entries", self._taker_reserve)
 
     # ── wiring ────────────────────────────────────────────────────────────────
 
@@ -941,7 +956,8 @@ class CrossGuard:
                                                 "maker + taker completion")
                     return
         self.stats["half_filled"] += 1
-        pnl = await self._sell(held_token, excess, held_paid)
+        pnl = await self._sell(held_token, excess, held_paid,
+                               await self._rate(a.narrow if no_rich else a.broad))
         if pnl is None:
             self.stats["stuck"] += 1
             self._stuck.add(a.key)
@@ -1236,6 +1252,17 @@ class CrossGuard:
         await self._enter(opp, now)
         return "attempted", edge
 
+    def _leaves_taker_room(self, committed: float) -> bool:
+        """Whether resting `committed` still leaves the reserved taker slot(s) free."""
+        reserve = max(0, self._taker_reserve)
+        if reserve == 0:
+            return True
+        headroom = getattr(self._breaker, "cross_headroom", None)
+        if not callable(headroom):
+            return True
+        slots, usdc = headroom()
+        return slots > reserve and usdc - committed >= reserve * self._max_usdc - 1e-9
+
     async def _maker_attempt(self, imp: Implication, no_book: dict, yes_book: dict,
                              now: float, taker_stop: str,
                              taker_edge: "float | None") -> "tuple[str, float | None]":
@@ -1259,6 +1286,9 @@ class CrossGuard:
                 edge = maker_edge if edge is None else max(edge, maker_edge)
         if opp is None:
             return (stop_key(reason) if reason != "ok" else taker_stop), edge
+        if self._enabled and not self._leaves_taker_room(opp.committed):
+            self.last_reason[key] = "the last cross slot is kept for a taker arbitrage"
+            return "taker_reserve", edge
         if not self._breaker.check_cross(opp.committed):
             self.last_reason[key] = "blocked by the breaker"
             return "breaker", edge
@@ -1347,9 +1377,10 @@ class CrossGuard:
             got = shares
         return got
 
-    async def _sell(self, token: str, shares: float, cost_per_share: float
-                    ) -> "float | None":
-        """Sell at the bid. Returns realised P&L, or None when it did not fill."""
+    async def _sell(self, token: str, shares: float, cost_per_share: float,
+                    rate: "float | None" = None) -> "float | None":
+        """Sell at the bid. Returns realised P&L after the taker fee, or None
+        when it did not fill. `rate` is the market's taker rate."""
         try:
             resp = await self._client.unwind_leg(token, shares)
         except Exception as exc:  # noqa: BLE001
@@ -1362,6 +1393,9 @@ class CrossGuard:
         # On a SELL the taker gives shares (making) and gets collateral (taking).
         proceeds = float(resp.get("taking_amount") or 0.0)
         sold = float(resp.get("making_amount") or shares)
+        # taking_amount is what the book paid, before the fee the wallet pays.
+        if sold > 0.0 and proceeds > 0.0:
+            proceeds -= sold * taker_fee_per_share(proceeds / sold, rate)
         return round(proceeds - sold * cost_per_share, 6)
 
     async def _enter(self, opp: Opportunity, now: float) -> None:
@@ -1386,7 +1420,8 @@ class CrossGuard:
         if got2 is None:
             self.stats["half_filled"] += 1
             self._cooldown[key] = now + CROSS_ENTRY_COOLDOWN_S
-            pnl = await self._sell(t1, got1, c1)
+            pnl = await self._sell(t1, got1, c1, opp.rate_narrow
+                                   if t1 == imp.narrow_no_token else opp.rate_broad)
             if pnl is None:
                 self.stats["stuck"] += 1
                 self._stuck.add(key)
@@ -1475,10 +1510,10 @@ class CrossGuard:
                         pos.guaranteed_edge)
             return
         committed = pos.entry_cost * pos.size
-        pnl1 = await self._sell(pos.narrow_no_token, pos.size, pos.narrow_no_paid)
+        pnl1 = await self._sell(pos.narrow_no_token, pos.size, pos.narrow_no_paid, rn)
         if pnl1 is None:
             return                                   # nothing sold — try again later
-        pnl2 = await self._sell(pos.broad_yes_token, pos.size, pos.broad_yes_paid)
+        pnl2 = await self._sell(pos.broad_yes_token, pos.size, pos.broad_yes_paid, rb)
         if pnl2 is None:
             self.stats["stuck"] += 1
             self._stuck.add(pos.key)

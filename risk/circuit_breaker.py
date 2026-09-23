@@ -538,6 +538,12 @@ class CircuitBreaker:
             )
         return None
 
+    def cross_headroom(self) -> "tuple[int, float]":
+        """Free cross slots and free cross capital (USDC) right now."""
+        with self._lock:
+            return (max(0, self._cross_max_positions - self._cross_open),
+                    max(0.0, self._cross_max_committed - self._cross_committed))
+
     def on_cross_open(self, committed_usdc: float) -> None:
         """Reserve a cross slot and its capital. Also restores one after restart."""
         with self._lock:

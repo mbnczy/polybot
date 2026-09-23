@@ -164,7 +164,10 @@ async def test_one_leg_filled_is_sold_back_when_completing_would_not_pay(tmp_pat
     assert g.open_positions() == []
     assert breaker.status_dict()["cross_open"] == 0
     # sold at the 0.40 bid against 0.41 paid
-    assert breaker.status_dict()["session_pnl"] == pytest.approx(5.43 * (0.40 - 0.41), abs=1e-6)
+    # Sold at the 0.40 bid after paying 0.41, less the taker fee on the sale
+    # (5.43 × 0.05 × 0.40 × 0.60): the wallet's number, not the book's.
+    assert breaker.status_dict()["session_pnl"] == pytest.approx(
+        5.43 * (0.40 - 0.41) - 5.43 * 0.05 * 0.40 * 0.60, abs=1e-4)
     assert any("HALF-FILL" in m for m in notifier.messages)
 
 
@@ -293,3 +296,42 @@ async def test_a_pair_two_minutes_from_kick_off_does_not(tmp_path, monkeypatch):
     g, client, _, _ = _maker_guard(tmp_path, monkeypatch, imps=[imp], enabled=False)
     await g.poll_once()
     assert g.stats["would_rest"] == 0
+
+
+# ── the slot kept for taker entries ───────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_the_maker_path_does_not_take_the_slot_kept_for_takers(tmp_path, monkeypatch):
+    """
+    2026-09-23: with one cross slot, resting pairs held it all day (62 rests,
+    no fill) while 37,794 entries waited behind them. Two slots, one of them
+    never the maker path's.
+    """
+    g, client, breaker, _ = _maker_guard(tmp_path, monkeypatch)
+    breaker.on_cross_open(5.0)                 # one slot already taken
+    await g.poll_once()
+    assert client.maker_orders == []
+    assert breaker.status_dict()["cross_open"] == 1
+    assert "taker_reserve" in g.stop_summary()
+
+
+@pytest.mark.asyncio
+async def test_a_taker_arbitrage_still_enters_beside_a_resting_pair(tmp_path, monkeypatch):
+    from tests.test_cross_guard import ARB
+    books = {**MAKER, "nn2": ARB["nn"], "by2": ARB["by"]}
+    arb = _imp(narrow="0xn2", broad="0xb2", narrow_no_token="nn2", broad_yes_token="by2",
+               narrow_title="Other: O/U 1.5", broad_title="Other: O/U 0.5")
+    g, client, breaker, _ = _maker_guard(tmp_path, monkeypatch, books=books,
+                                         imps=[_imp(), arb])
+    await g.poll_once()
+    assert [t for _, t, _, _ in client.maker_orders] == ["nn", "by"]     # the maker pair
+    assert {t for t, _, _ in client.buys} == {"nn2", "by2"}              # and the taker
+    assert breaker.status_dict()["cross_open"] == 2
+
+
+@pytest.mark.asyncio
+async def test_no_reserve_lets_the_maker_path_use_every_slot(tmp_path, monkeypatch):
+    g, client, breaker, _ = _maker_guard(tmp_path, monkeypatch, taker_reserve=0)
+    breaker.on_cross_open(5.0)
+    await g.poll_once()
+    assert len(client.maker_orders) == 2
