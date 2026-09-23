@@ -313,6 +313,15 @@ def parse_strike(market: dict) -> "Strike | None":
     return None
 
 
+def price_ladder_kind(title: str) -> "str | None":
+    """Which kind of price-ladder rung a title is ("hit", "close", …), or None."""
+    q = str(title or "").strip()
+    for kind, rx in _PRICE_TITLES:
+        if rx.match(q):
+            return kind
+    return None
+
+
 def _creation_safe(narrow: Strike, broad: Strike) -> bool:
     """For a path-dependent ladder: did the broad strike exist whenever the narrow could have been hit?"""
     if narrow.opens is None and narrow.group[0] != "hit":

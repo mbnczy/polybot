@@ -209,3 +209,78 @@ async def test_the_first_set_is_subscribed_as_soon_as_it_arrives(monkeypatch):
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     assert opened == [["A1", "B1"]]
+
+
+# ── price ladders: watched whatever their distance ───────────────────────────
+
+def _rung(strike, narrow_strike, **kw):
+    """NVDA's LOW ladder: hitting the lower strike implies hitting the higher."""
+    t = "Will NVIDIA (NVDA) hit (LOW) ${} Week of September 21 2026?"
+    return _imp(narrow_title=t.format(narrow_strike), broad_title=t.format(strike), **kw)
+
+
+def _ladder_setup(tmp_path, monkeypatch, imps, **kw):
+    g, *_ = _guard(tmp_path, monkeypatch, ARB, imps, ws_enabled=True, **kw)
+    g._implications()                                  # classifies the file's pairs
+    import time as _t
+    return g, _t.time()
+
+
+@pytest.mark.asyncio
+async def test_a_far_ladder_pair_is_watched_though_the_nearest_are_full(tmp_path, monkeypatch):
+    """On 2026-09-23 NVDA $196 ⊆ $204 paid +2.13%. Such a pair sits far below the
+    threshold until the underlying moves, so nearness alone never watched it."""
+    ladder = _rung(204, 196, narrow="0xl", broad="0xm",
+                   narrow_no_token="ln", broad_yes_token="my")
+    near = _imp()
+    far = _imp(narrow="0xf", broad="0xg", narrow_no_token="fn", broad_yes_token="gy")
+    g, now = _ladder_setup(tmp_path, monkeypatch, [ladder, near, far])
+    g._last_edge.update({ladder.key: -0.30, near.key: -0.01, far.key: -0.25})
+    monkeypatch.setattr("execution.cross_guard.CROSS_WS_MAX_PAIRS", 1)
+    assert {p.key for p in g._watch_pairs(now)} == {ladder.key, near.key}
+    assert g._ws_ladders == 1
+
+
+@pytest.mark.asyncio
+async def test_a_ladder_pair_is_watched_before_it_was_ever_priced(tmp_path, monkeypatch):
+    ladder = _rung(204, 196)
+    g, now = _ladder_setup(tmp_path, monkeypatch, [ladder])
+    pairs = g._watch_pairs(now)
+    assert [(p.key, p.no_token, p.yes_token) for p in pairs] == [(ladder.key, "nn", "by")]
+
+
+@pytest.mark.asyncio
+async def test_a_ladder_pair_the_guard_could_not_enter_is_not_watched(tmp_path, monkeypatch):
+    held = _rung(204, 196)
+    late = _rung(210, 200, narrow="0xp", broad="0xq", days=30)      # outside the window
+    g, now = _ladder_setup(tmp_path, monkeypatch, [held, late])
+    g._cooldown[held.key] = now + 600
+    assert g._watch_pairs(now) == []
+
+
+@pytest.mark.asyncio
+async def test_over_the_ladder_cap_the_nearest_rungs_are_kept(tmp_path, monkeypatch):
+    a = _rung(204, 196)
+    b = _rung(210, 200, narrow="0xp", broad="0xq", narrow_no_token="pn", broad_yes_token="qy")
+    c = _rung(220, 210, narrow="0xr", broad="0xs", narrow_no_token="rn", broad_yes_token="sy")
+    g, now = _ladder_setup(tmp_path, monkeypatch, [a, b, c])
+    g._last_edge.update({a.key: -0.20, b.key: -0.02})               # c never priced
+    monkeypatch.setattr("execution.cross_guard.CROSS_WS_MAX_LADDER_PAIRS", 2)
+    assert [p.key for p in g._watch_pairs(now)] == [b.key, a.key]
+
+
+@pytest.mark.asyncio
+async def test_ladders_can_be_switched_back_to_nearness_only(tmp_path, monkeypatch):
+    ladder = _rung(204, 196)
+    g, now = _ladder_setup(tmp_path, monkeypatch, [ladder])
+    monkeypatch.setattr("execution.cross_guard.CROSS_WS_LADDERS", False)
+    assert g._watch_pairs(now) == []                   # unpriced, so not near either
+
+
+def test_only_two_rungs_of_one_kind_count_as_a_ladder():
+    from execution.cross_guard import is_price_ladder
+    assert is_price_ladder(_rung(204, 196))
+    assert not is_price_ladder(_imp())                                  # over/unders
+    mixed = _imp(narrow_title="Will NVIDIA (NVDA) hit (LOW) $196 Week of September 21 2026?",
+                 broad_title="Will NVIDIA (NVDA) close above $190 on September 24?")
+    assert not is_price_ladder(mixed)

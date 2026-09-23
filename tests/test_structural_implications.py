@@ -333,3 +333,13 @@ def test_a_matchs_exact_scores_are_its_own_fixture():
     next_night = _sports("c", "Exact Score: AS Monaco 1 - 0 RC Lens?", "902",
                          end="2026-09-23T01:45:00Z")
     assert not reader.same_fixture(match, next_night)
+
+
+def test_price_ladder_kind_reads_each_title_shape():
+    from strategy.structural_implications import price_ladder_kind
+    assert price_ladder_kind("Will NVIDIA (NVDA) hit (LOW) $196 Week of September 21 2026?") == "hit"
+    assert price_ladder_kind("Will the price of Bitcoin be above $76,000 on September 24?") == "price"
+    assert price_ladder_kind("Will WTI Crude Oil (WTI) hit (HIGH) $115 Week of September 21 2026?") == "hit"
+    assert price_ladder_kind("  Will Apple (AAPL) close above $250 on September 24?  ") == "close"
+    assert price_ladder_kind("Chargers vs. Bills: O/U 51.5") is None
+    assert price_ladder_kind("") is None

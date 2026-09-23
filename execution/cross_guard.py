@@ -140,6 +140,13 @@ CROSS_MAKER_ENABLED: bool = _flag("CROSS_MAKER_ENABLED", "true")
 CROSS_WS_ENABLED: bool = _flag("CROSS_WS_ENABLED", "true")
 # Pairs watched that way, nearest first: two tokens each, 250 to a socket.
 CROSS_WS_MAX_PAIRS: int = int(os.environ.get("CROSS_WS_MAX_PAIRS", 400))
+# Price ladders are watched whatever their distance, on top of the nearest pairs.
+# Every real arbitrage so far was one (NVDA, WTI, Micron, XRP), and a ladder pair
+# crosses from far away in one move of the underlying: on 2026-09-23 only 117 of
+# 588 ladder pairs were among the 400 nearest, and a far pair is re-priced by the
+# sweep once in ten minutes. All of them took 1,173 tokens — five sockets.
+CROSS_WS_LADDERS: bool = _flag("CROSS_WS_LADDERS", "true")
+CROSS_WS_MAX_LADDER_PAIRS: int = int(os.environ.get("CROSS_WS_MAX_LADDER_PAIRS", 1000))
 # Pairs one push may price at once, and how soon the same pair may be pushed again.
 CROSS_WS_MAX_URGENT: int = int(os.environ.get("CROSS_WS_MAX_URGENT", 20))
 CROSS_WS_MIN_GAP_S: float = float(os.environ.get("CROSS_WS_MIN_GAP_S", 2.0))
@@ -242,6 +249,13 @@ class Implication:
         if self.narrow_end_ts is None or self.broad_end_ts is None:
             return None
         return max(self.narrow_end_ts, self.broad_end_ts)
+
+
+def is_price_ladder(imp: Implication) -> bool:
+    """Two rungs of one kind of price ladder ("hit", "close above", …), by their titles."""
+    from strategy.structural_implications import price_ladder_kind  # noqa: PLC0415
+    kind = price_ladder_kind(imp.narrow_title)
+    return kind is not None and kind == price_ladder_kind(imp.broad_title)
 
 
 def _take_batch(order: "list[Implication]", capacity: int) -> "list[Implication]":
@@ -670,6 +684,9 @@ class CrossGuard:
         # Pairs the socket says are at their threshold now: key → its edge there.
         self._urgent: dict[tuple[str, str], float] = {}
         self._urgent_at: dict[tuple[str, str], float] = {}
+        # Price-ladder pairs in the reader's file, classified when it is re-read.
+        self._ladders: set[tuple[str, str]] = set()
+        self._ws_ladders = 0                           # ladder pairs in the last watch()
         self._wake: "asyncio.Event | None" = None
         self._attempts: dict[tuple[str, str], MakerAttempt] = {}
         self._attempts_path = Path(positions_path or CROSS_POSITIONS_PATH).with_name(
@@ -802,8 +819,9 @@ class CrossGuard:
         if best is not None:
             line += f" | best edge {best[0]:+.4f} (min {self._min_edge:.4f}) {best[1][:50]}"
         if self._ws is not None:
-            line += (f" | ws {len(self._ws.tokens)} token(s), {self.stats['ws_pushed']} "
-                     f"push(es), {self.stats['ws_priced']} priced")
+            line += (f" | ws {len(self._ws.tokens)} token(s), {self._ws_ladders} ladder "
+                     f"pair(s), {self.stats['ws_pushed']} push(es), "
+                     f"{self.stats['ws_priced']} priced")
         return (f"{line} | would_enter {self.stats['would_enter']} "
                 f"entered {self.stats['entered']} open {len(self._book.open_positions())}")
 
@@ -860,18 +878,29 @@ class CrossGuard:
             self._wake.set()
 
     def _watch_pairs(self, now: float) -> "list[WatchPair]":
-        """The pairs last priced nearest their threshold, that a pass could still enter."""
+        """
+        Every price-ladder pair a pass could still enter, priced or not, and the
+        other pairs last priced nearest their threshold. Ladders over the cap
+        go nearest first too.
+        """
         from execution.cross_ws import WatchPair  # noqa: PLC0415
-        near = []
+        ladders, near = [], []
         for imp in self._implications():
-            edge = self._last_edge.get(imp.key)
-            if edge is None or self._cheap_stop(imp, now) not in (None, "deferred"):
+            if self._cheap_stop(imp, now) not in (None, "deferred"):
                 continue
-            near.append((edge, imp))
+            edge = self._last_edge.get(imp.key)
+            if CROSS_WS_LADDERS and imp.key in self._ladders:
+                ladders.append((float("-inf") if edge is None else edge, imp))
+            elif edge is not None:
+                near.append((edge, imp))
+        ladders.sort(key=lambda x: -x[0])
         near.sort(key=lambda x: -x[0])
+        chosen = (ladders[:max(0, CROSS_WS_MAX_LADDER_PAIRS)]
+                  + near[:max(0, CROSS_WS_MAX_PAIRS)])
+        self._ws_ladders = min(len(ladders), max(0, CROSS_WS_MAX_LADDER_PAIRS))
         return [WatchPair(imp.key, imp.narrow_no_token, imp.broad_yes_token,
                           imp.narrow_fee_rate, imp.broad_fee_rate)
-                for _, imp in near[:max(0, CROSS_WS_MAX_PAIRS)]]
+                for _, imp in chosen]
 
     async def _urgent_pass(self) -> None:
         """Price the pushed pairs from fresh books, through every gate a pass has."""
@@ -1120,6 +1149,7 @@ class CrossGuard:
         if self._imp_cache[0] != sig:
             self._imp_cache = (sig, load_implications(self._imp_path))
             self._forget_departed({imp.key for imp in self._imp_cache[1]})
+            self._ladders = {imp.key for imp in self._imp_cache[1] if is_price_ladder(imp)}
         return self._imp_cache[1]
 
     def _forget_departed(self, present: "set[tuple[str, str]]") -> None:
