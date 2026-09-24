@@ -6,6 +6,7 @@ the early exit, resolution, and the bookkeeping that has to survive a restart.
 from __future__ import annotations
 
 import json
+import math
 import time
 
 import pytest
@@ -17,6 +18,7 @@ from execution.cross_guard import (
     best_level,
     evaluate,
     load_implications,
+    min_order_shares,
     size_position,
     stop_key,
     Level,
@@ -152,6 +154,46 @@ def test_size_is_bounded_by_the_thinner_touch_and_the_cap():
     shares = size_position(Level(0.40, 50), Level(0.45, 20), 0.85,
                            max_usdc=5.0, min_shares=5.0)
     assert shares == 5.88          # 5.00 / 0.85, under both touches
+
+
+# ── the exchange's $1 minimum for a marketable order ──────────────────────────
+
+def test_a_marketable_order_needs_a_dollar_with_a_margin_for_rounding():
+    assert min_order_shares(0.14) == 7.29              # 1.02 / 0.14 = 7.2857…
+    assert min_order_shares(0.002) == 510.0
+    assert min_order_shares(0.60) == 1.70
+
+
+def test_a_deep_ladder_pair_is_refused_before_anything_is_sent():
+    """2026-09-23/24: Gold $4,000 ⊆ $4,050 at 0.99 + 0.002 was tried 17 times.
+    Five shares of the YES leg are worth $0.01; $1 would take 510 of them."""
+    books = {"nn": _book(asks=[(0.990, 65)], bids=[(0.985, 65)]),
+             "by": _book(asks=[(0.002, 16)], bids=[(0.001, 16)])}
+    opp, why = evaluate(_imp(), books["nn"], books["by"], now=NOW, min_edge=0.005)
+    assert opp is None and stop_key(why) == "under_min_order"
+    assert "510.00 shares" in why
+
+
+def test_a_cheap_leg_is_scaled_up_to_the_minimum_when_the_cap_allows():
+    """META at 0.84 + 0.14: five dollars buys 5.10 pairs, $0.71 of the cheap leg;
+    ten dollars buys 10.20, and both legs clear the minimum."""
+    books = {"nn": _book(asks=[(0.84, 160)], bids=[(0.83, 160)]),
+             "by": _book(asks=[(0.14, 90)], bids=[(0.13, 90)])}
+    opp, why = evaluate(_imp(), books["nn"], books["by"], now=NOW, min_edge=0.005,
+                        rate_narrow=0.0, rate_broad=0.0, max_usdc=5.0)
+    assert opp is None and stop_key(why) == "under_min_order"
+    opp, why = evaluate(_imp(), books["nn"], books["by"], now=NOW, min_edge=0.005,
+                        rate_narrow=0.0, rate_broad=0.0, max_usdc=10.0)
+    assert why == "ok" and opp.shares == 10.2
+    assert opp.shares * opp.yes_ask.price >= 1.0 and opp.shares * opp.no_ask.price >= 1.0
+
+
+def test_the_minimum_can_be_switched_off():
+    books = {"nn": _book(asks=[(0.990, 65)], bids=[(0.985, 65)]),
+             "by": _book(asks=[(0.002, 16)], bids=[(0.001, 16)])}
+    opp, why = evaluate(_imp(), books["nn"], books["by"], now=NOW, min_edge=0.005,
+                        min_order_usdc=0.0)
+    assert why == "ok" and opp.shares == math.floor(5.0 / opp.entry_per_pair * 100) / 100
 
 
 def test_a_touch_below_the_minimum_size_is_refused():
@@ -352,6 +394,8 @@ _CORNERS = dict(narrow_title="X vs. Y: X O/U 2.5 Corners", broad_title="X vs. Y:
     (_imp(), {"nn": _book(asks=[(0.40, 50)]), "by": ARB["by"]}, "no_bid"),
     (_imp(days=0.01), ARB, "too_close_to_end"),
     (_imp(broad_outcomes=None), ARB, "outcomes_unknown"),
+    (_imp(), {"nn": _book(asks=[(0.80, 50)], bids=[(0.79, 50)]),
+              "by": _book(asks=[(0.10, 50)], bids=[(0.09, 50)])}, "under_min_order"),
     (_imp(), ARB, "ok"),
 ])
 def test_every_refusal_has_a_stop_key(imp, books, key):

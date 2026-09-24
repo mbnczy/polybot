@@ -399,3 +399,51 @@ async def test_a_price_outside_every_grid_is_refused_not_moved(monkeypatch):
         await c.post_maker_order("T", "BUY", 0.0005, 5.0)     # only 0.001 exists
     await c.post_maker_order("T", "BUY", 0.9995, 5.0)         # 0.999 is cheaper: fine
     assert c.posted == [0.999]
+
+
+# ── the $1 marketable minimum and the maker's own cap ─────────────────────────
+
+@pytest.mark.asyncio
+async def test_a_completion_under_the_marketable_minimum_is_not_tried(tmp_path, monkeypatch):
+    """5.43 shares at 0.10 is $0.54: the exchange would refuse it, so the filled
+    leg is sold back straight away instead of after a refused order."""
+    g, client, breaker, notifier = _maker_guard(tmp_path, monkeypatch, maker_ttl_s=0.0)
+    await g.poll_once()
+    client.fills = {"m1": 5.43}                        # only the NO leg filled
+    client.books["by"] = _book(asks=[(0.10, 50)], bids=[(0.09, 50)])
+    await g.poll_once()
+    assert client.buys == []
+    assert [t for t, _ in client.sells] == ["nn"]
+
+
+@pytest.mark.asyncio
+async def test_a_resting_pair_keeps_its_own_cap_when_the_taker_cap_grows(tmp_path, monkeypatch):
+    g, client, breaker, _ = _maker_guard(tmp_path, monkeypatch, max_position_usdc=10.0,
+                                         maker_max_usdc=5.0, taker_reserve=0)
+    await g.poll_once()
+    sizes = {size for _, _, _, size in client.maker_orders}
+    assert sizes == {5.43}                             # 5.00 / 0.92, not 10.00 / 0.92
+
+
+@pytest.mark.asyncio
+async def test_with_the_live_caps_a_rest_still_leaves_a_whole_taker_slot(tmp_path, monkeypatch):
+    """Taker 10, maker 5, 15 in all: a 5-dollar rest leaves the 10 a taker needs.
+    With 10 in all it would not, and the maker path would never rest again."""
+    g, *_ = _maker_guard(tmp_path, monkeypatch, max_position_usdc=10.0, maker_max_usdc=5.0)
+    g._breaker.cross_headroom = lambda: (2, 15.0)
+    assert g._leaves_taker_room(5.0)
+    g._breaker.cross_headroom = lambda: (2, 10.0)
+    assert not g._leaves_taker_room(5.0)
+
+
+@pytest.mark.asyncio
+async def test_a_pair_too_small_to_cross_can_still_be_rested(tmp_path, monkeypatch):
+    """A resting bid is not a marketable order; the $1 minimum is not its limit."""
+    # Crossing: 0.80 + 0.14 plus fees, +0.046 — but $5 buys 5.24 pairs, $0.73 of
+    # the YES leg. Resting: 0.79 + 0.13 = 0.92, and a resting bid has no minimum.
+    books = {"nn": _book(asks=[(0.80, 50)], bids=[(0.78, 50)]),
+             "by": _book(asks=[(0.14, 50)], bids=[(0.12, 50)])}
+    g, client, _, _ = _maker_guard(tmp_path, monkeypatch, books=books, taker_reserve=0)
+    await g._priced(_imp(), NOW)
+    assert client.buys == []
+    assert [(t, p) for _, t, p, _ in client.maker_orders] == [("nn", 0.79), ("by", 0.13)]

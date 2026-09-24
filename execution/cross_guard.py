@@ -121,6 +121,17 @@ CROSS_MIN_EDGE: float = float(os.environ.get("CROSS_MIN_EDGE", 0.02))
 # it means no trades at all. Exposure is held down by the breaker's cross ledger
 # (one position at a time) instead.
 CROSS_MAX_POSITION_USDC: float = float(os.environ.get("CROSS_MAX_POSITION_USDC", 5.0))
+# The exchange refuses a marketable BUY worth under $1 ("invalid amount for a
+# marketable BUY order ($0.02), min size: $1"): 13 of the 19 entries tried on the
+# night of 2026-09-23 failed on it — the cheap leg of a deep ladder pair, YES at
+# 0.002, is worth $0.01 at five shares. Each leg is sized to clear it, or the pair
+# is left alone. The margin covers the amount being rounded down to the cent.
+CROSS_MIN_ORDER_USDC: float = float(os.environ.get("CROSS_MIN_ORDER_USDC", 1.0))
+_MIN_ORDER_MARGIN: float = 1.02
+# What a resting pair may commit. The taker cap can grow so a cheap leg clears the
+# $1 minimum without the resting pairs growing with it.
+CROSS_MAKER_MAX_USDC: float = float(os.environ.get("CROSS_MAKER_MAX_USDC",
+                                                   CROSS_MAX_POSITION_USDC))
 # A position we could not sell back is the half-fill loss, so both legs must
 # have a bid to exit into. Minutes before an event closes the book is a few
 # stale quotes nobody will honour, and an "edge" far above what these markets
@@ -372,14 +383,27 @@ class Opportunity:
         return self.shares * self.entry_per_pair
 
 
+def min_order_shares(price: float, min_usdc: float = CROSS_MIN_ORDER_USDC) -> float:
+    """Shares a marketable BUY at `price` needs to be worth the exchange's minimum."""
+    if price <= 0.0 or min_usdc <= 0.0:
+        return 0.0
+    return math.ceil(min_usdc * _MIN_ORDER_MARGIN / price * 100.0 - 1e-9) / 100.0
+
+
 def size_position(no_ask: Level, yes_ask: Level, entry_per_pair: float, *,
-                  max_usdc: float, min_shares: float) -> float:
-    """Pairs to buy: bounded by the touch on both legs and the capital cap."""
+                  max_usdc: float, min_shares: float,
+                  min_order_usdc: float = CROSS_MIN_ORDER_USDC) -> float:
+    """
+    Pairs to buy: as many as the touch on both legs and the capital cap allow,
+    and at least enough for each leg to be a valid marketable order.
+    """
     if entry_per_pair <= 0.0:
         return 0.0
     cap = min(no_ask.size, yes_ask.size, max_usdc / entry_per_pair)
     shares = math.floor(cap * 100.0) / 100.0
-    return shares if shares >= min_shares else 0.0
+    floor = max(min_shares, min_order_shares(no_ask.price, min_order_usdc),
+                min_order_shares(yes_ask.price, min_order_usdc))
+    return shares if shares >= floor else 0.0
 
 
 def quoted_entry(
@@ -411,11 +435,13 @@ _STOP_KEYS: tuple[tuple[str, str], ...] = (
     ("no ask", "no_ask"),
     ("no bid", "no_bid"),
     ("at the real asks", "edge_below_min"),
+    ("minimum for a marketable order", "under_min_order"),
     ("depth at the best ask", "thin_touch"),
 )
 # Stops reached with both asks priced on a genuine implication: only these
 # contribute to "best edge", so a pseudo-implication's fake edge cannot show.
-_PRICED_STOPS = frozenset({"edge_below_min", "thin_touch", "ok", "maker_edge_below_min"})
+_PRICED_STOPS = frozenset({"edge_below_min", "thin_touch", "under_min_order", "ok",
+                           "maker_edge_below_min"})
 _SHARE_EPS: float = 0.005
 
 
@@ -588,6 +614,7 @@ def evaluate(
     min_shares: float = CROSS_MIN_SHARES,
     min_time_to_end_s: float = CROSS_MIN_TIME_TO_END_S,
     yes_no_only: bool = CROSS_YES_NO_ONLY,
+    min_order_usdc: float = CROSS_MIN_ORDER_USDC,
 ) -> "tuple[Opportunity | None, str]":
     """Every entry gate, from the two books. Returns (opportunity, reason)."""
     gate = _entry_gates(imp, now, max_lockup_days, min_time_to_end_s, yes_no_only)
@@ -605,8 +632,15 @@ def evaluate(
     if 1.0 - entry < min_edge:
         return None, f"edge {1.0 - entry:+.4f} < {min_edge:.4f} at the real asks"
     shares = size_position(no_ask, yes_ask, entry, max_usdc=max_usdc,
-                           min_shares=min_shares)
+                           min_shares=min_shares, min_order_usdc=min_order_usdc)
     if shares <= 0.0:
+        room = math.floor(min(no_ask.size, yes_ask.size, max_usdc / entry) * 100.0) / 100.0
+        cheap = min(no_ask.price, yes_ask.price)
+        need = min_order_shares(cheap, min_order_usdc)
+        if room >= min_shares and need > room:
+            return None, (f"the leg at {cheap:.3f} needs {need:.2f} shares to reach the "
+                          f"${min_order_usdc:g} minimum for a marketable order — the touch "
+                          f"and the {max_usdc:g} USDC cap allow {room:.2f}")
         return None, (f"depth at the best ask ({no_ask.size:.0f} / {yes_ask.size:.0f}) "
                       f"does not reach the {min_shares:g}-share minimum")
     lockup = ((imp.resolves_ts or now) - now) / 86_400.0
@@ -642,6 +676,7 @@ class CrossGuard:
         maker_ttl_s:       "float | None" = None,
         maker_min_edge:    "float | None" = None,
         taker_reserve:     "int | None" = None,
+        maker_max_usdc:    "float | None" = None,
         ws_enabled:        "bool | None" = None,
         resolution_lookup: "ResolutionLookup | None" = None,
     ) -> None:
@@ -679,6 +714,7 @@ class CrossGuard:
         self._maker_min_edge = (CROSS_MAKER_MIN_EDGE if maker_min_edge is None
                                 else maker_min_edge)
         self._taker_reserve = CROSS_TAKER_RESERVE_SLOTS if taker_reserve is None else taker_reserve
+        self._maker_max_usdc = CROSS_MAKER_MAX_USDC if maker_max_usdc is None else maker_max_usdc
         self._ws_enabled = CROSS_WS_ENABLED if ws_enabled is None else ws_enabled
         self._ws: "CrossBookWatch | None" = None
         # Pairs the socket says are at their threshold now: key → its edge there.
@@ -717,12 +753,14 @@ class CrossGuard:
         self._last_pass: ("tuple[float, int, dict[str, int], "
                           "tuple[float, str] | None, int, float | None] | None") = None
         logger.info(
-            "CrossGuard init | %s | maker=%s (ttl %.0fs, min_edge %.3f, %d slot(s) kept "
-            "for takers) | window=%gd min_edge=%.3f max_pos=%.2f USDC open=%d file=%s",
+            "CrossGuard init | %s | maker=%s (ttl %.0fs, min_edge %.3f, max %.2f USDC, %d "
+            "slot(s) kept for takers) | window=%gd min_edge=%.3f max_pos=%.2f USDC "
+            "min_order=$%g open=%d file=%s",
             "EXECUTING" if self._enabled else "evaluate only (disabled)",
             "on" if self._maker_enabled else "off", self._maker_ttl, self._maker_min_edge,
-            self._taker_reserve, self._max_lockup, self._min_edge, self._max_usdc,
-            len(self._book.open_positions()), self._imp_path,
+            self._maker_max_usdc, self._taker_reserve, self._max_lockup, self._min_edge,
+            self._max_usdc, CROSS_MIN_ORDER_USDC, len(self._book.open_positions()),
+            self._imp_path,
         )
         headroom = getattr(breaker, "cross_headroom", None)
         if (self._enabled and self._maker_enabled and self._taker_reserve > 0
@@ -1082,7 +1120,9 @@ class CrossGuard:
         held_paid = a.no_price if no_rich else a.yes_price
         other_token = a.yes_token if no_rich else a.no_token
         ask = best_level(await self._client.get_orderbook(other_token), "asks")
-        if ask is not None and ask.size >= excess:
+        # A completion under the $1 marketable minimum would only be refused.
+        if (ask is not None and ask.size >= excess
+                and excess >= min_order_shares(ask.price)):
             completed = held_paid + buy_cost(ask.price, None)
             if completed < 1.0:
                 got = await self._buy(other_token, ask.price, excess)
@@ -1355,8 +1395,10 @@ class CrossGuard:
         if opp is None:
             # The taker path pays the ask plus a fee on both legs. Our own bid
             # pays neither, and that is where these pairs can become tradeable.
+            # A resting bid is not a marketable order: the $1 minimum does not
+            # apply to it, so a pair too small to cross can still be rested.
             if self._maker_enabled and stop in ("edge_below_min", "thin_touch", "no_ask",
-                                                "too_close_to_end"):
+                                                "too_close_to_end", "under_min_order"):
                 return await self._maker_attempt(imp, no_book, yes_book, now, stop, edge)
             return stop, edge
         if not self._breaker.check_cross(opp.committed):
@@ -1409,7 +1451,7 @@ class CrossGuard:
         key = imp.key
         opp, reason = evaluate_maker(
             imp, no_book, yes_book, now=now, max_lockup_days=self._max_lockup,
-            min_edge=self._maker_min_edge, max_usdc=self._max_usdc,
+            min_edge=self._maker_min_edge, max_usdc=self._maker_max_usdc,
             min_shares=self._min_shares, min_time_to_end_s=CROSS_MAKER_MIN_TIME_TO_END_S,
             yes_no_only=self._yes_no_only)
         self.last_reason[key] = reason
