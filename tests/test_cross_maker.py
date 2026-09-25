@@ -32,6 +32,8 @@ class _MakerClient(_Client):
         self.fills: dict[str, float] = {}
         self.fill_on_cancel: dict[str, float] = {}
         self.post_fail: set[str] = set()
+        self.fill_queries: list[tuple] = []
+        self.balances: dict[str, float] = {}       # what the wallet holds, by token
         self._n = 0
 
     async def post_maker_order(self, token_id, side, desired_price, size):
@@ -42,8 +44,12 @@ class _MakerClient(_Client):
         self.maker_orders.append((oid, token_id, desired_price, size))
         return {"status": "live", "order_id": oid}
 
-    async def order_filled_size(self, order_id, token_id=None):
+    async def order_filled_size(self, order_id, token_id=None, market=None):
+        self.fill_queries.append((order_id, token_id, market))
         return self.fills.get(order_id, 0.0)
+
+    async def share_balance(self, token_id):
+        return self.balances.get(token_id, 0.0)
 
     async def cancel_order(self, order_id):
         self.cancelled.append(order_id)
@@ -447,3 +453,65 @@ async def test_a_pair_too_small_to_cross_can_still_be_rested(tmp_path, monkeypat
     await g._priced(_imp(), NOW)
     assert client.buys == []
     assert [(t, p) for _, t, p, _ in client.maker_orders] == [("nn", 0.79), ("by", 0.13)]
+
+
+# ── fills the trade feed does not report ─────────────────────────────────────
+# 2026-09-24: four cheap legs (Over 7.5 goals at 0.01-0.02) filled while the feed,
+# filtered on our own token, said nothing had; the guard logged "expired unfilled
+# — nothing held" and the shares sat in the wallet unwatched.
+
+@pytest.mark.asyncio
+async def test_fills_are_looked_up_by_market_not_by_token(tmp_path, monkeypatch):
+    g, client, _, _ = _maker_guard(tmp_path, monkeypatch)
+    await g.poll_once()                                # rests m1 (NO) and m2 (YES)
+    await g.poll_once()
+    assert ("m1", "nn", "0xn") in client.fill_queries
+    assert ("m2", "by", "0xb") in client.fill_queries
+
+
+@pytest.mark.asyncio
+async def test_a_fill_the_feed_missed_is_found_in_the_wallet_at_expiry(tmp_path, monkeypatch):
+    g, client, breaker, notifier = _maker_guard(tmp_path, monkeypatch, maker_ttl_s=0.0)
+    await g.poll_once()
+    client.balances["by"] = 5.43                       # YES filled; the feed says 0
+    await g.poll_once()
+    assert g.stats["feed_missed"] == 1
+    # Handled like any one-leg fill: here completing it still pays (0.51 + 0.45).
+    assert client.buys == [("nn", 0.45, 5.43)]
+    assert len(g.open_positions()) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_fill_the_chain_settled_late_is_found_on_the_second_look(tmp_path, monkeypatch):
+    g, client, _, notifier = _maker_guard(tmp_path, monkeypatch, maker_ttl_s=0.0)
+    await g.poll_once()
+    await g.poll_once()                                # expired, nothing held yet
+    assert client.buys == [] and client.sells == []
+    client.balances["nn"] = 5.43                       # the NO fill lands after expiry
+    client.books["by"] = _book(asks=[(0.62, 50)], bids=[(0.50, 50)])
+    await g._watch_maker(NOW + cg.CROSS_FILL_AUDIT_S - 1)
+    assert client.sells == []                          # not due yet
+    await g._watch_maker(NOW + cg.CROSS_FILL_AUDIT_S + 1)
+    assert g.stats["feed_missed"] == 1
+    # Completing would cost 0.41 + 0.62: the NO leg is sold back instead.
+    assert client.buys == [] and client.sells == [("nn", 5.43)]
+    assert any("HALF-FILL" in m for m in notifier.messages)
+
+
+@pytest.mark.asyncio
+async def test_a_wallet_that_already_held_the_token_is_not_a_fill(tmp_path, monkeypatch):
+    g, client, _, _ = _maker_guard(tmp_path, monkeypatch, maker_ttl_s=0.0)
+    client.balances["by"] = 20.0                       # held before the orders went out
+    await g.poll_once()
+    await g.poll_once()
+    await g._watch_maker(NOW + cg.CROSS_FILL_AUDIT_S + 1)
+    assert g.stats["feed_missed"] == 0 and client.buys == [] and client.sells == []
+
+
+@pytest.mark.asyncio
+async def test_without_a_balance_reader_nothing_is_audited(tmp_path, monkeypatch):
+    g, client, _, _ = _maker_guard(tmp_path, monkeypatch, maker_ttl_s=0.0)
+    monkeypatch.setattr(type(client), "share_balance", None, raising=False)
+    await g.poll_once()
+    await g.poll_once()
+    assert g._audits == []

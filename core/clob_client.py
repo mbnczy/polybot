@@ -938,7 +938,7 @@ class PolyClient:
         return held
 
     async def order_filled_size(
-        self, order_id: str, token_id: "str | None" = None
+        self, order_id: str, token_id: "str | None" = None, market: "str | None" = None,
     ) -> "float | None":
         """
         How much of ONE order actually filled, attributed by order id.
@@ -959,6 +959,13 @@ class PolyClient:
 
         Returns None if the feed cannot be read, so callers keep whatever
         conservative fallback they had rather than treating "unknown" as zero.
+
+        Pass `market` (the condition id) where it is known. A resting BUY of one
+        token can be matched against a taker buying the other — the exchange
+        mints the pair — and that trade is filed under the taker's token, so a
+        filter on our own token cannot see it. That is the likeliest reading of
+        four cross maker fills this lookup reported as zero on 2026-09-24; the
+        market filter holds both tokens either way.
         """
         self._touch_order(order_id, token_id)
         if _PAPER_TRADE:
@@ -970,7 +977,8 @@ class PolyClient:
 
         def _read() -> float:
             total = 0.0
-            kwargs = {"token_id": str(token_id)} if token_id else {}
+            kwargs = ({"market": str(market)} if market
+                      else {"token_id": str(token_id)} if token_id else {})
             pages  = self._client.list_account_trades(**kwargs)
             seen   = 0
             for page in pages:

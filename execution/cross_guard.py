@@ -162,6 +162,9 @@ CROSS_WS_MAX_LADDER_PAIRS: int = int(os.environ.get("CROSS_WS_MAX_LADDER_PAIRS",
 CROSS_WS_MAX_URGENT: int = int(os.environ.get("CROSS_WS_MAX_URGENT", 20))
 CROSS_WS_MIN_GAP_S: float = float(os.environ.get("CROSS_WS_MIN_GAP_S", 2.0))
 CROSS_MAKER_TTL_S: float = float(os.environ.get("CROSS_MAKER_TTL_S", 180.0))
+# A pair that expired with nothing held is looked at once more this much later,
+# in the wallet: a fill the chain had not settled at expiry shows there.
+CROSS_FILL_AUDIT_S: float = float(os.environ.get("CROSS_FILL_AUDIT_S", 90.0))
 CROSS_MAKER_MIN_EDGE: float = float(os.environ.get("CROSS_MAKER_MIN_EDGE", CROSS_MIN_EDGE))
 # A bid a tick above an almost empty book is not an offer anyone will take: on
 # 2026-09-17 that produced "+0.96 edge" pairs whose books stood at 0.01 / 0.50.
@@ -502,6 +505,10 @@ class MakerAttempt:
     committed:     float
     no_filled:     float = 0.0
     yes_filled:    float = 0.0
+    # What the wallet held of each token before the orders went out, so a fill
+    # the trade feed does not report still shows (CrossGuard._wallet_fills).
+    no_bal0:       "float | None" = None
+    yes_bal0:      "float | None" = None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -511,7 +518,7 @@ class MakerAttempt:
         return {k: getattr(self, k) for k in (
             "narrow", "broad", "narrow_title", "broad_title", "no_token", "yes_token",
             "no_price", "yes_price", "shares", "no_order", "yes_order", "placed_at",
-            "resolves_ts", "committed", "no_filled", "yes_filled")}
+            "resolves_ts", "committed", "no_filled", "yes_filled", "no_bal0", "yes_bal0")}
 
 
 @dataclass(frozen=True)
@@ -725,6 +732,8 @@ class CrossGuard:
         self._ws_ladders = 0                           # ladder pairs in the last watch()
         self._wake: "asyncio.Event | None" = None
         self._attempts: dict[tuple[str, str], MakerAttempt] = {}
+        # Pairs that expired with nothing held, due a second look in the wallet.
+        self._audits: list[tuple[float, MakerAttempt]] = []
         self._attempts_path = Path(positions_path or CROSS_POSITIONS_PATH).with_name(
             Path(positions_path or CROSS_POSITIONS_PATH).stem + "_maker.json")
         # Every rest the guard would have made while disabled, one JSON line each,
@@ -746,7 +755,7 @@ class CrossGuard:
         self.stats = {"evaluated": 0, "would_enter": 0, "entered": 0,
                       "half_filled": 0, "exited": 0, "resolved": 0, "stuck": 0,
                       "would_rest": 0, "rested": 0, "maker_filled": 0,
-                      "ws_pushed": 0, "ws_priced": 0}
+                      "ws_pushed": 0, "ws_priced": 0, "feed_missed": 0}
         # The last complete pass over the reader's file, for stop_summary():
         # (when, implications read, stops by key, (best edge, narrow title),
         #  pairs not priced this pass, age of the stalest price in seconds).
@@ -1016,6 +1025,8 @@ class CrossGuard:
     async def _rest_maker(self, opp: MakerOpportunity, now: float) -> bool:
         imp = opp.imp
         self._breaker.on_cross_open(opp.committed)
+        no_bal0 = await self._balance(imp.narrow_no_token)
+        yes_bal0 = await self._balance(imp.broad_yes_token)
         no_id = await self._post_maker(imp.narrow_no_token, opp.no_price, opp.shares)
         yes_id = await self._post_maker(imp.broad_yes_token, opp.yes_price, opp.shares)
         if not no_id or not yes_id:
@@ -1035,7 +1046,8 @@ class CrossGuard:
             broad_title=imp.broad_title, no_token=imp.narrow_no_token,
             yes_token=imp.broad_yes_token, no_price=opp.no_price, yes_price=opp.yes_price,
             shares=opp.shares, no_order=no_id, yes_order=yes_id, placed_at=now,
-            resolves_ts=imp.resolves_ts, committed=opp.committed)
+            resolves_ts=imp.resolves_ts, committed=opp.committed,
+            no_bal0=no_bal0, yes_bal0=yes_bal0)
         self._save_attempts()
         self.stats["rested"] += 1
         await self._say(
@@ -1047,12 +1059,13 @@ class CrossGuard:
         return True
 
     async def _refresh_attempt(self, a: MakerAttempt) -> None:
-        for leg in ("no", "yes"):
+        # By market, not token: see PolyClient.order_filled_size.
+        for leg, market in (("no", a.narrow), ("yes", a.broad)):
             order, token = getattr(a, f"{leg}_order"), getattr(a, f"{leg}_token")
             if not order:
                 continue
             try:
-                filled = await self._client.order_filled_size(order, token)
+                filled = await self._client.order_filled_size(order, token, market=market)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("CrossGuard | fill lookup failed for %s: %s", order[:12], exc)
                 continue
@@ -1061,6 +1074,7 @@ class CrossGuard:
                         max(getattr(a, f"{leg}_filled"), min(a.shares, float(filled))))
 
     async def _watch_maker(self, now: float) -> None:
+        await self._audit_expired(now)
         for a in list(self._attempts.values()):
             await self._refresh_attempt(a)
             if min(a.no_filled, a.yes_filled) >= a.shares - _SHARE_EPS:
@@ -1083,16 +1097,79 @@ class CrossGuard:
         self._attempts.pop(a.key, None)
         self._save_attempts()
         self._cooldown[a.key] = now + CROSS_ENTRY_COOLDOWN_S
-        pairs = math.floor(min(a.no_filled, a.yes_filled) * 100.0) / 100.0
         self._breaker.release_cross(a.committed)
+        await self._count_wallet(a, "at expiry")
+        if not await self._book_fills(a, now, "maker"):
+            logger.info("CrossGuard | maker pair on %s expired unfilled — nothing held",
+                        a.narrow_title[:40])
+            if a.no_bal0 is not None or a.yes_bal0 is not None:
+                self._audits.append((now + CROSS_FILL_AUDIT_S, a))
+
+    async def _book_fills(self, a: MakerAttempt, now: float, how: str) -> bool:
+        """Open what paired, resolve what did not; False when nothing filled at all."""
+        pairs = math.floor(min(a.no_filled, a.yes_filled) * 100.0) / 100.0
         if pairs > _SHARE_EPS:
-            await self._open_from_maker(a, pairs, a.no_price, a.yes_price, now, "maker")
+            await self._open_from_maker(a, pairs, a.no_price, a.yes_price, now, how)
         excess = round(abs(a.no_filled - a.yes_filled), 4)
         if excess > _SHARE_EPS:
             await self._resolve_excess(a, excess, now)
-        elif pairs <= _SHARE_EPS:
-            logger.info("CrossGuard | maker pair on %s expired unfilled — nothing held",
-                        a.narrow_title[:40])
+        return pairs > _SHARE_EPS or excess > _SHARE_EPS
+
+    async def _balance(self, token: str) -> "float | None":
+        """The wallet's shares of `token`, or None when they cannot be read."""
+        read = getattr(self._client, "share_balance", None)
+        if not callable(read):
+            return None
+        try:
+            bal = await read(token)
+        except Exception as exc:  # noqa: BLE001 — a failed read only skips the check
+            logger.debug("CrossGuard | balance read failed for %s: %s", token[:12], exc)
+            return None
+        return None if bal is None else float(bal)
+
+    async def _wallet_fills(self, a: MakerAttempt) -> "dict[str, float]":
+        """
+        Shares each leg gained in the wallet beyond what the trade feed reported.
+
+        On 2026-09-24 the feed reported four fills as nothing: the guard logged
+        "expired unfilled — nothing held" over legs the wallet held, and they
+        sat unwatched. The chain does not miss a fill; it can lag one, which the
+        second look CROSS_FILL_AUDIT_S later covers.
+        """
+        out: dict[str, float] = {}
+        for leg in ("no", "yes"):
+            bal0 = getattr(a, f"{leg}_bal0")
+            if bal0 is None:
+                continue
+            bal = await self._balance(getattr(a, f"{leg}_token"))
+            if bal is None:
+                continue
+            extra = round(min(a.shares, bal - bal0) - getattr(a, f"{leg}_filled"), 4)
+            if extra > _SHARE_EPS:
+                out[leg] = extra
+        return out
+
+    async def _count_wallet(self, a: MakerAttempt, when: str) -> bool:
+        """Add what the wallet shows and the feed did not; True if there was any."""
+        gained = await self._wallet_fills(a)
+        for leg, extra in gained.items():
+            self.stats["feed_missed"] += 1
+            logger.warning(
+                "CrossGuard | %s the wallet holds %.2f %s shares on %s that the trade "
+                "feed did not report — counting them as filled",
+                when, extra, leg.upper(), a.narrow_title[:40])
+            setattr(a, f"{leg}_filled", getattr(a, f"{leg}_filled") + extra)
+        return bool(gained)
+
+    async def _audit_expired(self, now: float) -> None:
+        """The second look at pairs that expired with nothing held."""
+        due = [a for at, a in self._audits if at <= now]
+        if not due:
+            return
+        self._audits = [(at, a) for at, a in self._audits if at > now]
+        for a in due:
+            if await self._count_wallet(a, f"{CROSS_FILL_AUDIT_S:.0f}s after expiry"):
+                await self._book_fills(a, now, "maker, found in the wallet")
 
     async def _open_from_maker(self, a: MakerAttempt, size: float, no_paid: float,
                                yes_paid: float, now: float, how: str) -> None:
