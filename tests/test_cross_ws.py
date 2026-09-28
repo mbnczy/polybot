@@ -80,6 +80,21 @@ def test_unwatched_tokens_are_ignored_and_dropped_on_change():
     assert w.tokens == {"A", "B"} and "NO" not in w._tops
 
 
+def test_the_socket_says_when_a_top_last_moved(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("execution.cross_ws.time.monotonic", lambda: clock[0])
+    w, _ = _watch()
+    w.handle(json.dumps(_snap("NO", [(0.40, 10)], [(0.38, 10)])))
+    assert w.since_move("NO") is None                  # a first snapshot is not a move
+    clock[0] = 110.0
+    w.handle(json.dumps(_change("NO", "BUY", 0.30, 5, 0.38, 0.40)))   # below the top
+    assert w.since_move("NO") is None
+    w.handle(json.dumps(_change("NO", "SELL", 0.39, 5, 0.38, 0.39)))  # a better ask
+    clock[0] = 115.0
+    assert w.since_move("NO") == 5.0
+    assert w.since_move("UNSEEN") is None
+
+
 def test_garbage_frames_do_not_raise():
     w, _ = _watch()
     w.handle("INVALID OPERATION")

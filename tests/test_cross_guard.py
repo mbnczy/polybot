@@ -63,15 +63,19 @@ class _Client:
         self.sells: list[tuple[str, float]] = []
         self.buy_fail: set[str] = set()
         self.sell_fail: set[str] = set()
+        self.partial: dict[str, float] = {}         # token → shares an FAK buy gets
+        self.order_types: list[str] = []
 
     async def get_orderbook(self, token):
         return self.books.get(token, _book())
 
     async def post_order(self, token_id, side, price, size, _order_type="FOK"):
         self.buys.append((token_id, price, size))
+        self.order_types.append(_order_type)
         if token_id in self.buy_fail:
             return {"status": "unmatched"}
-        return {"status": "matched", "making_amount": size * price, "taking_amount": size}
+        got = min(size, self.partial[token_id]) if token_id in self.partial else size
+        return {"status": "matched", "making_amount": got * price, "taking_amount": got}
 
     async def unwind_leg(self, token_id, size, price=0.0):
         self.sells.append((token_id, size))
@@ -102,6 +106,9 @@ def _write_imps(tmp_path, imps):
 
 
 def _guard(tmp_path, monkeypatch, books, imps, *, enabled=True, **kw):
+    # The resting tests below price a tick above the bid; joining the queue
+    # (the live default) has tests of its own in test_cross_maker.py.
+    kw.setdefault("maker_join", False)
     monkeypatch.setenv("CROSS_MAX_POSITIONS", "2")
     monkeypatch.setenv("CROSS_MAX_COMMITTED_USDC", "10")
     monkeypatch.setattr(time, "time", lambda: NOW)
@@ -402,6 +409,35 @@ def test_every_refusal_has_a_stop_key(imp, books, key):
     """A reworded reason must not fall through to "other" unnoticed."""
     _, why = evaluate(imp, books["nn"], books["by"], now=NOW)
     assert stop_key(why) == key
+
+
+# ── the first leg takes what is there ─────────────────────────────────────────
+# Six first legs died as FOK on 2026-09-23/24 because a sliver of the touch had
+# gone; none failed on the second. FAK on the first, then exactly that on the second.
+
+@pytest.mark.asyncio
+async def test_the_first_leg_is_fak_and_the_second_matches_what_it_got(tmp_path, monkeypatch):
+    g, client, breaker, _ = _guard(tmp_path, monkeypatch, ARB, [_imp()],
+                                   max_position_usdc=10.0)
+    client.partial["by"] = 8.0                         # the thinner leg goes first
+    await g._priced(_imp(), NOW)
+    assert client.order_types[:2] == ["FAK", "FOK"]
+    assert client.buys[0][0] == "by" and client.buys[1] == ("nn", 0.40, 8.0)
+    (pos,) = g.open_positions()
+    assert pos.size == 8.0
+    assert breaker.status_dict()["cross_open"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_first_leg_too_small_for_a_valid_second_is_sold_back(tmp_path, monkeypatch):
+    g, client, breaker, _ = _guard(tmp_path, monkeypatch, ARB, [_imp()],
+                                   max_position_usdc=10.0)
+    client.partial["by"] = 3.0                         # under the five-share minimum
+    await g._priced(_imp(), NOW)
+    assert [t for t, _, _ in client.buys] == ["by"]    # no second leg was sent
+    assert client.sells == [("by", 3.0)]
+    assert g.open_positions() == []
+    assert breaker.status_dict()["cross_open"] == 0
 
 
 def _other(n, days=2.0):

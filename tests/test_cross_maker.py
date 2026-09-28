@@ -9,6 +9,7 @@ order can rest unfilled, or one leg can fill alone.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -515,3 +516,145 @@ async def test_without_a_balance_reader_nothing_is_audited(tmp_path, monkeypatch
     await g.poll_once()
     await g.poll_once()
     assert g._audits == []
+
+
+# ── completing at once, and cancels the exchange refuses ─────────────────────
+# 2026-09-27: every one-leg fill came 3-5 s after posting, while the completion
+# only ran at the 180-second expiry — by then the other leg's ask had gone.
+
+@pytest.mark.asyncio
+async def test_a_one_leg_fill_is_completed_at_once_when_that_pays(tmp_path, monkeypatch):
+    g, client, _, _ = _maker_guard(tmp_path, monkeypatch)            # 180 s to expiry
+    await g.poll_once()
+    client.fills = {"m1": 5.43}                        # NO filled, seconds in
+    client.books["by"] = _book(asks=[(0.50, 50)], bids=[(0.49, 50)])
+    await g._watch_maker(cg.time.time() + 4)
+    assert client.buys == [("by", 0.50, 5.43)]
+    assert "m2" in client.cancelled
+    assert len(g.open_positions()) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_one_leg_fill_keeps_resting_while_completing_would_not_pay(tmp_path, monkeypatch):
+    g, client, _, _ = _maker_guard(tmp_path, monkeypatch)
+    await g.poll_once()
+    client.fills = {"m1": 5.43}
+    client.books["by"] = _book(asks=[(0.62, 50)], bids=[(0.50, 50)])
+    await g._watch_maker(cg.time.time() + 4)
+    assert client.buys == [] and client.sells == [] and client.cancelled == []
+    assert _imp().key in g._attempts                   # the YES bid may still fill
+
+
+@pytest.mark.asyncio
+async def test_a_resting_pair_is_watched_every_few_seconds_between_sweeps(tmp_path, monkeypatch):
+    g, client, _, _ = _maker_guard(tmp_path, monkeypatch, poll_s=3600.0, ws_enabled=False)
+    monkeypatch.setattr(cg, "CROSS_FILL_POLL_S", 0.02)
+    await g.poll_once()                                # rests a pair
+    polls, watched = [], []
+
+    async def _poll():
+        polls.append(1)
+
+    async def _watch(now):
+        watched.append(now)
+    g.poll_once, g._watch_maker = _poll, _watch
+    task = asyncio.create_task(g.run())
+    await asyncio.sleep(0.2)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert polls == [1] and len(watched) >= 3
+
+
+@pytest.mark.asyncio
+async def test_a_refused_cancel_keeps_the_pair_watched_and_is_retried(tmp_path, monkeypatch):
+    g, client, _, _ = _maker_guard(tmp_path, monkeypatch, maker_ttl_s=0.0)
+    await g.poll_once()
+    real_cancel = client.cancel_order
+
+    async def refuse(order_id):
+        raise RuntimeError("order manager not ready, please retry")
+    client.cancel_order = refuse
+    await g._watch_maker(cg.time.time() + 1)
+    assert _imp().key in g._attempts                   # not settled over live orders
+    client.cancel_order = real_cancel
+    await g._watch_maker(cg.time.time() + 2)
+    assert _imp().key not in g._attempts
+    assert set(client.cancelled) == {"m1", "m2"}
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_refused_past_the_retry_window_settles_with_a_warning(tmp_path, monkeypatch):
+    g, client, _, notifier = _maker_guard(tmp_path, monkeypatch, maker_ttl_s=0.0)
+    await g.poll_once()
+
+    async def refuse(order_id):
+        raise RuntimeError("order manager not ready, please retry")
+    client.cancel_order = refuse
+    await g._watch_maker(cg.time.time() + cg.CROSS_CANCEL_RETRY_S + 1)
+    assert _imp().key not in g._attempts
+    assert any("would not cancel" in m for m in notifier.messages)
+
+
+# ── where and when to rest ────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_joining_the_queue_rests_at_the_best_bid(tmp_path, monkeypatch):
+    g, client, _, _ = _maker_guard(tmp_path, monkeypatch, maker_join=True)
+    await g.poll_once()
+    assert [(t, p) for _, t, p, _ in client.maker_orders] == [("nn", 0.40), ("by", 0.50)]
+
+
+def test_joining_never_crosses_and_needs_a_bid():
+    assert maker_price(MAKER["nn"], 0.01, join=True) == 0.40
+    assert maker_price(_book(asks=[(0.41, 10)]), 0.01, join=True) is None
+
+
+@pytest.mark.asyncio
+async def test_a_book_that_just_moved_gets_no_resting_bid(tmp_path, monkeypatch):
+    g, client, _, _ = _maker_guard(tmp_path, monkeypatch)
+
+    class _Pushed:
+        tokens: set = set()
+
+        def since_move(self, token):
+            return 5.0 if token == "by" else None
+    g._ws = _Pushed()
+    await g.poll_once()
+    assert client.maker_orders == []
+    assert "book_moving" in g.stop_summary()
+    g._ws.since_move = lambda token: 45.0              # quiet for longer than the window
+    await g.poll_once()
+    assert len(client.maker_orders) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_losing_one_leg_fill_blocks_the_pair_and_its_token(tmp_path, monkeypatch):
+    """The 5-year Treasury pair was rested three times in 45 minutes, each one
+    filled on NO alone and bought back from us a cent lower."""
+    g, client, _, _ = _maker_guard(tmp_path, monkeypatch, maker_ttl_s=0.0)
+    await g.poll_once()
+    client.fills = {"m1": 5.43}                        # NO alone
+    client.books["by"] = _book(asks=[(0.62, 50)], bids=[(0.50, 50)])
+    await g.poll_once()                                # sold back at 0.40, bought at 0.41
+    assert client.sells == [("nn", 5.43)]
+    now = cg.time.time()
+    assert g._maker_block[_imp().key] > now and g._maker_block["nn"] > now
+    books = dict(MAKER)
+    stop, _ = await g._maker_attempt(_imp(), books["nn"], books["by"], now + 3600,
+                                     "edge_below_min", None)
+    assert stop == "maker_cooldown"
+    n = len(client.maker_orders)
+    await g._maker_attempt(_imp(), books["nn"], books["by"],
+                           now + cg.CROSS_HALF_FILL_COOLDOWN_S + 1, "edge_below_min", None)
+    assert len(client.maker_orders) == n + 2           # rested again once the block ran out
+
+
+@pytest.mark.asyncio
+async def test_a_one_leg_fill_sold_back_at_a_profit_blocks_nothing(tmp_path, monkeypatch):
+    g, client, _, _ = _maker_guard(tmp_path, monkeypatch, maker_ttl_s=0.0)
+    await g.poll_once()
+    client.fills = {"m1": 5.43}
+    client.books["nn"] = _book(asks=[(0.45, 50)], bids=[(0.44, 50)])  # NO rose under us
+    client.books["by"] = _book(asks=[(0.62, 50)], bids=[(0.50, 50)])
+    await g.poll_once()
+    assert client.sells == [("nn", 5.43)] and g._maker_block == {}

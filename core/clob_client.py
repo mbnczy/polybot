@@ -1314,16 +1314,18 @@ class PolyClient:
         )
 
     def _create_market(self, *, token_id: str, side: str, shares: float,
-                       price: float | None) -> Any:
+                       price: float | None, order_type: str = "FOK") -> Any:
         """
-        Sign an FOK market order for `shares`.
+        Sign a market order for `shares`: FOK (all or nothing) by default, or
+        FAK (take what is there, cancel the rest).
 
         `price` acts as the marketable limit: max price for BUY, min price
         for SELL.  None → let the SDK derive it from the live book.
         """
         side = side.upper()
         kwargs: dict[str, Any] = {
-            "token_id": token_id, "side": side, "order_type": "FOK",
+            "token_id": token_id, "side": side,
+            "order_type": "FAK" if str(order_type).upper() == "FAK" else "FOK",
         }
 
         # The two sides take DIFFERENT quantity parameters. From the SDK:
@@ -1624,10 +1626,11 @@ class PolyClient:
         side:        str,
         price:       float,
         size:        float,
-        _order_type: str = "FOK",   # retained for API compatibility; FOK only
+        _order_type: str = "FOK",
     ) -> dict:
         """
-        Build, sign, and submit a single-leg FOK market order.
+        Build, sign, and submit a single-leg market order: FOK by default, FAK
+        when `_order_type` says so (fills what the book holds, cancels the rest).
 
         Paper mode: logs intent and returns a mock response — no network call.
         """
@@ -1649,13 +1652,13 @@ class PolyClient:
 
         signed_order = await self._run_with_retry(
             self._create_market,
-            token_id=token_id, side=side, shares=size, price=price,
+            token_id=token_id, side=side, shares=size, price=price, order_type=_order_type,
         )
         # Single-shot: market FOK orders are not idempotent (retry → duplicate).
         response = await self._post_once(signed_order)
         logger.info(
-            "Order submitted | side=%s token=%s price=%.4f size=%.2f → %s",
-            side, token_id[:12], price, size, response,
+            "Order submitted | %s side=%s token=%s price=%.4f size=%.2f → %s",
+            _order_type, side, token_id[:12], price, size, response,
         )
         return response
 

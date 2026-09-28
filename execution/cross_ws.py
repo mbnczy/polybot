@@ -61,21 +61,35 @@ class WatchPair:
 
 
 class _Top:
-    """Best bid and ask of one token, from snapshots and deltas."""
-    __slots__ = ("bids", "asks", "bid", "ask")
+    """Best bid and ask of one token, from snapshots and deltas, and when they
+    last moved (monotonic; None until a move has been seen)."""
+    __slots__ = ("bids", "asks", "bid", "ask", "moved")
 
     def __init__(self) -> None:
         self.bids: dict[float, float] = {}
         self.asks: dict[float, float] = {}
         self.bid: "float | None" = None
         self.ask: "float | None" = None
+        self.moved: "float | None" = None
+
+    def _mark(self, before: tuple) -> None:
+        # The first snapshot sets the top; it is not a move anyone saw.
+        if before != (None, None) and (self.bid, self.ask) != before:
+            self.moved = time.monotonic()
 
     def load(self, bids, asks) -> None:
+        before = (self.bid, self.ask)
         self.bids, self.asks = _levels(bids), _levels(asks)
         self.bid = max(self.bids) if self.bids else None
         self.ask = min(self.asks) if self.asks else None
+        self._mark(before)
 
     def change(self, side: str, price, size, best_bid, best_ask) -> None:
+        before = (self.bid, self.ask)
+        self._change(side, price, size, best_bid, best_ask)
+        self._mark(before)
+
+    def _change(self, side: str, price, size, best_bid, best_ask) -> None:
         try:
             p, s = float(price), float(size)
         except (TypeError, ValueError):
@@ -167,6 +181,14 @@ class CrossBookWatch:
 
     def _tracked(self, token: str) -> bool:
         return token in self._by_token or token in self._subscribed
+
+    def since_move(self, token: str) -> "float | None":
+        """Seconds since this token's best bid or ask last moved; None when the
+        socket has not seen it move (not watched, or quiet since subscribing)."""
+        top = self._tops.get(token)
+        if top is None or top.moved is None:
+            return None
+        return time.monotonic() - top.moved
 
     # ── events ───────────────────────────────────────────────────────────────
 
