@@ -649,6 +649,19 @@ async def test_a_losing_one_leg_fill_blocks_the_pair_and_its_token(tmp_path, mon
     assert len(client.maker_orders) == n + 2           # rested again once the block ran out
 
 
+def test_a_deep_pair_is_not_rested_in():
+    """13 of 14 one-leg fills to 2026-09-28 were a leg bid at 0.01-0.02."""
+    deep = {"nn": _book(asks=[(0.96, 50)], bids=[(0.94, 50)]),
+            "by": _book(asks=[(0.03, 50)], bids=[(0.01, 50)])}
+    opp, why = evaluate_maker(_imp(), deep["nn"], deep["by"], now=NOW, min_edge=0.01)
+    assert opp is None and cg.stop_key(why) == "maker_deep"
+    opp, why = evaluate_maker(_imp(), deep["nn"], deep["by"], now=NOW, min_edge=0.01,
+                              min_price=0.0)
+    assert why == "ok"                                 # 0 switches the band off
+    opp, why = evaluate_maker(_imp(), MAKER["nn"], MAKER["by"], now=NOW)
+    assert why == "ok"                                 # 0.41 and 0.51 are well inside
+
+
 @pytest.mark.asyncio
 async def test_a_one_leg_fill_sold_back_at_a_profit_blocks_nothing(tmp_path, monkeypatch):
     g, client, _, _ = _maker_guard(tmp_path, monkeypatch, maker_ttl_s=0.0)
@@ -658,3 +671,91 @@ async def test_a_one_leg_fill_sold_back_at_a_profit_blocks_nothing(tmp_path, mon
     client.books["by"] = _book(asks=[(0.62, 50)], bids=[(0.50, 50)])
     await g.poll_once()
     assert client.sells == [("nn", 5.43)] and g._maker_block == {}
+
+
+# ── what a sell-back leaves behind ────────────────────────────────────────────
+# 2026-09-28 14:17: the bid took 0.24 of 5.23 Over 7.5 shares; the other 4.99
+# stayed in the wallet and nothing offered them again.
+
+async def _half_filled_and_partly_sold(tmp_path, monkeypatch, cap):
+    g, client, breaker, notifier = _maker_guard(tmp_path, monkeypatch, maker_ttl_s=0.0)
+    await g.poll_once()
+    client.fills = {"m1": 5.43}                        # NO alone
+    client.books["by"] = _book(asks=[(0.62, 50)], bids=[(0.50, 50)])   # no completion
+    client.sell_cap["nn"] = cap
+    await g.poll_once()
+    return g, client, breaker, notifier
+
+
+@pytest.mark.asyncio
+async def test_a_part_sold_back_leaves_the_rest_on_offer(tmp_path, monkeypatch):
+    g, client, breaker, _ = await _half_filled_and_partly_sold(tmp_path, monkeypatch, 0.24)
+    assert client.sells == [("nn", 5.43)]
+    (lo,) = g._leftovers
+    assert (lo.token, lo.shares) == ("nn", 5.19)
+    saved = json.loads((tmp_path / "positions_leftovers.json").read_text())
+    assert saved[0]["shares"] == 5.19
+    now = cg.time.time()
+    client.sell_cap.clear()
+    client.balances["nn"] = 5.19
+    await g._retry_leftovers(now + 1)                  # not due yet
+    assert len(client.sells) == 1
+    await g._retry_leftovers(now + cg.CROSS_LEFTOVER_RETRY_S + 1)
+    assert client.sells[-1] == ("nn", 5.19)
+    assert g._leftovers == []
+    assert json.loads((tmp_path / "positions_leftovers.json").read_text()) == []
+
+
+@pytest.mark.asyncio
+async def test_a_leg_the_bid_would_not_take_at_all_is_offered_again(tmp_path, monkeypatch):
+    """Malta vs. Liechtenstein, 2026-09-26: "No resting liquidity", then forgotten."""
+    g, client, _, notifier = _maker_guard(tmp_path, monkeypatch, maker_ttl_s=0.0)
+    await g.poll_once()
+    client.fills = {"m1": 5.43}
+    client.books["by"] = _book(asks=[(0.62, 50)], bids=[(0.50, 50)])
+    client.sell_fail.add("nn")
+    await g.poll_once()
+    assert [(lo.token, lo.shares) for lo in g._leftovers] == [("nn", 5.43)]
+    assert any("Offered again" in m for m in notifier.messages)
+    client.sell_fail.clear()
+    client.balances["nn"] = 5.43
+    await g._retry_leftovers(cg.time.time() + cg.CROSS_LEFTOVER_RETRY_S + 1)
+    assert g._leftovers == []
+
+
+@pytest.mark.asyncio
+async def test_a_remainder_still_held_after_ten_minutes_raises_one_alert(tmp_path, monkeypatch):
+    g, client, _, notifier = await _half_filled_and_partly_sold(tmp_path, monkeypatch, 0.24)
+    client.sell_cap["nn"] = 0.0                        # the bid is gone for good
+    client.balances["nn"] = 5.19
+    now = cg.time.time()
+    for k in range(1, 30):
+        await g._retry_leftovers(now + k * cg.CROSS_LEFTOVER_RETRY_S)
+    alerts = [m for m in notifier.messages if "still held" in m]
+    assert len(alerts) == 1 and g._leftovers[0].shares == 5.19
+
+
+@pytest.mark.asyncio
+async def test_a_remainder_the_wallet_no_longer_holds_is_closed(tmp_path, monkeypatch):
+    g, client, _, _ = await _half_filled_and_partly_sold(tmp_path, monkeypatch, 0.24)
+    client.balances["nn"] = 0.0                        # redeemed, or sold by hand
+    await g._retry_leftovers(cg.time.time() + cg.CROSS_LEFTOVER_RETRY_S + 1)
+    assert g._leftovers == [] and len(client.sells) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_remainder_is_given_up_once_its_market_has_ended(tmp_path, monkeypatch):
+    g, client, _, _ = await _half_filled_and_partly_sold(tmp_path, monkeypatch, 0.24)
+    client.balances["nn"] = 5.19
+    await g._retry_leftovers(_imp().resolves_ts + 1)
+    assert g._leftovers == [] and len(client.sells) == 1
+
+
+@pytest.mark.asyncio
+async def test_remainders_survive_a_restart(tmp_path, monkeypatch):
+    g, client, breaker, notifier = await _half_filled_and_partly_sold(tmp_path, monkeypatch, 0.24)
+    g2 = cg.CrossGuard(client, breaker, notifier,
+                       implications_path=str(tmp_path / "imps.json"),
+                       positions_path=str(tmp_path / "positions.json"), enabled=True)
+    g2.restore()
+    assert [(lo.token, lo.shares) for lo in g2._leftovers] == [("nn", 5.19)]

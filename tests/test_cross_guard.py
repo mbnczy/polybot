@@ -64,6 +64,7 @@ class _Client:
         self.buy_fail: set[str] = set()
         self.sell_fail: set[str] = set()
         self.partial: dict[str, float] = {}         # token → shares an FAK buy gets
+        self.sell_cap: dict[str, float] = {}        # token → shares a sell-back places
         self.order_types: list[str] = []
 
     async def get_orderbook(self, token):
@@ -82,7 +83,8 @@ class _Client:
         if token_id in self.sell_fail:
             return {"status": "unmatched"}
         bid = best_level(self.books[token_id], "bids").price
-        return {"status": "matched", "making_amount": size, "taking_amount": size * bid}
+        sold = min(size, self.sell_cap.get(token_id, size))   # what the bid took
+        return {"status": "matched", "making_amount": sold, "taking_amount": sold * bid}
 
 
 class _Notifier:

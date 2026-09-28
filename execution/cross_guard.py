@@ -189,6 +189,15 @@ CROSS_MAKER_JOIN: bool = _flag("CROSS_MAKER_JOIN", "true")
 # books show it. A top that just moved is a market being repriced, and a bid
 # placed into it is the one that gets hit. 0 turns the check off.
 CROSS_MAKER_QUIET_S: float = float(os.environ.get("CROSS_MAKER_QUIET_S", 30.0))
+# Both resting bids must sit inside [this, 1 - this]. Of the 14 one-leg fills
+# from going live to 2026-09-28, 13 were a leg bid at 0.01-0.02 — Over 7.5 goals,
+# a -2.5 spread, a far silver strike — dumped on us while its 0.95+ partner never
+# filled, and completing at that partner's ask never paid. 0 turns it off.
+CROSS_MAKER_MIN_PRICE: float = float(os.environ.get("CROSS_MAKER_MIN_PRICE", 0.05))
+# A leg sold back only in part (the bid held too little) is offered again this
+# often until it is gone, and an alert goes out once it has been held this long.
+CROSS_LEFTOVER_RETRY_S: float = float(os.environ.get("CROSS_LEFTOVER_RETRY_S", 30.0))
+CROSS_LEFTOVER_ALERT_S: float = float(os.environ.get("CROSS_LEFTOVER_ALERT_S", 600.0))
 CROSS_MAKER_MIN_EDGE: float = float(os.environ.get("CROSS_MAKER_MIN_EDGE", CROSS_MIN_EDGE))
 # A bid a tick above an almost empty book is not an offer anyone will take: on
 # 2026-09-17 that produced "+0.96 edge" pairs whose books stood at 0.01 / 0.50.
@@ -449,6 +458,7 @@ def quoted_entry(
 # its key, so a reworded reason cannot silently fall through to "other".
 _STOP_KEYS: tuple[tuple[str, str], ...] = (
     ("too wide a book to rest in", "book_too_wide"),
+    ("outside the resting band", "maker_deep"),
     ("a one-sided book to rest in", "one_sided_book"),
     ("at our own bids", "maker_edge_below_min"),
     ("nothing to rest above", "no_bid"),
@@ -509,6 +519,27 @@ def maker_price(book: dict, tick: float, join: bool = False) -> "float | None":
     if ask is not None and price >= ask.price - 1e-9:
         price = round(bid.price, 4)
     return price if 0.0 < price < 1.0 else None
+
+
+@dataclass
+class Leftover:
+    """Shares of a naked leg a sell-back could not place in full — still held,
+    still offered every CROSS_LEFTOVER_RETRY_S until they are gone. On
+    2026-09-28 the bid took 0.24 of 5.23 and the other 4.99 were forgotten."""
+    token:     str
+    shares:    float
+    cost:      float                 # paid per share, for the P&L of what sells later
+    rate:      "float | None"
+    title:     str
+    since:     float
+    until:     float                 # given up after this: the market has ended
+    next_try:  float = 0.0
+    alerted:   bool = False
+
+    def as_dict(self) -> dict:
+        return {k: getattr(self, k) for k in (
+            "token", "shares", "cost", "rate", "title", "since", "until", "next_try",
+            "alerted")}
 
 
 @dataclass
@@ -585,6 +616,7 @@ def evaluate_maker(
     yes_no_only: bool = CROSS_YES_NO_ONLY,
     max_spread: float = CROSS_MAKER_MAX_SPREAD,
     join: bool = False,
+    min_price: float = CROSS_MAKER_MIN_PRICE,
 ) -> "tuple[MakerOpportunity | None, str]":
     """The same gates as a taker entry, priced at the bids we would rest."""
     gate = _entry_gates(imp, now, max_lockup_days, min_time_to_end_s, yes_no_only)
@@ -605,6 +637,10 @@ def evaluate_maker(
     if quote is None:
         return None, "a leg has no bid — nothing to rest above"
     no_price, yes_price, entry = quote
+    for price, leg in ((no_price, "NO on narrow"), (yes_price, "YES on broad")):
+        if min_price > 0.0 and not min_price - 1e-9 <= price <= 1.0 - min_price + 1e-9:
+            return None, (f"{leg} would rest at {price:.3f}, outside the resting band "
+                          f"[{min_price:.2f}, {1.0 - min_price:.2f}]")
     if 1.0 - entry < min_edge:
         return None, (f"maker edge {1.0 - entry:+.4f} < {min_edge:.4f} at our own bids")
     shares = math.floor(max_usdc / entry * 100.0) / 100.0 if entry > 0 else 0.0
@@ -773,6 +809,10 @@ class CrossGuard:
         self._paper_path = Path(positions_path or CROSS_POSITIONS_PATH).with_name(
             Path(positions_path or CROSS_POSITIONS_PATH).stem + "_paper_rests.jsonl")
         self._orphans: list[MakerAttempt] = []
+        # What sell-backs left behind, kept across restarts: the shares are still held.
+        self._leftovers_path = Path(positions_path or CROSS_POSITIONS_PATH).with_name(
+            Path(positions_path or CROSS_POSITIONS_PATH).stem + "_leftovers.json")
+        self._leftovers: list[Leftover] = []
         self._last_stop: dict[tuple[str, str], str] = {}
         self._last_edge: dict[tuple[str, str], "float | None"] = {}
         # When each pair's books were last read, and when this guard first looked
@@ -844,7 +884,27 @@ class CrossGuard:
             logger.warning("CrossGuard | %d maker order pair(s) left resting by the "
                            "previous process — cancelling on the first poll",
                            len(self._orphans))
+        try:
+            raw = json.loads(self._leftovers_path.read_text())
+        except (OSError, ValueError):
+            raw = []
+        for row in raw if isinstance(raw, list) else []:
+            try:
+                self._leftovers.append(Leftover(**row))
+            except TypeError:
+                continue
+        if self._leftovers:
+            logger.warning("CrossGuard | %d leg remainder(s) from before the restart are "
+                           "still for sale", len(self._leftovers))
         return n
+
+    def _save_leftovers(self) -> None:
+        try:
+            tmp = self._leftovers_path.with_suffix(self._leftovers_path.suffix + ".tmp")
+            tmp.write_text(json.dumps([lo.as_dict() for lo in self._leftovers]))
+            tmp.replace(self._leftovers_path)
+        except OSError as exc:
+            logger.warning("CrossGuard | cannot write %s: %s", self._leftovers_path, exc)
 
     def _save_attempts(self) -> None:
         try:
@@ -1037,6 +1097,7 @@ class CrossGuard:
         now = time.time()
         await self._cancel_orphans()
         await self._watch_maker(now)
+        await self._retry_leftovers(now)
         await self._watch_open(now)
         await self._scan_entries(now)
 
@@ -1308,7 +1369,9 @@ class CrossGuard:
                     return
         self.stats["half_filled"] += 1
         pnl = await self._sell(held_token, excess, held_paid,
-                               await self._rate(a.narrow if no_rich else a.broad))
+                               await self._rate(a.narrow if no_rich else a.broad),
+                               remember=("NO " + a.narrow_title if no_rich
+                                         else "YES " + a.broad_title, a.resolves_ts))
         if pnl is None or pnl < 0.0:
             # Whoever filled us there is likely to do it again: rest elsewhere.
             until = now + CROSS_HALF_FILL_COOLDOWN_S
@@ -1319,7 +1382,8 @@ class CrossGuard:
             await self._say(
                 f"🚨 CROSS MAKER HALF-FILL STUCK — {excess:.2f} shares of "
                 f"{'NO ' + a.narrow_title[:50] if no_rich else 'YES ' + a.broad_title[:50]} "
-                f"filled alone and could not be sold back. Manual decision needed.")
+                f"filled alone and the bid would not take them. Offered again every "
+                f"{CROSS_LEFTOVER_RETRY_S:.0f}s.")
             return
         self._breaker.book_pnl(pnl)
         await self._say(
@@ -1768,25 +1832,94 @@ class CrossGuard:
         return got
 
     async def _sell(self, token: str, shares: float, cost_per_share: float,
-                    rate: "float | None" = None) -> "float | None":
-        """Sell at the bid. Returns realised P&L after the taker fee, or None
-        when it did not fill. `rate` is the market's taker rate."""
+                    rate: "float | None" = None,
+                    remember: "tuple[str, float | None] | None" = None) -> "float | None":
+        """
+        Sell at the bid. Returns realised P&L after the taker fee on what sold,
+        or None when nothing did. `rate` is the market's taker rate.
+
+        With `remember` — (what the leg is, when its market ends) — whatever of
+        `shares` the bid did not take is kept as a Leftover and offered again
+        until it is gone, rather than left in the wallet unwatched.
+        """
+        pnl, sold = await self._sell_detail(token, shares, cost_per_share, rate)
+        rest = math.floor((shares - sold) * 100.0 + 1e-6) / 100.0
+        if remember is not None and rest >= 0.01:
+            what, ends = remember
+            now = time.time()
+            self._leftovers.append(Leftover(
+                token=token, shares=rest, cost=cost_per_share, rate=rate, title=what,
+                since=now, until=ends if ends else now + 86_400.0,
+                next_try=now + CROSS_LEFTOVER_RETRY_S))
+            self._save_leftovers()
+            logger.warning("CrossGuard | %.2f of %.2f shares of %s left unsold — offered "
+                           "again every %.0fs", rest, shares, what[:48], CROSS_LEFTOVER_RETRY_S)
+        return pnl
+
+    async def _sell_detail(self, token: str, shares: float, cost_per_share: float,
+                           rate: "float | None" = None) -> "tuple[float | None, float]":
+        """Sell at the bid: (realised P&L after the fee, shares sold), (None, 0) if none."""
         try:
             resp = await self._client.unwind_leg(token, shares)
         except Exception as exc:  # noqa: BLE001
             logger.error("CrossGuard | sell failed on %s: %s", token[:12], exc)
-            return None
+            return None, 0.0
         status = str((resp or {}).get("status", "")).strip().lower()
         if status not in _FILLED_STATUSES:
             logger.error("CrossGuard | sell not filled on %s: %s", token[:12], status or resp)
-            return None
+            return None, 0.0
         # On a SELL the taker gives shares (making) and gets collateral (taking).
         proceeds = float(resp.get("taking_amount") or 0.0)
-        sold = float(resp.get("making_amount") or shares)
+        # Missing means the response did not say, and the whole order is assumed;
+        # a stated 0 is a sale of nothing, not of everything.
+        made = resp.get("making_amount")
+        sold = min(shares, shares if made in (None, "") else float(made))
         # taking_amount is what the book paid, before the fee the wallet pays.
         if sold > 0.0 and proceeds > 0.0:
             proceeds -= sold * taker_fee_per_share(proceeds / sold, rate)
-        return round(proceeds - sold * cost_per_share, 6)
+        return round(proceeds - sold * cost_per_share, 6), sold
+
+    async def _retry_leftovers(self, now: float) -> None:
+        """Offer again what sell-backs left behind (Leftover), until it is gone."""
+        if not self._leftovers:
+            return
+        changed = False
+        for lo in list(self._leftovers):
+            if now >= lo.until:
+                self._leftovers.remove(lo)
+                changed = True
+                logger.warning("CrossGuard | giving up on %.2f unsold shares of %s: its "
+                               "market has ended", lo.shares, lo.title[:48])
+                continue
+            if lo.next_try > now:
+                continue
+            lo.next_try = now + CROSS_LEFTOVER_RETRY_S
+            changed = True
+            held = await self._balance(lo.token)
+            if held is not None and held < 0.01:
+                self._leftovers.remove(lo)
+                logger.info("CrossGuard | the wallet holds none of %s any more — "
+                            "remainder closed", lo.title[:48])
+                continue
+            shares = lo.shares if held is None else min(lo.shares,
+                                                        math.floor(held * 100.0) / 100.0)
+            pnl, sold = await self._sell_detail(lo.token, shares, lo.cost, lo.rate)
+            if pnl is not None and sold > 0.0:
+                self._breaker.book_pnl(pnl)
+                lo.shares = round(lo.shares - sold, 2)
+                logger.info("CrossGuard | sold %.2f more of %s (%+.4f USDC), %.2f left",
+                            sold, lo.title[:48], pnl, lo.shares)
+            if lo.shares < 0.01:
+                self._leftovers.remove(lo)
+                continue
+            if not lo.alerted and now - lo.since >= CROSS_LEFTOVER_ALERT_S:
+                lo.alerted = True
+                await self._say(
+                    f"⚠️ CROSS — {lo.shares:.2f} shares of {lo.title[:56]} still held "
+                    f"{(now - lo.since) / 60:.0f} min after a sell-back: the bid will not "
+                    f"take them. Offered again every {CROSS_LEFTOVER_RETRY_S:.0f}s.")
+        if changed:
+            self._save_leftovers()
 
     async def _enter(self, opp: Opportunity, now: float) -> None:
         imp, key = opp.imp, opp.imp.key
@@ -1821,7 +1954,9 @@ class CrossGuard:
             self.stats["half_filled"] += 1
             self._cooldown[key] = now + CROSS_ENTRY_COOLDOWN_S
             pnl = await self._sell(t1, got1, c1, opp.rate_narrow
-                                   if t1 == imp.narrow_no_token else opp.rate_broad)
+                                   if t1 == imp.narrow_no_token else opp.rate_broad,
+                                   remember=(f"{l1} {imp.narrow_title if t1 == imp.narrow_no_token else imp.broad_title}",
+                                             imp.resolves_ts))
             if pnl is None:
                 self.stats["stuck"] += 1
                 self._stuck.add(key)
