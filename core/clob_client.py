@@ -69,6 +69,7 @@ Environment variables
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import math
@@ -704,6 +705,38 @@ def _is_untracked_order(exc: Exception) -> bool:
     return bool(rows) and all(r.get("input", "sentinel") is None for r in rows)
 
 
+# How long a token the bot traded stays "recently traded" in the ledger below.
+_TOUCH_KEEP_S: float = 3_600.0
+
+
+def _trades_tokens(tokens_of):
+    """
+    Record the tokens an order method trades, and the order ids it gets back.
+
+    The wallet reconciler checks inventory against what the bot believes is
+    open. A position that opens and closes between two of its reads, or whose
+    last trade reaches the data API after the close, moved inventory while
+    "nothing was open" — three false alarms on 2026-09-23, all of them the
+    bot's own guarded orders. Knowing which tokens the bot itself touched, and
+    when, lets it tell those apart from an order nobody is watching.
+    """
+    def deco(fn):
+        sig = inspect.signature(fn)
+
+        @wraps(fn)
+        async def inner(self, *args, **kwargs):
+            bound = sig.bind(self, *args, **kwargs)
+            bound.apply_defaults()
+            tokens = [str(t) for t in tokens_of(bound.arguments) if t]
+            self._touch(*tokens)
+            resp = await fn(self, *args, **kwargs)
+            self._remember_orders(tokens, resp)
+            self._touch(*tokens)
+            return resp
+        return inner
+    return deco
+
+
 class PolyClient:
     """
     Async-friendly Polymarket CLOB client.
@@ -714,6 +747,52 @@ class PolyClient:
     All public methods are coroutines.  Blocking SDK calls are dispatched to a
     thread-pool executor so the event loop is never stalled.
     """
+
+    # ── which tokens the bot itself traded (see _trades_tokens) ───────────────
+    # Kept on the instance through __dict__.setdefault so that a client built
+    # without __init__ (tests, tools) still records instead of raising.
+
+    def _touch(self, *tokens: str) -> None:
+        touched = self.__dict__.setdefault("_touched", {})
+        now = time.time()
+        for t in tokens:
+            if t:
+                touched[str(t)] = now
+        if len(touched) > 2_000:
+            cut = now - _TOUCH_KEEP_S
+            for t in [t for t, at in touched.items() if at < cut]:
+                del touched[t]
+
+    def _remember_orders(self, tokens: "list[str]", resp: Any) -> None:
+        """Map each returned order id to its token, so a later status check or
+        cancel on that order counts as touching the token."""
+        if isinstance(resp, dict):
+            resps = [resp]
+        elif isinstance(resp, (list, tuple)):
+            resps = list(resp)
+        else:
+            return
+        owner = self.__dict__.setdefault("_order_token", {})
+        for i, r in enumerate(resps):
+            if not isinstance(r, dict):
+                continue
+            oid = r.get("order_id") or r.get("orderID")
+            tok = tokens[i] if len(tokens) == len(resps) else (
+                tokens[0] if len(tokens) == 1 else None)
+            if oid and tok:
+                owner[str(oid)] = tok
+        if len(owner) > 5_000:
+            for k in list(owner)[:len(owner) - 5_000]:
+                del owner[k]
+
+    def _touch_order(self, order_id: "str | None", token_id: "str | None" = None) -> None:
+        tok = token_id or self.__dict__.get("_order_token", {}).get(str(order_id))
+        if tok:
+            self._touch(tok)
+
+    def traded_since(self, ts: float) -> "set[str]":
+        """Tokens the bot posted, polled, cancelled or sold at or after `ts`."""
+        return {t for t, at in self.__dict__.get("_touched", {}).items() if at >= ts}
 
     def __init__(self) -> None:
         pk     = os.environ["POLY_PRIVATE_KEY"]
@@ -859,7 +938,7 @@ class PolyClient:
         return held
 
     async def order_filled_size(
-        self, order_id: str, token_id: "str | None" = None
+        self, order_id: str, token_id: "str | None" = None, market: "str | None" = None,
     ) -> "float | None":
         """
         How much of ONE order actually filled, attributed by order id.
@@ -880,7 +959,15 @@ class PolyClient:
 
         Returns None if the feed cannot be read, so callers keep whatever
         conservative fallback they had rather than treating "unknown" as zero.
+
+        Pass `market` (the condition id) where it is known. A resting BUY of one
+        token can be matched against a taker buying the other — the exchange
+        mints the pair — and that trade is filed under the taker's token, so a
+        filter on our own token cannot see it. That is the likeliest reading of
+        four cross maker fills this lookup reported as zero on 2026-09-24; the
+        market filter holds both tokens either way.
         """
+        self._touch_order(order_id, token_id)
         if _PAPER_TRADE:
             return None
 
@@ -890,7 +977,8 @@ class PolyClient:
 
         def _read() -> float:
             total = 0.0
-            kwargs = {"token_id": str(token_id)} if token_id else {}
+            kwargs = ({"market": str(market)} if market
+                      else {"token_id": str(token_id)} if token_id else {})
             pages  = self._client.list_account_trades(**kwargs)
             seen   = 0
             for page in pages:
@@ -1093,6 +1181,7 @@ class PolyClient:
                 out.append({
                     "title":     str(r.get("title") or "")[:80],
                     "outcome":   str(r.get("outcome") or ""),
+                    "asset":     str(r.get("asset") or ""),
                     "size":      float(r.get("size") or 0.0),
                     "avg_price": float(r.get("avgPrice") or 0.0),
                     "cur_price": float(r.get("curPrice") or 0.0),
@@ -1225,16 +1314,18 @@ class PolyClient:
         )
 
     def _create_market(self, *, token_id: str, side: str, shares: float,
-                       price: float | None) -> Any:
+                       price: float | None, order_type: str = "FOK") -> Any:
         """
-        Sign an FOK market order for `shares`.
+        Sign a market order for `shares`: FOK (all or nothing) by default, or
+        FAK (take what is there, cancel the rest).
 
         `price` acts as the marketable limit: max price for BUY, min price
         for SELL.  None → let the SDK derive it from the live book.
         """
         side = side.upper()
         kwargs: dict[str, Any] = {
-            "token_id": token_id, "side": side, "order_type": "FOK",
+            "token_id": token_id, "side": side,
+            "order_type": "FAK" if str(order_type).upper() == "FAK" else "FOK",
         }
 
         # The two sides take DIFFERENT quantity parameters. From the SDK:
@@ -1415,12 +1506,34 @@ class PolyClient:
         )
         return _normalise_book(book)
 
+    async def get_orderbooks(self, token_ids: "list[str]", chunk: int = 100) -> "dict[str, dict]":
+        """
+        Many books at once (POST /books), keyed by token id, `chunk` tokens a
+        request. A token the exchange has no book for is absent from the result
+        rather than failing the request — measured live on 2026-09-18 — so a
+        missing key means "no book", the same answer a single read raises.
+        """
+        ids = list(dict.fromkeys(str(t) for t in token_ids))   # pairs share markets
+        out: dict[str, dict] = {}
+        for i in range(0, len(ids), chunk):
+            part = ids[i:i + chunk]
+            books = await self._run_with_retry(
+                lambda part=part: self._client.get_order_books(token_ids=part)
+            )
+            for book in books or ():
+                tid = (book.get("token_id") or book.get("asset_id")
+                       if isinstance(book, dict) else getattr(book, "token_id", None))
+                if tid is not None:
+                    out[str(tid)] = _normalise_book(book)
+        return out
+
     # ──────────────────────────────────────────────────────────────────────────
     # Public async API — order management
     # ──────────────────────────────────────────────────────────────────────────
 
     async def cancel_order(self, order_id: str) -> dict:
         """Cancel an open order by ID."""
+        self._touch_order(order_id)
         resp = await self._run_with_retry(
             lambda: self._client.cancel_order(order_id=order_id)
         )
@@ -1466,6 +1579,8 @@ class PolyClient:
         Returns the order dict if found, or None if the order is no longer
         tracked (fully filled or cancelled / unknown to the CLOB).
         """
+        self._touch_order(order_id)
+
         def _fetch():
             try:
                 return self._client.get_order(order_id=order_id)
@@ -1504,16 +1619,18 @@ class PolyClient:
     # Public async API — single-leg taker order (FOK)
     # ──────────────────────────────────────────────────────────────────────────
 
+    @_trades_tokens(lambda a: [a.get("token_id")])
     async def post_order(
         self,
         token_id:    str,
         side:        str,
         price:       float,
         size:        float,
-        _order_type: str = "FOK",   # retained for API compatibility; FOK only
+        _order_type: str = "FOK",
     ) -> dict:
         """
-        Build, sign, and submit a single-leg FOK market order.
+        Build, sign, and submit a single-leg market order: FOK by default, FAK
+        when `_order_type` says so (fills what the book holds, cancels the rest).
 
         Paper mode: logs intent and returns a mock response — no network call.
         """
@@ -1535,13 +1652,13 @@ class PolyClient:
 
         signed_order = await self._run_with_retry(
             self._create_market,
-            token_id=token_id, side=side, shares=size, price=price,
+            token_id=token_id, side=side, shares=size, price=price, order_type=_order_type,
         )
         # Single-shot: market FOK orders are not idempotent (retry → duplicate).
         response = await self._post_once(signed_order)
         logger.info(
-            "Order submitted | side=%s token=%s price=%.4f size=%.2f → %s",
-            side, token_id[:12], price, size, response,
+            "Order submitted | %s side=%s token=%s price=%.4f size=%.2f → %s",
+            _order_type, side, token_id[:12], price, size, response,
         )
         return response
 
@@ -1549,6 +1666,7 @@ class PolyClient:
     # Public async API — synthetic post-only maker order (GTC limit)
     # ──────────────────────────────────────────────────────────────────────────
 
+    @_trades_tokens(lambda a: [a.get("token_id")])
     async def post_maker_order(
         self,
         token_id:      str,
@@ -1606,8 +1724,19 @@ class PolyClient:
                 else:
                     safe_price = desired_price
 
-            # Clamp to the valid CLOB price tick range [0.01, 0.99]
-            safe_price = round(max(0.01, min(safe_price, 0.99)), 3)
+            # The widest range any market has; each market's own tick grid is
+            # checked when the order is signed, and an off-grid price is refused
+            # there, never rounded. The old [0.01, 0.99] clamp moved prices
+            # itself: on 2026-09-23 a pair priced at 0.992 + 0.003 (+0.5%) on
+            # 0.001-tick books was posted at 0.99 + 0.01 — no edge at all.
+            safe_price = round(max(0.001, min(safe_price, 0.999)), 3)
+            # A maker order may improve on the price it was asked for, never
+            # worsen it: the caller priced its edge at desired_price.
+            if ((side_upper == "BUY" and safe_price > desired_price + 1e-9)
+                    or (side_upper == "SELL" and safe_price < desired_price - 1e-9)):
+                raise ValueError(
+                    f"maker {side_upper} at {desired_price:.4f} would have to post at "
+                    f"{safe_price:.4f} — refusing a worse price than was priced")
 
         if _PAPER_TRADE:
             logger.info(
@@ -1641,6 +1770,7 @@ class PolyClient:
     # Public async API — dual-leg taker arbitrage (FOK, zero leg risk)
     # ──────────────────────────────────────────────────────────────────────────
 
+    @_trades_tokens(lambda a: [a.get("yes_token_id"), a.get("no_token_id")])
     async def execute_arb_pair(
         self,
         yes_token_id: str,
@@ -1719,6 +1849,7 @@ class PolyClient:
         MATCH_ORDERS_TOTAL.inc()
         return yes_resp, no_resp
 
+    @_trades_tokens(lambda a: [a.get("token_id")])
     async def unwind_leg(
         self,
         token_id: str,
@@ -1890,6 +2021,7 @@ class PolyClient:
     # Public async API — dual-leg maker arbitrage (GTC limit, synthetic post-only)
     # ──────────────────────────────────────────────────────────────────────────
 
+    @_trades_tokens(lambda a: [a.get("yes_token_id"), a.get("no_token_id")])
     async def execute_arb_maker_pair(
         self,
         yes_token_id: str,
@@ -1965,6 +2097,7 @@ class PolyClient:
     # Public async API — N-leg NegRisk bundle via CLOB limit orders
     # ──────────────────────────────────────────────────────────────────────────
 
+    @_trades_tokens(lambda a: [getattr(leg, "token_id", None) for leg in a.get("legs") or []])
     async def execute_negrisk_clob_bundle(
         self,
         legs: list[BundleLeg],
@@ -2191,6 +2324,7 @@ class PolyClient:
     # Public async API — atomic on-chain arb via CTF Exchange V2 matchOrders
     # ──────────────────────────────────────────────────────────────────────────
 
+    @_trades_tokens(lambda a: [getattr(leg, "token_id", None) for leg in a.get("legs") or []])
     async def execute_arb_maker_bundle(
         self,
         legs:         list[BundleLeg],

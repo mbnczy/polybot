@@ -79,3 +79,30 @@ def test_inventory_is_tracking_lifecycle(patched_web3, fake_telegram):
     assert inv.is_tracking("0xabc") is True
     pos.status = "SETTLED"
     assert inv.is_tracking("0xabc") is False
+
+
+# ── order_filled_size by market ───────────────────────────────────────────────
+
+def test_a_market_lookup_finds_a_maker_fill_filed_under_the_other_token(monkeypatch):
+    """Our resting BUY of YES matched a taker buying NO: the exchange minted the
+    pair and filed the trade under the taker's token. A token filter on YES
+    cannot see it; the market filter holds both."""
+    import asyncio
+    from types import SimpleNamespace as NS
+    c = _bare_client()
+    c._touch_order = lambda *a, **k: None
+    asked = []
+    trade = NS(status="CONFIRMED", taker_order_id="0xtaker", size="5.25", asset_id="NO",
+               maker_orders=[NS(order_id="0xOURS", matched_amount="4.99"),
+                             NS(order_id="0xother", matched_amount="1.00")])
+
+    def list_account_trades(**kw):
+        asked.append(kw)
+        items = [trade] if kw.get("market") == "0xcond" or kw.get("token_id") == "NO" else []
+        return [NS(items=items)]
+    c._client = NS(list_account_trades=list_account_trades)
+    monkeypatch.setattr(cc, "_PAPER_TRADE", False)
+    by_token = asyncio.run(c.order_filled_size("0xours", "YES"))
+    by_market = asyncio.run(c.order_filled_size("0xours", "YES", market="0xcond"))
+    assert by_token == 0.0 and by_market == 4.99
+    assert asked == [{"token_id": "YES"}, {"market": "0xcond"}]

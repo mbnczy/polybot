@@ -67,7 +67,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from strategy.arbitrage import effective_taker_fee, maker_quote_is_hopeless
+from strategy.arbitrage import effective_taker_fee, maker_quote_is_hopeless, taker_sell_fee
 from telemetry import fill_log
 from telemetry.metrics import ARB_HALF_FILLS, ARB_UNWIND_FAILURES
 
@@ -346,6 +346,12 @@ class NegRiskBundleGuard:
         the real 0% every one of them was a profit."""
         self._fee = max(0.0, float(rate))
         logger.info("NegRiskGuard | taker fee set to %.4f", self._fee)
+
+    def _sell_fee(self, gross: float, sold: float) -> float:
+        """The taker fee on an unwind, at the rate a completion would be charged."""
+        if not self._fee_schedule:
+            return gross * self._fee
+        return taker_sell_fee(gross, sold, self._group_rate)
 
     def clear_strikes(self, condition_id: str) -> None:
         """A group that completed cleanly starts from zero again."""
@@ -873,8 +879,10 @@ class NegRiskBundleGuard:
                 status = str(resp.get("status", "")).strip().lower()
                 if status not in _FILLED_STATUSES:
                     raise RuntimeError(f"unwind not filled: {resp}")
-                proceeds = float(resp.get("taking_amount") or 0.0)
+                gross    = float(resp.get("taking_amount") or 0.0)
                 sold     = float(resp.get("making_amount") or size)
+                # taking_amount is before the fee; the wallet gets less.
+                proceeds = gross - self._sell_fee(gross, sold)
                 realised = proceeds - sold * leg.bid
                 logger.warning(
                     "NegRiskGuard | UNWOUND leg[%d] %.2f shares on %s — "

@@ -64,6 +64,55 @@ logger = logging.getLogger(__name__)
 
 _API_BASE = "https://api.telegram.org"
 
+# ── What goes out ─────────────────────────────────────────────────────────────
+# TELEGRAM_TRADES_ONLY: send only messages about a transaction that happened — a
+# position opened, a leg filled and sold back, an exit, a settlement. Signals,
+# resting orders, episodes in which nothing traded, the daily heartbeat and the
+# start-up line stay in the journal. Asked for on 2026-10-13, when the chat had
+# become a feed of arbitrage notices that never traded.
+# TELEGRAM_CRITICAL (on): under that policy the few alerts that need a person
+# still go out — a halt, a leg that cannot be sold, inventory nobody watches.
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    return default if not raw else raw in ("1", "true", "yes", "on")
+
+
+_TRADE_MARKERS: tuple[str, ...] = (
+    "ARB EXECUTED", "POSITION OPENED", "HALF-FILL", "Half-fill on", "EXITED EARLY",
+    "EXIT HALF-DONE", "POSITION RESOLVED", "PAIR GUARD RESIDUE", "CTF REDEEMED",
+    "SETTLED — mergePositions", "NEG RISK ARB |",
+)
+_CRITICAL_MARKERS: tuple[str, ...] = (
+    "CRITICAL ERROR", "MANUAL INTERVENTION", "Manual decision", "halted",
+    "UNWIND FAILED", "SETTLE FAILED", "REVERTED", "MERGE FAILED", "RECONCILE",
+    "felügyelet nélkül", "would not cancel", "still held", "still unsold",
+    "EXECUTION ERROR", "SUBMIT ERROR", "cancel_all_orders failed",
+)
+# An outcome line that says shares changed hands: a fill, a flatten, an unwind,
+# a realised result — and not "no fill" or "rested … with no fill".
+_TRADED_RE = re.compile(
+    r"(?<!no )\bfilled\b|half-fill|flatten|unwound|\bnaked\b|completed as taker|pnl=",
+    re.IGNORECASE,
+)
+
+
+def says_traded(text: str) -> bool:
+    """Whether an episode's outcome line reports a transaction that happened."""
+    return bool(_TRADED_RE.search(text or ""))
+
+
+def message_kind(text: str) -> str:
+    """ "trade", "critical" or "info": what a message is about, for the policy."""
+    text = text or ""
+    if any(m in text for m in _TRADE_MARKERS):
+        return "trade"
+    if "NegRisk bundle on" in text and says_traded(text):
+        return "trade"
+    if any(m in text for m in _CRITICAL_MARKERS):
+        return "critical"
+    return "info"
+
 
 def _scrub(text: object) -> str:
     """
@@ -135,6 +184,14 @@ class TelegramNotifier:
         self._chat_id: Optional[str] = os.environ.get("TELEGRAM_CHAT_ID",   "").strip() or None
         self._session: Optional[aiohttp.ClientSession] = None
         self._enabled  = bool(self._token and self._chat_id)
+        # See "What goes out" at the top of the module.
+        self._trades_only = _env_flag("TELEGRAM_TRADES_ONLY", False)
+        self._critical    = _env_flag("TELEGRAM_CRITICAL", True)
+        if self._trades_only:
+            logger.info(
+                "TelegramNotifier | only transactions that happened are sent%s",
+                " and critical alerts" if self._critical else "",
+            )
 
         # Callbacks — on_halt is set after construction to avoid circular refs
         self._on_status: Optional[Callable[[], dict]]           = on_status
@@ -226,14 +283,29 @@ class TelegramNotifier:
     # Core outbound send (aiohttp — no dependency on the Application lifecycle)
     # ──────────────────────────────────────────────────────────────────────────
 
-    async def notify(self, text: str, *, parse_mode: Optional[str] = None) -> bool:
+    def _allowed(self, text: str, kind: Optional[str]) -> bool:
+        """Whether the policy lets this message out (TELEGRAM_TRADES_ONLY)."""
+        if not self._trades_only:
+            return True
+        kind = kind or message_kind(text)
+        return kind == "trade" or (kind == "critical" and self._critical)
+
+    async def notify(self, text: str, *, parse_mode: Optional[str] = None,
+                     kind: Optional[str] = None) -> bool:
         """
         Send a message to the configured chat.
 
-        Returns True on success, False on any error (non-raising).
+        `kind` ("trade", "critical", "info") says what the message is about when
+        the caller knows; otherwise it is read off the text (message_kind).
+
+        Returns True on success, False on any error or when the policy holds the
+        message back (non-raising).
         """
         if not self._enabled:
             logger.debug("Telegram notify (noop): %s", text[:80])
+            return False
+        if not self._allowed(text, kind):
+            logger.debug("Telegram held back (no transaction): %s", text[:80])
             return False
 
         url     = f"{_API_BASE}/bot{self._token}/sendMessage"
@@ -362,7 +434,8 @@ class TelegramNotifier:
     # Fire-and-forget helpers (never block the trading loop)
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _fire(self, text: str, *, parse_mode: Optional[str] = None) -> None:
+    def _fire(self, text: str, *, parse_mode: Optional[str] = None,
+              kind: Optional[str] = None) -> None:
         """
         Schedule a background delivery task via asyncio.create_task().
 
@@ -372,8 +445,11 @@ class TelegramNotifier:
         if not self._enabled:
             logger.debug("Telegram fire (noop): %s", text[:80])
             return
+        if not self._allowed(text, kind):
+            logger.debug("Telegram held back (no transaction): %s", text[:80])
+            return
         asyncio.create_task(
-            self.notify(text, parse_mode=parse_mode),
+            self.notify(text, parse_mode=parse_mode, kind=kind),
             name="tg-deliver",
         )
 
@@ -611,12 +687,18 @@ class TelegramNotifier:
             outcome = "no execution attempted"
         else:
             outcome = "no signal"
+        # An episode is a transaction only if one of its outcomes traded: a
+        # signal that was skipped, or orders that rested and expired, is not.
+        traded = bool(ep) and any(
+            pnl is not None or says_traded(text) for text, pnl in ep["events"])
+        kind = "trade" if traded else "info"
         logger.info(
-            "ARB EPISODE sent | %s %s | %.2fs peak %.1f bps | signals %d | %s",
+            "ARB EPISODE %s | %s %s | %.2fs peak %.1f bps | signals %d | %s",
+            "sent" if self._allowed("", kind) else "kept off Telegram (nothing traded)",
             path, condition_id[:16], duration_s, peak_edge_bps,
             (ep or {}).get("detections", 0), str(outcome)[:160],
         )
-        self._fire("\n".join(lines), parse_mode="HTML")
+        self._fire("\n".join(lines), parse_mode="HTML", kind=kind)
 
     def send_arb_detected(
         self,

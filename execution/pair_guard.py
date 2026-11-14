@@ -64,6 +64,7 @@ from strategy.arbitrage import (
     DEFAULT_TAKER_FEE,
     DEFAULT_TICK_SIZE,
     quote_opens_new_level,
+    taker_sell_fee,
 )
 from telemetry import fill_log
 from telemetry.metrics import ARB_HALF_FILLS, ARB_UNWIND_FAILURES
@@ -370,6 +371,7 @@ class MakerPairGuard:
                 if str(resp.get("status", "")).strip().lower() in _FILLED_STATUSES:
                     sold = float(resp.get("making_amount") or 0.0)
                     proceeds = float(resp.get("taking_amount") or 0.0)
+                    proceeds -= taker_sell_fee(proceeds, sold)   # reported before the fee
             except Exception as exc:  # noqa: BLE001
                 logger.warning("PairGuard | residue unwind on %s failed: %s", cid[:16], exc)
             if sold > _SHARE_EPS:
@@ -780,10 +782,12 @@ class MakerPairGuard:
             status = str(resp.get("status", "")).strip().lower()
             if status not in _FILLED_STATUSES:
                 raise RuntimeError(f"unwind not filled: {resp}")
-            # Realised P&L = SELL proceeds − cost basis. taking_amount is the
-            # pUSD received; making_amount is the shares actually sold.
+            # Realised P&L = SELL proceeds − cost basis. taking_amount is what
+            # the book paid, before the taker fee; making_amount is the shares
+            # actually sold.
             proceeds  = float(resp.get("taking_amount") or 0.0)
             sold      = float(resp.get("making_amount") or excess)
+            proceeds -= taker_sell_fee(proceeds, sold)
             realised  = round(proceeds - sold * rich.bid, 6)
             logger.warning(
                 "PairGuard | UNWOUND %.2f naked %s shares on %s — "

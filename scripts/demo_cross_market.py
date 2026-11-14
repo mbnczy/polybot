@@ -87,11 +87,36 @@ def _page(params: dict, limit: int) -> list[dict]:
 # across the whole one-week window (~40,000 markets) that is 280 MB raw and well
 # over the reader's 1 GB cap as Python objects. Slimmed, it is a few hundred bytes.
 _KEEP_FIELDS = ("conditionId", "question", "endDate", "outcomes", "clobTokenIds",
-                "negRiskMarketID", "outcomePrices", "bestBid", "bestAsk", "updatedAt")
+                "negRiskMarketID", "outcomePrices", "bestBid", "bestAsk", "updatedAt",
+                "orderPriceMinTickSize", "createdAt", "sportsMarketType")
+
+
+def _fee_rate(market: dict) -> "float | None":
+    """
+    The market's taker fee rate as Gamma publishes it, the way FeeEngine reads
+    it: 0 when fees are off, the schedule's rate otherwise, None when neither is
+    stated (the bot then asks FeeEngine itself).
+    """
+    if "feeRate" in market:
+        return market["feeRate"]
+    if market.get("feesEnabled") is False:
+        return 0.0
+    sched = market.get("feeSchedule")
+    if not isinstance(sched, dict):
+        return None
+    try:
+        rate = float(sched.get("rate"))
+    except (TypeError, ValueError):
+        return None
+    return rate if 0.0 <= rate <= 1.0 else None
 
 
 def _slim(m: dict) -> dict:
     out = {k: m[k] for k in _KEEP_FIELDS if m.get(k) is not None}
+    # One float, not the schedule dict: 85,000 of them are held at once.
+    rate = _fee_rate(m)
+    if rate is not None:
+        out["feeRate"] = rate
     ev = m.get("events")
     if isinstance(ev, list) and ev and isinstance(ev[0], dict) and ev[0].get("id") is not None:
         out["events"] = [{"id": str(ev[0]["id"])}]
@@ -303,6 +328,170 @@ def run_resolution_audit(args, cache: dict) -> "object":
     return audit
 
 
+def _tick_of(market: dict) -> "float | None":
+    try:
+        tick = float(market.get("orderPriceMinTickSize"))
+    except (TypeError, ValueError):
+        return None
+    return tick if tick > 0 else None
+
+
+def _num(v) -> "float | None":
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if 0.0 < x < 1.0 else None
+
+
+def screen_edge(narrow: dict, broad: dict) -> "float | None":
+    """
+    What this direction would pay right now, at the better of the two ways in:
+
+      • crossing:  NO on narrow at (1 − its bid) + YES on broad at its ask
+      • resting:   our own bids, a tick above each book, no fee
+
+    The snapshot is minutes old and says nothing about depth — it decides where
+    the model's budget goes, not what is traded.
+    """
+    nb, na = _num(narrow.get("bestBid")), _num(narrow.get("bestAsk"))
+    bb, ba = _num(broad.get("bestBid")), _num(broad.get("bestAsk"))
+    best = None
+    if nb is not None and ba is not None:
+        best = 1.0 - ((1.0 - nb) + ba)
+    if na is not None and bb is not None:
+        tn = _tick_of(narrow) or 0.01
+        tb = _tick_of(broad) or 0.01
+        maker = 1.0 - ((1.0 - na + tn) + (bb + tb))
+        best = maker if best is None else max(best, maker)
+    return best
+
+
+# No confirmed implication with a quotable book on both legs has ever been
+# priced above this, so a bigger number means the pair is not one.
+PRICE_FIRST_MAX_EDGE = 0.20
+
+
+def _spread(market: dict) -> "float | None":
+    bid, ask = _num(market.get("bestBid")), _num(market.get("bestAsk"))
+    return None if bid is None or ask is None else ask - bid
+
+
+# Twice the guard's maker gate (CROSS_MAKER_MAX_SPREAD 0.05). A book is watched
+# while it is merely near tradeable, so a pair does not leave the file and come
+# back every time its spread brushes the gate.
+READER_MAX_SPREAD = 0.10
+
+
+def quotable(markets: list[dict], max_spread: float) -> list[dict]:
+    """
+    The markets someone actually quotes: a bid and an ask no wider than
+    `max_spread`.
+
+    Measured 2026-09-18 over the one-week window: 85,548 markets, 28,600 of them
+    within 0.10. The other two thirds filled 84% of the export with pairs the
+    guard refused as "book_too_wide", and at two book reads a pair they kept its
+    queue saturated — a full sweep took 19 minutes. Filtering here loses nothing
+    tradeable: pairs with a tight book on both legs went from 461 to 474,
+    because the prefilter's 20,000 slots go to quotable markets instead.
+    """
+    out = []
+    for m in markets:
+        spread = _spread(m)
+        if spread is not None and spread <= max_spread + 1e-9:
+            out.append(m)
+    return out
+
+
+def _backwards(narrow: dict, broad: dict) -> bool:
+    """
+    True when the two titles themselves refute "narrow implies broad".
+
+    Without this the screen scores both directions and keeps the better one, so
+    every wide-apart ladder pair looks violated: SPY above $780 at 0.001 against
+    SPY above $750 at 0.990 scored +0.989 on 2026-09-17 — read as "above 750
+    implies above 780", which is backwards. The prices there are right, and the
+    model would have spent its budget confirming it.
+
+    Only the titles' own words are allowed to decide. strategy.ladder_direction
+    can also read the direction off the family's prices, but this screen exists
+    to find the pairs whose prices are wrong, so it cannot take their word for
+    which way the implication runs.
+    """
+    from strategy.ladder_direction import (            # noqa: PLC0415
+        RISING, numbers, skeleton, stated_direction)
+
+    qn, qb = _question_of(narrow), _question_of(broad)
+    if skeleton(qn) != skeleton(qb):
+        return False
+    xn, xb = numbers(qn), numbers(qb)
+    if len(xn) != len(xb):
+        return False
+    diff = [i for i in range(len(xn)) if xn[i] != xb[i]]
+    if len(diff) != 1:
+        return False
+    stated = stated_direction(qn)
+    if stated is None:
+        return False
+    # A rising ladder ("above X") narrows as the threshold climbs.
+    return (xn[diff[0]] > xb[diff[0]]) != (stated == RISING)
+
+
+def _question_of(market: dict) -> str:
+    return str(market.get("question") or market.get("title") or "")
+
+
+def price_first(cands: list, markets: list[dict], share: float,
+                budget: int, max_spread: float = 0.05,
+                max_edge: float = PRICE_FIRST_MAX_EDGE,
+                stats: "dict | None" = None) -> list:
+    """
+    Reorder the model's budget: the pairs whose prices would already pay first,
+    then the prefilter's own ranking.
+
+    Measured 2026-09-17: the budget went to shape-ranked pairs, 94% of them
+    over/under families whose median edge is −38% — the ones that can never pay.
+    Meanwhile 14,728 pairs in a 12-hour window were priced as if an implication
+    were violated, and none of them had ever been judged.
+
+    `max_edge` is what keeps the ranking honest. Of 2,143 implications the model
+    has confirmed, 320 had a quotable book on both legs, and not one of them was
+    violated: the best edge among them was −0.009 crossing and −0.010 resting.
+    A tight book showing +0.30 is therefore not a dislocation anyone can trade,
+    it is a pair that is not an implication — and ranking by the biggest number
+    hands the budget to exactly those. Above the ceiling a pair is dropped, not
+    demoted: 947 of the 1,209 the screen offered sat above it.
+    """
+    by_id = {str(m.get("conditionId")): m for m in markets if m.get("conditionId")}
+    scored = []
+    for c in cands:
+        a, b = by_id.get(c.a_id), by_id.get(c.b_id)
+        if not a or not b:
+            continue
+        sa, sb = _spread(a), _spread(b)
+        # 0.55 - 0.50 is 0.05000000000000004: a book at the cap has to pass.
+        if (sa is None or sb is None
+                or sa > max_spread + 1e-9 or sb > max_spread + 1e-9):
+            continue
+        edges = [screen_edge(n, b_) for n, b_ in ((a, b), (b, a))
+                 if not _backwards(n, b_)]
+        edge = max((e for e in edges if e is not None), default=None)
+        if edge is not None and 0.0 < edge <= max_edge:
+            scored.append((edge, c))
+    scored.sort(key=lambda x: -x[0])
+    take = min(len(scored), int(budget * share))
+    chosen = [c for _, c in scored[:take]]
+    if stats is not None:
+        # What the screen actually found, not what it was asked for. The share
+        # is a ceiling: after the edge ceiling and the spread gate there are
+        # often fewer priced pairs than the budget would allow.
+        stats["by_price"] = len(chosen)
+        stats["offered"] = len(scored)
+    picked = {id(c) for c in chosen}
+    chosen += [c for c in cands if id(c) not in picked][:budget - len(chosen)]
+    return chosen
+
+
 def snapshot_yes_ask(market: dict) -> float | None:
     """
     P(YES) as the best YES ask in the fetched snapshot — no book read.
@@ -493,10 +682,26 @@ def discover(markets: list[dict], args) -> list:
                                    max_per_event=args.max_per_event)
     cache = VerdictCache(args.cache_file).load()
     known, unknown = cache.split(cands)
-    fresh = unknown[:args.new_per_pass]
+    if not getattr(args, "no_structural", False):
+        # A pair of one match's over/unders is settled by the titles either way —
+        # an implication the rule emits, or none — so the model's budget goes
+        # to the pairs only it can judge.
+        from strategy.structural_implications import decides  # noqa: PLC0415
+        at = {str(m.get("conditionId")): m for m in markets if m.get("conditionId")}
+        before = len(unknown)
+        unknown = [c for c in unknown
+                   if not (c.a_id in at and c.b_id in at and decides(at[c.a_id], at[c.b_id]))]
+        if before != len(unknown):
+            print(f"  structural : {before - len(unknown)} unjudged pair(s) settled by the "
+                  f"titles, not sent to the model")
+    split: dict = {}
+    fresh = price_first(unknown, markets, args.price_first_share, args.new_per_pass,
+                        max_edge=args.price_first_max_edge, stats=split)
     print(f"  prefilter  : {len(cands)} candidate pair(s) | "
           f"{len(cands) - len(unknown)} already judged ({len(cache)} in cache), "
-          f"{len(unknown)} new → classifying {len(fresh)}")
+          f"{len(unknown)} new → classifying {len(fresh)} "
+          f"({split.get('by_price', 0)} of them priced as if violated, "
+          f"out of {split.get('offered', 0)} the screen offered)")
     if not fresh:
         strong = [r for r in known if r.confidence >= args.threshold]
         print(f"    {len(known)} from cache · {len(strong)} at/above {args.threshold}")
@@ -580,6 +785,12 @@ def export_implications(rels: list, markets: list[dict], path: str, audit=None) 
             # Which outcome each YES token is. The bot refuses a leg whose first
             # token is not provably "Yes" (strategy/outcomes.py).
             "narrow_outcomes": market_outcomes(mn), "broad_outcomes": market_outcomes(mb),
+            # The bot rests its bids one tick above the book; the tick is a
+            # property of the market, 0.01 in the middle and 0.001 at the edges.
+            "narrow_tick": _tick_of(mn), "broad_tick": _tick_of(mb),
+            # The bot prices hundreds of pairs a poll. Looking each fee up on
+            # Gamma would be a request per market; the reader already has it.
+            "narrow_fee_rate": _fee_rate(mn), "broad_fee_rate": _fee_rate(mb),
             "confidence": float(getattr(r, "confidence", 0.0)),
             "evidence": str(getattr(r, "evidence", ""))[:300],
         })
@@ -599,6 +810,110 @@ def export_implications(rels: list, markets: list[dict], path: str, audit=None) 
           + (f" ({expired} expired dropped)" if expired else "")
           + (f" ({blocked} refused by the resolution audit)" if blocked else ""))
     return len(rows)
+
+
+_SPORT_TITLE = re.compile(r"^(?:Spread: |Exact Score: |[^:]+ vs\.? [^:]+: )")
+_FIXTURE_TOLERANCE_S = 600.0
+_YES_NO_LABELS = frozenset({"yes", "no", "over", "under", "draw"})
+
+
+def _is_sports(market: dict) -> bool:
+    return bool(market.get("sportsMarketType")) or bool(
+        _SPORT_TITLE.match(str(market.get("question") or "")))
+
+
+def _side(market: dict) -> "str | None":
+    """The YES token's own label, when it names a team or a player rather than Yes."""
+    try:
+        raw = market.get("outcomes")
+        first = str((json.loads(raw) if isinstance(raw, str) else list(raw or []))[0]).strip()
+    except (TypeError, ValueError, IndexError):
+        return None
+    return None if first.lower() in _YES_NO_LABELS else first.lower()
+
+
+def same_fixture(a: dict, b: dict) -> bool:
+    """
+    False when two sports markets belong to different games. A title does not
+    say which game: a baseball series, a cup tie and a league match list the
+    same two teams days apart, and the model, seeing titles only, paired them —
+    "Spread: Chicago Cubs (-2.5) ⊆ (-1.5)" across two games, "San Francisco
+    Giants Team Total: O/U 4.5" against the next night's, both violated at
+    resolution. Markets of one game share its event; where an event is missing,
+    a game's markets still share its start.
+    """
+    if not (_is_sports(a) and _is_sports(b)):
+        return True
+    ea, eb = _event_id(a), _event_id(b)
+    if ea is not None and ea == eb:
+        return True
+    # Different events can still be one game: a match's exact scores are listed
+    # as their own event, and those pairs have resolved correctly 2,870 times.
+    # What no two games of one team share is the moment they start.
+    ta, tb = _market_end_ts(a), _market_end_ts(b)
+    if ta is None or tb is None:
+        return False
+    return abs(ta - tb) <= _FIXTURE_TOLERANCE_S
+
+
+def same_side(a: dict, b: dict) -> bool:
+    """
+    False when the two YES tokens are not the same competitor. A moneyline or
+    handicap market's outcomes are names, not Yes/No, and which one the YES
+    token is decides what the trade holds: "Set Handicap: Kasintseva (-1.5) ⊆
+    Porto: Kasintseva vs Bains" was exported where the second market's YES is
+    Bains, and it resolved violated.
+    """
+    sa, sb = _side(a), _side(b)
+    if sa is None or sb is None:
+        return True                      # a Yes/No or Over/Under leg says nothing here
+    return sa == sb
+
+
+def _event_id(market: dict) -> "str | None":
+    ev = market.get("events")
+    if isinstance(ev, list) and ev and isinstance(ev[0], dict) and ev[0].get("id") is not None:
+        return str(ev[0]["id"])
+    return None
+
+
+def drop_cross_fixture(rels: list, markets: list[dict]) -> list:
+    by_id = {str(m.get("conditionId")): m for m in markets if m.get("conditionId")}
+    kept, fixtures, sides = [], 0, 0
+    for r in rels:
+        a, b = by_id.get(r.narrow), by_id.get(r.broad)
+        if a is None or b is None:
+            kept.append(r)
+            continue
+        if not same_fixture(a, b):
+            fixtures += 1
+        elif not same_side(a, b):
+            sides += 1
+        else:
+            kept.append(r)
+    if fixtures or sides:
+        print(f"  fixtures   : {fixtures} pair(s) dropped — two different games; "
+              f"{sides} — the two YES tokens are different competitors")
+    return kept
+
+
+def with_structural(rels: list, markets: list[dict]) -> list:
+    """
+    Add the implications a match's over/under titles state outright
+    (strategy/structural_implications.py) to the model's.
+
+    On 2026-09-18 the rule produced 7,697 of them across 523 matches, where the
+    model's whole export was 1,087 pairs — and on the 954 over/under pairs both
+    could read, they agreed every time. Added after the ladder direction check:
+    their direction is the definition of the markets, not an inference.
+    """
+    from strategy.structural_implications import links  # noqa: PLC0415
+
+    have = {(r.narrow, r.broad) for r in rels}
+    extra = [r for r in links(markets) if (r.narrow, r.broad) not in have]
+    print(f"  structural : {len(extra)} implication(s) from match over/unders, "
+          f"{len(rels)} from the model")
+    return rels + extra
 
 
 def _drop_backwards(rels: list, markets: list[dict]) -> list:
@@ -1078,7 +1393,16 @@ def one_pass(args, markets_cache: dict) -> int:
         except Exception as exc:                    # noqa: BLE001 — never stops a pass
             logger.error("resolution audit failed: %s", exc)
     if fresh_discovery:
-        rels = _drop_backwards(discover(markets, args), markets)
+        universe = markets
+        cap = getattr(args, "max_spread", None)
+        if cap is not None:
+            universe = quotable(markets, cap)
+            print(f"  quotable   : {len(universe)} of {len(markets)} market(s) quoted "
+                  f"within {cap:.2f} — the rest never reach the model or the export")
+        rels = _drop_backwards(discover(universe, args), markets)
+        if not getattr(args, "no_structural", False):
+            rels = with_structural(rels, universe)
+        rels = drop_cross_fixture(rels, markets)
         markets_cache["rels"] = rels
 
         # Only announce relations we have not announced before.
@@ -1151,6 +1475,17 @@ def main() -> int:
                     help="where model verdicts are remembered between passes")
     ap.add_argument("--new-per-pass", type=int,  default=60, metavar="N",
                     help="how many unseen pairs each discovery sends to the model")
+    ap.add_argument("--price-first-share", type=float, default=0.75, metavar="F",
+                    help="share of that budget spent on pairs the prices would already "
+                         "pay for; the rest follows the prefilter's ranking")
+    ap.add_argument("--max-spread", type=float, default=READER_MAX_SPREAD, metavar="S",
+                    help="only markets quoted within this spread reach the model and "
+                         "the export (default %(default)s); pass a negative value to "
+                         "keep every market")
+    ap.add_argument("--price-first-max-edge", type=float, default=PRICE_FIRST_MAX_EDGE,
+                    metavar="E",
+                    help="apparent edge above which a pair is treated as not an "
+                         "implication at all rather than as a dislocation")
     ap.add_argument("--pairs",       type=int,   default=800,
                     help="candidate pairs sent to the model")
     ap.add_argument("--threshold",   type=float, default=0.90,
@@ -1200,12 +1535,16 @@ def main() -> int:
                          "capture (default CROSS_EXIT_MIN_CAPTURE, 1.0)")
     ap.add_argument("--no-paper", action="store_true",
                     help="do not open or track paper positions")
+    ap.add_argument("--no-structural", action="store_true",
+                    help="do not add the implications stated by match over/under titles")
     ap.add_argument("--no-implication-alerts", action="store_true",
                     help="only alert on price violations, not on discoveries")
     ap.add_argument("--dry-run",     action="store_true")
     ap.add_argument("--env-file",    default=str(REPO / ".env"))
     ap.add_argument("--bot-env",     default="/home/ubuntu/polybot/.env")
     args = ap.parse_args()
+    if args.max_spread is not None and args.max_spread < 0:
+        args.max_spread = None
 
     logging.basicConfig(level=logging.INFO, format="  %(levelname)s %(message)s")
     # httpx logs every request at INFO. Fetching the whole window is ~500 of them

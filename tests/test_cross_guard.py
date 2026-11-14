@@ -6,6 +6,7 @@ the early exit, resolution, and the bookkeeping that has to survive a restart.
 from __future__ import annotations
 
 import json
+import math
 import time
 
 import pytest
@@ -17,6 +18,7 @@ from execution.cross_guard import (
     best_level,
     evaluate,
     load_implications,
+    min_order_shares,
     size_position,
     stop_key,
     Level,
@@ -61,22 +63,28 @@ class _Client:
         self.sells: list[tuple[str, float]] = []
         self.buy_fail: set[str] = set()
         self.sell_fail: set[str] = set()
+        self.partial: dict[str, float] = {}         # token → shares an FAK buy gets
+        self.sell_cap: dict[str, float] = {}        # token → shares a sell-back places
+        self.order_types: list[str] = []
 
     async def get_orderbook(self, token):
         return self.books.get(token, _book())
 
     async def post_order(self, token_id, side, price, size, _order_type="FOK"):
         self.buys.append((token_id, price, size))
+        self.order_types.append(_order_type)
         if token_id in self.buy_fail:
             return {"status": "unmatched"}
-        return {"status": "matched", "making_amount": size * price, "taking_amount": size}
+        got = min(size, self.partial[token_id]) if token_id in self.partial else size
+        return {"status": "matched", "making_amount": got * price, "taking_amount": got}
 
     async def unwind_leg(self, token_id, size, price=0.0):
         self.sells.append((token_id, size))
         if token_id in self.sell_fail:
             return {"status": "unmatched"}
         bid = best_level(self.books[token_id], "bids").price
-        return {"status": "matched", "making_amount": size, "taking_amount": size * bid}
+        sold = min(size, self.sell_cap.get(token_id, size))   # what the bid took
+        return {"status": "matched", "making_amount": sold, "taking_amount": sold * bid}
 
 
 class _Notifier:
@@ -94,11 +102,15 @@ def _write_imps(tmp_path, imps):
             "narrow", "broad", "narrow_title", "broad_title", "narrow_yes_token",
             "narrow_no_token", "broad_yes_token", "broad_no_token",
             "narrow_end_ts", "broad_end_ts", "confidence",
-            "narrow_outcomes", "broad_outcomes")} for i in imps]}))
+            "narrow_outcomes", "broad_outcomes", "narrow_tick", "broad_tick",
+            "narrow_fee_rate", "broad_fee_rate")} for i in imps]}))
     return p
 
 
 def _guard(tmp_path, monkeypatch, books, imps, *, enabled=True, **kw):
+    # The resting tests below price a tick above the bid; joining the queue
+    # (the live default) has tests of its own in test_cross_maker.py.
+    kw.setdefault("maker_join", False)
     monkeypatch.setenv("CROSS_MAX_POSITIONS", "2")
     monkeypatch.setenv("CROSS_MAX_COMMITTED_USDC", "10")
     monkeypatch.setattr(time, "time", lambda: NOW)
@@ -151,6 +163,46 @@ def test_size_is_bounded_by_the_thinner_touch_and_the_cap():
     shares = size_position(Level(0.40, 50), Level(0.45, 20), 0.85,
                            max_usdc=5.0, min_shares=5.0)
     assert shares == 5.88          # 5.00 / 0.85, under both touches
+
+
+# ── the exchange's $1 minimum for a marketable order ──────────────────────────
+
+def test_a_marketable_order_needs_a_dollar_with_a_margin_for_rounding():
+    assert min_order_shares(0.14) == 7.29              # 1.02 / 0.14 = 7.2857…
+    assert min_order_shares(0.002) == 510.0
+    assert min_order_shares(0.60) == 1.70
+
+
+def test_a_deep_ladder_pair_is_refused_before_anything_is_sent():
+    """2026-09-23/24: Gold $4,000 ⊆ $4,050 at 0.99 + 0.002 was tried 17 times.
+    Five shares of the YES leg are worth $0.01; $1 would take 510 of them."""
+    books = {"nn": _book(asks=[(0.990, 65)], bids=[(0.985, 65)]),
+             "by": _book(asks=[(0.002, 16)], bids=[(0.001, 16)])}
+    opp, why = evaluate(_imp(), books["nn"], books["by"], now=NOW, min_edge=0.005)
+    assert opp is None and stop_key(why) == "under_min_order"
+    assert "510.00 shares" in why
+
+
+def test_a_cheap_leg_is_scaled_up_to_the_minimum_when_the_cap_allows():
+    """META at 0.84 + 0.14: five dollars buys 5.10 pairs, $0.71 of the cheap leg;
+    ten dollars buys 10.20, and both legs clear the minimum."""
+    books = {"nn": _book(asks=[(0.84, 160)], bids=[(0.83, 160)]),
+             "by": _book(asks=[(0.14, 90)], bids=[(0.13, 90)])}
+    opp, why = evaluate(_imp(), books["nn"], books["by"], now=NOW, min_edge=0.005,
+                        rate_narrow=0.0, rate_broad=0.0, max_usdc=5.0)
+    assert opp is None and stop_key(why) == "under_min_order"
+    opp, why = evaluate(_imp(), books["nn"], books["by"], now=NOW, min_edge=0.005,
+                        rate_narrow=0.0, rate_broad=0.0, max_usdc=10.0)
+    assert why == "ok" and opp.shares == 10.2
+    assert opp.shares * opp.yes_ask.price >= 1.0 and opp.shares * opp.no_ask.price >= 1.0
+
+
+def test_the_minimum_can_be_switched_off():
+    books = {"nn": _book(asks=[(0.990, 65)], bids=[(0.985, 65)]),
+             "by": _book(asks=[(0.002, 16)], bids=[(0.001, 16)])}
+    opp, why = evaluate(_imp(), books["nn"], books["by"], now=NOW, min_edge=0.005,
+                        min_order_usdc=0.0)
+    assert why == "ok" and opp.shares == math.floor(5.0 / opp.entry_per_pair * 100) / 100
 
 
 def test_a_touch_below_the_minimum_size_is_refused():
@@ -351,12 +403,43 @@ _CORNERS = dict(narrow_title="X vs. Y: X O/U 2.5 Corners", broad_title="X vs. Y:
     (_imp(), {"nn": _book(asks=[(0.40, 50)]), "by": ARB["by"]}, "no_bid"),
     (_imp(days=0.01), ARB, "too_close_to_end"),
     (_imp(broad_outcomes=None), ARB, "outcomes_unknown"),
+    (_imp(), {"nn": _book(asks=[(0.80, 50)], bids=[(0.79, 50)]),
+              "by": _book(asks=[(0.10, 50)], bids=[(0.09, 50)])}, "under_min_order"),
     (_imp(), ARB, "ok"),
 ])
 def test_every_refusal_has_a_stop_key(imp, books, key):
     """A reworded reason must not fall through to "other" unnoticed."""
     _, why = evaluate(imp, books["nn"], books["by"], now=NOW)
     assert stop_key(why) == key
+
+
+# ── the first leg takes what is there ─────────────────────────────────────────
+# Six first legs died as FOK on 2026-09-23/24 because a sliver of the touch had
+# gone; none failed on the second. FAK on the first, then exactly that on the second.
+
+@pytest.mark.asyncio
+async def test_the_first_leg_is_fak_and_the_second_matches_what_it_got(tmp_path, monkeypatch):
+    g, client, breaker, _ = _guard(tmp_path, monkeypatch, ARB, [_imp()],
+                                   max_position_usdc=10.0)
+    client.partial["by"] = 8.0                         # the thinner leg goes first
+    await g._priced(_imp(), NOW)
+    assert client.order_types[:2] == ["FAK", "FOK"]
+    assert client.buys[0][0] == "by" and client.buys[1] == ("nn", 0.40, 8.0)
+    (pos,) = g.open_positions()
+    assert pos.size == 8.0
+    assert breaker.status_dict()["cross_open"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_first_leg_too_small_for_a_valid_second_is_sold_back(tmp_path, monkeypatch):
+    g, client, breaker, _ = _guard(tmp_path, monkeypatch, ARB, [_imp()],
+                                   max_position_usdc=10.0)
+    client.partial["by"] = 3.0                         # under the five-share minimum
+    await g._priced(_imp(), NOW)
+    assert [t for t, _, _ in client.buys] == ["by"]    # no second leg was sent
+    assert client.sells == [("by", 3.0)]
+    assert g.open_positions() == []
+    assert breaker.status_dict()["cross_open"] == 0
 
 
 def _other(n, days=2.0):
@@ -380,12 +463,13 @@ async def test_the_summary_names_where_each_pair_stopped(tmp_path, monkeypatch):
     assert "best edge +0.1500" in line
     assert client.buys == []
 
-    # Next pass the would-be entry sits out its cooldown and the pair 79 points
-    # from the threshold is deferred rather than re-priced: the snapshot moves
-    # on, the running count keeps it.
+    # Next pass the would-be entry sits out its cooldown. The pair 79 points
+    # from the threshold is not due, but the budget has room for it, so it is
+    # priced again rather than left to go stale.
     await g.poll_once()
     line = g.stop_summary()
-    assert "cooldown 1" in line and "1 not re-priced" in line
+    assert "cooldown 1" in line and "not re-priced" not in line
+    assert "stalest price 0s" in line
     assert line.endswith("would_enter 1 entered 0 open 0")
 
 
@@ -497,11 +581,17 @@ def test_a_pair_judged_without_a_book_read_is_not_deferred(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_a_far_pair_is_not_priced_again_next_poll(tmp_path, monkeypatch):
-    """Two book reads per pair per poll is what a wide net cannot afford."""
+async def test_a_far_pair_waits_behind_the_pairs_that_are_due(tmp_path, monkeypatch):
+    """Two book reads per pair per poll is what a wide net cannot afford: when
+    the budget is taken, a pair 79 points away is the one that waits."""
     far = {"nn": _book(asks=[(0.83, 50)], bids=[(0.80, 50)]),
-           "by": _book(asks=[(0.96, 50)], bids=[(0.94, 50)])}     # edge -0.79
-    g, client, _, _ = _guard(tmp_path, monkeypatch, far, [_imp()], enabled=False)
+           "by": _book(asks=[(0.96, 50)], bids=[(0.94, 50)]),      # edge -0.79
+           "nn2": _book(asks=[(0.83, 50)], bids=[(0.80, 50)]),
+           "by2": _book(asks=[(0.96, 50)], bids=[(0.94, 50)])}
+    second = _imp(narrow="0xn2", broad="0xb2", narrow_no_token="nn2",
+                  broad_yes_token="by2", narrow_yes_token="ny2", broad_no_token="bn2")
+    g, client, _, _ = _guard(tmp_path, monkeypatch, far, [_imp(), second],
+                             enabled=False, max_book_reads=2)
     reads = []
     inner = client.get_orderbook
 
@@ -511,13 +601,14 @@ async def test_a_far_pair_is_not_priced_again_next_poll(tmp_path, monkeypatch):
 
     client.get_orderbook = counting
     await g.poll_once()
-    assert len(reads) == 2
+    assert reads == ["nn", "by"]
     await g.poll_once()
-    assert len(reads) == 2                      # deferred, not re-priced
+    assert reads[2:] == ["nn2", "by2"]          # the unpriced pair went first
     line = g.stop_summary()
     assert "1 not re-priced" in line
-    # and it still reports what it was when last priced
-    assert "edge_below_min 1" in line and "best edge -0.7900" in line
+    # It still reports what it was when last priced — at the better of the two
+    # prices: resting our own bids (0.81 + 0.95) beats crossing (0.83 + 0.96).
+    assert "maker_edge_below_min 2" in line and "best edge -0.7600" in line
 
 
 # ── only markets whose YES token is provably "Yes" ────────────────────────────

@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -54,6 +55,13 @@ RECONCILE_POLL_S: float = float(os.environ.get("RECONCILE_POLL_S", 120.0))
 
 # Share moves below this are rounding noise, not a trade.
 _SHARE_EPS: float = 0.01
+
+# A token the bot itself traded this recently explains a move on it. Two reads
+# and a margin: the data API can show a trade one read after the guard closed
+# the position (the 10:16:26 completion of 2026-09-23 appeared at 10:18:29).
+# Moves on any other token are judged exactly as before.
+def _trail_s(poll_s: float) -> float:
+    return 2.0 * poll_s + 30.0
 
 
 
@@ -80,6 +88,9 @@ class WalletReconciler:
         self._notifier = notifier
         self._poll     = max(10.0, poll_s)
         self._prev: dict[str, float] | None = None
+        # Snapshot key → token id, kept after a position empties so the move
+        # that emptied it can still be attributed.
+        self._asset_of: dict[str, str] = {}
         self._prev_cash: float | None = None
         self.unexplained_events: int = 0
         # Settlements AutoRedeemer has announced but the snapshot has not yet
@@ -115,11 +126,25 @@ class WalletReconciler:
         cash = await self._client.collateral_balance()
         if cash is None:
             return None
-        held = {
-            f"{r.get('title','')[:40]}|{r.get('outcome','')}": float(r.get("size") or 0.0)
-            for r in rows
-        }
+        held: dict[str, float] = {}
+        for r in rows:
+            key = f"{r.get('title','')[:40]}|{r.get('outcome','')}"
+            held[key] = float(r.get("size") or 0.0)
+            if r.get("asset"):
+                self._asset_of[key] = str(r["asset"])
         return self._drop_managed(held), float(cash)
+
+    def _own_recent(self, moves: dict[str, float]) -> dict[str, float]:
+        """The moves on tokens the bot itself traded within the trail window."""
+        traded_since = getattr(self._client, "traded_since", None)
+        if not callable(traded_since):
+            return {}
+        try:
+            recent = traded_since(time.time() - _trail_s(self._poll))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("WalletReconciler | traded_since failed: %s", exc)
+            return {}
+        return {k: v for k, v in moves.items() if self._asset_of.get(k) in recent}
 
     def _drop_managed(self, held: dict[str, float]) -> dict[str, float]:
         """
@@ -240,6 +265,22 @@ class WalletReconciler:
                 len(moves), open_positions,
             )
             return None
+
+        # The bot's own orders, settling after their guard closed the position:
+        # a position can open and close between two reads, and a trade can reach
+        # the data API a read later than the close. Only a token the bot traded
+        # within the trail window qualifies, so an order resting on any other
+        # token — the leak this check exists for — still alarms.
+        own = self._own_recent(moves)
+        if own:
+            logger.info(
+                "WalletReconciler | %s — the bot's own trading within %.0fs, settling",
+                ", ".join(f"{k} {v:+.2f}" for k, v in sorted(own.items())),
+                _trail_s(self._poll),
+            )
+            moves = {k: v for k, v in moves.items() if k not in own}
+            if not moves:
+                return None
 
         # Inventory moved while the bot believed it had nothing open.
         self.unexplained_events += 1
