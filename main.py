@@ -222,6 +222,14 @@ _ARB_HALF_FILL_COOLDOWN_S: float = float(os.environ.get("ARB_HALF_FILL_COOLDOWN_
 # to disable resting-bid maker orders (one-leg risk) and trade taker-only.
 _maker_arb_enabled = os.environ.get("MAKER_ARB_ENABLED", "true").strip().lower() != "false"
 
+# Taker pair path toggle (buy YES and NO at the asks for under 1). Default on.
+# The YES and NO books of one market are mirror images (30 of 30 checked on
+# 2026-11-14: NO ask = 1 - YES bid, level for level), so the two asks always sum
+# to more than 1 and a signal can only come from the two tokens' updates arriving
+# apart. 126 signals from 2026-09-03 to 2026-11-14 completed no pair, and each
+# one-leg fill was sold back at a loss. Set TAKER_ARB_ENABLED=false to stop it.
+_taker_arb_enabled = os.environ.get("TAKER_ARB_ENABLED", "true").strip().lower() != "false"
+
 # Optional single-market seed (backward-compatible with Phase ≤ 6 .env files)
 YES_TOKEN_ID: str = _cfg.yes_token_id
 NO_TOKEN_ID:  str = _cfg.no_token_id
@@ -756,6 +764,9 @@ async def strategy_loop(
                 )
                 continue
 
+            if not (_taker_arb_enabled or _maker_arb_enabled):
+                continue                        # no binary pair path is switched on
+
             # ── 1. Fetch real-time taker fee ──────────────────────────────────
             # Peek the cache synchronously first (no event-loop bounce); only
             # await a network fetch on a cold miss. After scanner pre-warming the
@@ -775,7 +786,7 @@ async def strategy_loop(
                 max_position_usdc=MAX_ARB_PAIR_USDC,
                 fee_rate=fee_rate,
                 tick_size=tick.get("tick_size"),
-            )
+            ) if _taker_arb_enabled else None
 
             # ── 2b. Maker arb fallback (DutchBookPricer) ──────────────────────
             # Gated by MAKER_ARB_ENABLED: the resting-bid maker path is subject
@@ -1180,6 +1191,7 @@ async def main() -> None:
         "ENABLED" if _maker_arb_enabled else "DISABLED (taker-only)",
         _extreme_lo, _extreme_hi, _min_real_edge,
     )
+    logger.info("Taker pair path: %s", "ENABLED" if _taker_arb_enabled else "DISABLED")
 
     # ── initialise components ─────────────────────────────────────────────
     client         = PolyClient()

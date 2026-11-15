@@ -957,3 +957,30 @@ async def test_a_leg_under_the_exchange_minimum_never_reaches_the_exchange(compo
     await _run_strategy_until(c, lambda: bool(skipped))
     assert calls["pair"] == 0
     assert any("$1 minimum" in s for s in skipped), skipped
+
+
+
+@pytest.mark.asyncio
+async def test_with_the_taker_pair_switched_off_a_signal_sends_nothing(components, monkeypatch):
+    """
+    TAKER_ARB_ENABLED=false. The fixture's books (0.47 + 0.50) are a signal the
+    detector takes; with the path off nothing is evaluated and nothing is sent.
+    """
+    import main as main_mod
+    monkeypatch.setattr(main_mod, "_taker_arb_enabled", False)
+    monkeypatch.setattr(main_mod, "_maker_arb_enabled", False)
+    c = components
+    calls = _half_filled(c, unwound={})
+    await _run_strategy_until(c, lambda: False, timeout=0.8)
+    assert calls["pair"] == 0
+    assert c["breaker"].status_dict()["orders_passed"] == 0
+    assert c["notifier"].arb_signals == []
+
+
+@pytest.mark.asyncio
+async def test_the_taker_pair_is_on_unless_switched_off(components):
+    c = components
+    calls = _half_filled(c, unwound={"status": "matched", "making_amount": 11.0,
+                                     "taking_amount": 4.70})
+    await _run_strategy_until(c, lambda: calls["pair"] >= 1)
+    assert calls["pair"] == 1
