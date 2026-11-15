@@ -189,3 +189,47 @@ def test_redemptions_read_the_feed(client):
 def test_a_failed_redemption_read_is_none(client):
     client.http.answers = [_Resp({}, status=503)]
     assert asyncio.run(client.recent_redemptions(1.0)) is None
+
+
+# ── the fee calibration ───────────────────────────────────────────────────────
+
+def _fill(tx, size, price, net, ts):
+    return {"type": "TRADE", "transaction_hash": tx, "size": size, "price": price,
+            "usdc_size": net, "timestamp": ts}
+
+
+def _taker_sides(client, monkeypatch, hashes):
+    import core.clob_client as cc
+    monkeypatch.setattr(cc, "_PAPER_TRADE", False)
+
+    class _Trade:
+        def __init__(self, h):
+            self.status, self.transaction_hash, self.trader_side = "CONFIRMED", h, "TAKER"
+
+    class _Page:
+        items = [_Trade(h) for h in hashes]
+
+    class _Sdk:
+        def list_account_trades(self):
+            return [_Page()]
+
+    client._client = _Sdk()
+
+
+def test_a_fee_free_market_does_not_set_the_rate_for_the_rest(client, monkeypatch):
+    """
+    Regression for 2026-11-15: the two newest taker fills were on a fee-free market
+    (10.1 @ 0.60 for exactly 6.06), and the fallback rate for every market went to 0.
+    """
+    _taker_sides(client, monkeypatch, ["0xfree", "0xpaid"])
+    client.http.answers = [_page([
+        _fill("0xfree", 10.1, 0.60, 6.06, 1_794_106_440),          # paid no fee
+        _fill("0xpaid", 11.13, 0.66, 7.2459, 1_793_754_247),       # 0.04 on 2026-11-04
+    ])]
+    assert asyncio.run(client.observed_taker_rate()) == pytest.approx(0.04, abs=1e-4)
+
+
+def test_only_fee_free_fills_leave_the_rate_alone(client, monkeypatch):
+    _taker_sides(client, monkeypatch, ["0xfree"])
+    client.http.answers = [_page([_fill("0xfree", 10.1, 0.60, 6.06, 1_794_106_440)])]
+    assert asyncio.run(client.observed_taker_rate()) is None

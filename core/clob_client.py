@@ -314,6 +314,8 @@ _FEE_RATE_WINDOW: int = int(os.environ.get("FEE_RATE_WINDOW", 12))
 # Only fills within this span of the newest one decide the rate. Bounds how long
 # a superseded rate can keep being quoted after a change.
 _FEE_RATE_MAX_AGE_S: int = int(os.environ.get("FEE_RATE_MAX_AGE_S", 86_400))
+# A solved rate under this is a fee-free market, not a schedule (the lowest is 0.03).
+_FEE_FREE_BELOW: float = 0.001
 
 # How far below the best bid still counts as real liquidity when sizing an
 # unwind slice. 0.10 = accept the top 10% price band. Dust orders parked at
@@ -1151,7 +1153,12 @@ class PolyClient:
             if denom <= 0.0 or net <= 0.0 or not (0.0 < px < 1.0):
                 continue
             rate = abs(size * px - net) / denom
-            if 0.0 <= rate <= 0.5:
+            # A fill that paid nothing was on a fee-free market and says nothing
+            # about the others. On 2026-11-15 the two newest taker fills were on
+            # one, and the fallback rate for every market went from 0.04 to 0.
+            if rate < _FEE_FREE_BELOW:
+                continue
+            if rate <= 0.5:
                 solved.append((ts, rate))
         if not solved:
             return None
