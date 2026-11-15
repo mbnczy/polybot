@@ -57,10 +57,10 @@ import bisect  # noqa: E402
 
 import httpx  # noqa: E402
 
+from core.data_api import market_trades  # noqa: E402
 from scripts.analyze_ws_recording import _lines, load_tokens  # noqa: E402
 from strategy.resolution_audit import resolved_prices  # noqa: E402
 
-_TRADES = "https://data-api.polymarket.com/trades"
 _GAMMA = "https://gamma-api.polymarket.com/markets"
 HORIZONS = (("3 min", 180.0), ("30 min", 1800.0), ("2 h", 7200.0), ("to kick-off", None))
 
@@ -105,18 +105,7 @@ def _get(url: str, params) -> "httpx.Response | None":
 
 def trades_since(cid: str, since: float) -> list[dict]:
     """Every trade on the market since `since`, oldest first."""
-    out: list[dict] = []
-    if True:
-        offset = 0
-        while offset < 10_000:
-            r = _get(_TRADES, {"market": cid, "limit": 500, "offset": offset})
-            if r is None or r.status_code != 200:
-                break
-            page = r.json()
-            out += page
-            if len(page) < 500 or (page and page[-1]["timestamp"] < since):
-                break
-            offset += 500
+    out = market_trades(_get, cid, since=since, max_rows=10_000)
     return sorted((t for t in out if t["timestamp"] >= since), key=lambda t: t["timestamp"])
 
 

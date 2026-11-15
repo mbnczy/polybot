@@ -40,8 +40,9 @@ sys.path.insert(0, str(REPO))
 
 import httpx  # noqa: E402
 
+from core.data_api import market_trades  # noqa: E402
+
 _GAMMA = "https://gamma-api.polymarket.com/markets"
-_TRADES = "https://data-api.polymarket.com/trades"
 _ISO = "%Y-%m-%dT%H:%M:%SZ"
 _LOCAL = threading.local()
 
@@ -138,14 +139,7 @@ def resolved_yes(m: dict) -> "int | None":
 
 
 def trades(cid: str) -> list:
-    out = []
-    for offset in range(0, 1500, 500):
-        r = _get(_TRADES, {"market": cid, "limit": 500, "offset": offset})
-        page = r.json() if r is not None and r.status_code == 200 else []
-        out += page
-        if len(page) < 500:
-            break
-    return out
+    return market_trades(_get, cid, max_rows=1500)
 
 
 def study(m: dict, args) -> "dict | None":

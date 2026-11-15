@@ -34,9 +34,10 @@ sys.path.insert(0, str(REPO))
 
 import httpx  # noqa: E402
 
+from core.data_api import market_trades  # noqa: E402
+
 _CLOB = "https://clob.polymarket.com"
 _GAMMA = "https://gamma-api.polymarket.com/markets"
-_TRADES = "https://data-api.polymarket.com/trades"
 
 
 def reward_markets(c: httpx.Client) -> list[dict]:
@@ -130,7 +131,7 @@ def main(args) -> int:
 
     def flow(r):
         with httpx.Client(timeout=30) as c:
-            t = c.get(_TRADES, params={"market": r["cid"], "limit": 500}).json()
+            t = market_trades(lambda u, p: c.get(u, params=p), r["cid"], since=since, max_rows=500)
         day = [x for x in t if x["timestamp"] >= since]
         return len(day), sum(float(x["size"]) for x in day)
 

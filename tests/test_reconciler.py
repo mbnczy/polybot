@@ -314,3 +314,140 @@ async def test_a_sale_that_empties_a_position_is_attributed_by_its_last_token():
     c.rows = []
     c.traded["tok35"] = _time.time() - 110.0
     assert await r.check_once() is None
+
+
+# ── resolution: redeemable rows and the exchange's own operator ───────────────
+
+def _resolved(title, outcome, size, value=0.0):
+    return {**_row(title, outcome, size), "redeemable": True, "value": value}
+
+
+@pytest.mark.asyncio
+async def test_a_market_resolving_is_not_shares_moving():
+    """A loser stays listed for good. It left live inventory without any order."""
+    r, c, _, n = _rig([_row("A", "No", 20.0)])
+    await r.check_once()
+    n.sent.clear()
+    c.rows = [_resolved("A", "No", 20.0)]
+    assert await r.check_once() is None
+    assert n.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_redeemable_row_appearing_is_not_shares_appearing():
+    """A cross leg leaving the managed set after its position closed."""
+    r, c, _, n = _rig([])
+    await r.check_once()
+    c.rows = [_resolved("Brighton", "No", 10.0)]
+    assert await r.check_once() is None
+    assert n.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_resolved_row_excuses_only_itself():
+    r, c, _, n = _rig([_row("A", "No", 20.0), _row("B", "Yes", 5.0)])
+    await r.check_once()
+    n.sent.clear()
+    c.rows = [_resolved("A", "No", 20.0)]                # B vanished with no reason
+    report = await r.check_once()
+    assert report is not None and list(report["moves"]) == ["B|Yes"]
+
+
+class _FeedClient(_Client):
+    def __init__(self, rows, feed, cash=100.0):
+        super().__init__(rows, cash)
+        self.feed = feed
+        self.asked = 0
+
+    async def recent_redemptions(self, since):
+        self.asked += 1
+        return self.feed
+
+
+def _feed_rig(rows, feed):
+    c, b, n = _FeedClient(rows, feed), _Breaker(), _Notifier()
+    return WalletReconciler(c, b, n, poll_s=10.0), c, n
+
+
+@pytest.mark.asyncio
+async def test_the_operator_redeeming_between_two_reads_is_not_a_leak():
+    """
+    Regression for what would have happened on 2026-11-04 with the reconciler able
+    to see: the operator redeemed within seconds of the market closing, so the shares
+    went from held to gone with nothing here told about it.
+    """
+    title = "Will the Republicans win the Texas Senate race in 2026?"
+    r, c, n = _feed_rig([_row(title, "No", 20.44)], [])
+    await r.check_once()
+    n.sent.clear()
+    c.rows = []
+    c.feed = [{"title": title, "outcome": "No", "usdc": 20.44}]
+    assert await r.check_once() is None
+    assert n.sent == []
+
+
+@pytest.mark.asyncio
+async def test_the_feed_excuses_only_the_position_it_names():
+    r, c, n = _feed_rig([_row("A", "No", 20.0), _row("B", "No", 5.0)], [])
+    await r.check_once()
+    n.sent.clear()
+    c.rows = []
+    c.feed = [{"title": "A", "outcome": "No", "usdc": 20.0}]
+    report = await r.check_once()
+    assert report is not None and list(report["moves"]) == ["B|No"]
+
+
+@pytest.mark.asyncio
+async def test_the_same_market_on_the_other_outcome_is_not_excused():
+    r, c, n = _feed_rig([_row("A", "Yes", 5.0)], [])
+    await r.check_once()
+    c.rows = []
+    c.feed = [{"title": "A", "outcome": "No", "usdc": 20.0}]
+    assert await r.check_once() is not None
+
+
+@pytest.mark.asyncio
+async def test_the_feed_never_excuses_shares_appearing():
+    r, c, n = _feed_rig([], [{"title": "A", "outcome": "No", "usdc": 20.0}])
+    await r.check_once()
+    c.rows = [_row("A", "No", 5.0)]
+    assert await r.check_once() is not None
+    assert c.asked == 0, "nothing vanished, so there is nothing to ask the feed about"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_feed_read_still_alerts():
+    """Better a false alarm than a leak passing because the feed was down."""
+    r, c, n = _feed_rig([_row("A", "No", 20.0)], None)
+    await r.check_once()
+    n.sent.clear()
+    c.rows = []
+    assert await r.check_once() is not None
+    assert n.sent
+
+
+# ── the start-up report ───────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_worthless_leftovers_do_not_page_anyone_at_startup():
+    """11 positions were reported on 2026-11-02, every one of them worth nothing."""
+    r, _, _, n = _rig([_resolved("Galway O/U 7.5", "Over", 5.25),
+                       {**_row("Treasury 5.5%", "Yes", 0.37), "value": 0.04}])
+    await r.check_once()
+    assert n.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_position_worth_something_is_still_reported_at_startup():
+    r, _, _, n = _rig([{**_row("Galway O/U 7.5", "Over", 5.25), "value": 0.0},
+                       {**_row("Texas", "No", 10.0), "value": 8.0}])
+    await r.check_once()
+    assert len(n.sent) == 1 and "Texas" in n.sent[0] and "Galway" not in n.sent[0]
+
+
+@pytest.mark.asyncio
+async def test_small_positions_are_still_watched():
+    r, c, _, n = _rig([{**_row("Treasury 5.5%", "Yes", 0.37), "value": 0.04}])
+    await r.check_once()
+    c.rows = []
+    assert await r.check_once() is not None

@@ -94,6 +94,7 @@ from web3.middleware import ExtraDataToPOAMiddleware
 from polymarket import BuilderApiKey, SecureClient
 from polymarket.errors import RateLimitError, UnexpectedResponseError
 
+from core import data_api
 from telemetry.metrics import MATCH_ORDERS_TOTAL, SIGN_SECONDS, SUBMIT_SECONDS
 from strategy.arbitrage import TICK_SIZE   # single source of truth for tick size
 
@@ -352,6 +353,21 @@ def classify_fills(yes_resp: dict | None, no_resp: dict | None) -> str:
     if no_ok:
         return "no_only"
     return "none"
+
+
+def filled_buy(resp: dict, asked_shares: float, price: float) -> tuple[float, float]:
+    """
+    (collateral spent, shares received) of a filled marketable BUY, before fees.
+
+    A market BUY spends an amount, so a better price than the limit buys more
+    shares than were asked for: 8.32 pUSD at 0.701 bought 11.87 of the 11.13 asked
+    on 2026-11-04. Selling back the number asked for stranded the difference.
+    """
+    spent  = float(resp.get("making_amount") or 0.0)
+    bought = float(resp.get("taking_amount") or 0.0)
+    if spent <= 0.0 or bought <= 0.0:
+        return asked_shares * price, asked_shares
+    return spent, bought
 
 # ── Synthetic Post-Only constants ─────────────────────────────────────────────
 # TICK_SIZE single source of truth is strategy/arbitrage.py — imported at the top
@@ -676,6 +692,9 @@ def _terminal_order_error(exc: Exception) -> "str | None":
     # either: 136 of these burned five retries each on 2026-09-12.
     if "no orderbook exists" in text:
         return "no orderbook for token"
+    # The same order stays under the minimum: 8 s of retries on 2026-11-03.
+    if "invalid amount for a marketable" in text:
+        return "under the minimum order"
     return None
 
 
@@ -1065,7 +1084,7 @@ class PolyClient:
             fee = rate x p x (1-p) x size          (makers pay nothing)
 
         so the rate falls straight out of any fill whose gross and net are both
-        known. The net is `usdcSize` on data-api /activity; the CLOB trade
+        known. The net is `usdc_size` on data-api /v2/activity; the CLOB trade
         record does not carry it, and its fee_rate_bps reads 0 even on charged
         trades, which is what made this look free.
 
@@ -1107,26 +1126,24 @@ class PolyClient:
         try:
             sides = await asyncio.get_running_loop().run_in_executor(_executor, _sides)
             async with httpx.AsyncClient(timeout=20.0) as http:
-                resp = await http.get(
-                    "https://data-api.polymarket.com/activity",
-                    params={"user": self.trading_wallet, "limit": 100},
+                page = await data_api.fetch_page(
+                    http, "activity",
+                    {"user": self.trading_wallet, "type": "TRADE", "limit": 100},
                 )
-            if resp.status_code != 200:
+            if page is None:
                 return None
-            rows = resp.json()
+            rows = page[0]
         except Exception as exc:  # noqa: BLE001
             logger.warning("Taker rate calibration failed: %s", exc)
             return None
 
         solved: list[tuple[int, float]] = []
-        for row in rows if isinstance(rows, list) else []:
-            if row.get("type") != "TRADE":
-                continue
-            if sides.get(str(row.get("transactionHash", "")).lower()) != "TAKER":
+        for row in rows:
+            if sides.get(str(row.get("transaction_hash", "")).lower()) != "TAKER":
                 continue
             try:
                 size = float(row["size"]); px = float(row["price"])
-                net  = float(row.get("usdcSize") or 0.0)
+                net  = float(row.get("usdc_size") or 0.0)
                 ts   = int(row.get("timestamp") or 0)
             except (KeyError, TypeError, ValueError):
                 continue
@@ -1159,38 +1176,65 @@ class PolyClient:
         `title` per position, so the daily summary can say "Fed rate hike in
         2026?" rather than a bare condition ID.
 
-        Returns a list of {title, outcome, size, avg_price, cur_price, value,
-        pnl}, or None if the query fails.
+        Returns a list of {title, outcome, asset, condition_id, size, avg_price,
+        cur_price, value, pnl, redeemable}, or None if the query fails.
+
+        `redeemable` means the market has resolved and the shares are still held,
+        losers included: a loser stays listed at value 0 until someone burns it.
         """
-        url    = "https://data-api.polymarket.com/positions"
-        params = {"user": self.trading_wallet, "sizeThreshold": 0.0001}
+        params = {"user": self.trading_wallet,
+                  "filter_type": "TOKENS", "filter_amount": 0.0001}
         try:
             import httpx  # noqa: PLC0415 — optional at import time
             async with httpx.AsyncClient(timeout=20.0) as http:
-                resp = await http.get(url, params=params)
-            if resp.status_code != 200:
-                logger.warning(
-                    "Positions query returned HTTP %d", resp.status_code
-                )
-                return None
-            rows = resp.json()
-            if not isinstance(rows, list):
+                rows = await data_api.fetch_all(http, "positions", params)
+            if rows is None:
                 return None
             out: list[dict] = []
             for r in rows:
                 out.append({
-                    "title":     str(r.get("title") or "")[:80],
-                    "outcome":   str(r.get("outcome") or ""),
-                    "asset":     str(r.get("asset") or ""),
-                    "size":      float(r.get("size") or 0.0),
-                    "avg_price": float(r.get("avgPrice") or 0.0),
-                    "cur_price": float(r.get("curPrice") or 0.0),
-                    "value":     float(r.get("currentValue") or 0.0),
-                    "pnl":       float(r.get("cashPnl") or 0.0),
+                    "title":        str(r.get("title") or "")[:80],
+                    "outcome":      str(r.get("outcome") or ""),
+                    "asset":        str(r.get("token_id") or ""),
+                    "condition_id": str(r.get("condition_id") or ""),
+                    "size":         float(r.get("current_size") or 0.0),
+                    "avg_price":    float(r.get("avg_price") or 0.0),
+                    "cur_price":    float(r.get("current_price") or 0.0),
+                    "value":        float(r.get("current_value") or 0.0),
+                    "pnl":          float(r.get("total_pnl") or 0.0),
+                    "redeemable":   bool(r.get("redeemable")),
                 })
             return out
         except Exception as exc:  # noqa: BLE001
             logger.warning("Positions query failed: %s", exc)
+            return None
+
+    async def recent_redemptions(self, since: float) -> "list[dict] | None":
+        """
+        The wallet's redemptions since `since` (epoch seconds), newest first, as
+        {title, outcome, usdc, tx, condition_id, ts}; None if the query fails.
+
+        Polymarket's auto-redeem operator performs most of them, so this feed, and
+        not anything the bot did, is what says a position was paid out.
+        """
+        params = {"user": self.trading_wallet, "type": "REDEEM",
+                  "start": max(1, int(since)), "limit": 100}
+        try:
+            import httpx  # noqa: PLC0415 — optional at import time
+            async with httpx.AsyncClient(timeout=20.0) as http:
+                page = await data_api.fetch_page(http, "activity", params)
+            if page is None:
+                return None
+            return [{
+                "title":        str(r.get("title") or "")[:80],
+                "outcome":      str(r.get("outcome") or ""),
+                "usdc":         float(r.get("usdc_size") or 0.0),
+                "tx":           str(r.get("transaction_hash") or ""),
+                "condition_id": str(r.get("condition_id") or ""),
+                "ts":           int(r.get("timestamp") or 0),
+            } for r in page[0]]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Redemption query failed: %s", exc)
             return None
 
     async def collateral_balance(self) -> "float | None":

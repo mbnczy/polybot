@@ -1649,3 +1649,78 @@ class TestEscalatingCooldown:
         g.clear_strikes("0xg")
         assert not g.is_busy("0xg")
         assert g._arm_cooldown("0xg") == pytest.approx(10.0)
+
+
+class TestGroupLossLimit:
+    """
+    The night of 2026-11-03: 15 losing unwinds on two groups in 80 minutes, -1.66
+    USDC, while 3 completions (+0.43) each reset the escalating cooldown. A group
+    that keeps losing is left alone for the window, completions or not.
+    """
+
+    def _guard(self):
+        from execution.negrisk_guard import NegRiskBundleGuard
+        return NegRiskBundleGuard(_StubClient({}), _StubBreaker(), _StubNotifier(),
+                                  group_cooldown=0.0)
+
+    def test_under_the_limit_nothing_is_blocked(self):
+        g = self._guard()
+        g._note_loss("0xg"); g._note_loss("0xg")
+        assert not g.is_busy("0xg")
+
+    def test_at_the_limit_the_group_is_blocked(self):
+        g = self._guard()
+        for _ in range(3):
+            g._note_loss("0xg")
+        assert g.is_busy("0xg")
+
+    def test_a_completion_does_not_lift_it(self):
+        g = self._guard()
+        for _ in range(3):
+            g._note_loss("0xg")
+        g.clear_strikes("0xg")
+        assert g.is_busy("0xg")
+
+    def test_a_completion_does_not_wipe_the_count(self):
+        g = self._guard()
+        g._note_loss("0xg"); g._note_loss("0xg")
+        g.clear_strikes("0xg")
+        g._note_loss("0xg")
+        assert g.is_busy("0xg")
+
+    def test_other_groups_are_untouched(self):
+        g = self._guard()
+        for _ in range(3):
+            g._note_loss("0xa")
+        assert not g.is_busy("0xb")
+
+    def test_it_lifts_when_the_window_passes(self, monkeypatch):
+        import time
+        import execution.negrisk_guard as ng
+        g = self._guard()
+        t = {"now": 1000.0}
+        monkeypatch.setattr(time, "monotonic", lambda: t["now"])
+        for _ in range(3):
+            g._note_loss("0xg")
+        assert g.is_busy("0xg")
+        t["now"] += ng.NEGRISK_GROUP_LOSS_WINDOW_S + 1
+        assert not g.is_busy("0xg")
+
+    def test_old_losses_fall_out_of_the_count(self, monkeypatch):
+        import time
+        import execution.negrisk_guard as ng
+        g = self._guard()
+        t = {"now": 1000.0}
+        monkeypatch.setattr(time, "monotonic", lambda: t["now"])
+        g._note_loss("0xg"); g._note_loss("0xg")
+        t["now"] += ng.NEGRISK_GROUP_LOSS_WINDOW_S + 1
+        g._note_loss("0xg")
+        assert not g.is_busy("0xg")
+
+    def test_zero_switches_it_off(self, monkeypatch):
+        import execution.negrisk_guard as ng
+        monkeypatch.setattr(ng, "NEGRISK_GROUP_MAX_LOSSES", 0)
+        g = self._guard()
+        for _ in range(10):
+            g._note_loss("0xg")
+        assert not g.is_busy("0xg")

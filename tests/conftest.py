@@ -126,7 +126,6 @@ def patched_web3(monkeypatch, fake_w3):
         def __new__(cls, *_a, **_kw):
             return fake_w3
 
-    monkeypatch.setattr("execution.auto_redeem.Web3",       _W3Proxy, raising=True)
     monkeypatch.setattr("execution.inventory_manager.Web3", _W3Proxy, raising=True)
     return fake_w3
 

@@ -57,9 +57,10 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from strategy.cross_market import Implication
 from strategy.quantity_guard import is_over_under, statistics
@@ -812,11 +813,25 @@ def _to_implication(
         return None
 
 
+# What a request that never got an answer returns, as against a model saying no.
+_NO_ANSWER = object()
+
+# An endpoint that has answered nothing and failed this many requests is down. The
+# rest of a batch would only wait out the same timeout, one pass after another.
+_GIVE_UP_AFTER = 16
+
+
 def classify_one(
     client, provider: Provider, model: str, c: Candidate,
     rules: "dict[str, str] | None" = None,
 ) -> Optional[Implication]:
     """Classify a single pair. Returns None on refusal, error, or NONE."""
+    rel = _classify(client, provider, model, c, rules)
+    return None if rel is _NO_ANSWER else rel
+
+
+def _classify(client, provider: Provider, model: str, c: Candidate, rules) -> Any:
+    """As classify_one, but a failed request returns _NO_ANSWER."""
     kwargs: dict = {
         "model": model,
         "messages": [
@@ -840,7 +855,7 @@ def classify_one(
         text = resp.choices[0].message.content or ""
     except Exception as exc:                         # noqa: BLE001 — provider-agnostic
         logger.warning("implication mapper | request failed: %s", exc)
-        return None
+        return _NO_ANSWER
 
     verdict = parse_verdict(text)
     if verdict is None:
@@ -869,6 +884,7 @@ def classify_candidates(
     client=None,
     concurrency: int = 8,
     rules:       "dict[str, str] | None" = None,
+    failed:      "list[Candidate] | None" = None,
 ) -> list[Implication]:
     """
     Classify candidate pairs concurrently.
@@ -877,6 +893,9 @@ def classify_candidates(
     compatibility surface, so throughput comes from concurrency instead. Bounded,
     because these endpoints rate-limit and discovery is offline — there is no
     deadline worth tripping a 429 for.
+
+    `failed` collects the candidates that got no answer. Nothing was learned about
+    those, so a caller that remembers verdicts must not remember them.
     """
     if not candidates:
         return []
@@ -892,12 +911,32 @@ def classify_candidates(
         len(candidates), prov.name, mdl,
     )
 
+    missed: list[Candidate] = [] if failed is None else failed
+    answered = threading.Event()
+
+    def _one(c: Candidate) -> Optional[Implication]:
+        if not answered.is_set() and len(missed) >= _GIVE_UP_AFTER:
+            missed.append(c)
+            return None
+        rel = _classify(cli, prov, mdl, c, rules)
+        if rel is _NO_ANSWER:
+            missed.append(c)
+            return None
+        answered.set()
+        return rel
+
     out: list[Implication] = []
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-        for rel in pool.map(lambda c: classify_one(cli, prov, mdl, c, rules), candidates):
+        for rel in pool.map(_one, candidates):
             if rel:
                 out.append(rel)
 
+    if missed:
+        logger.error(
+            "implication mapper | %d of %d request(s) got no answer from %s/%s — "
+            "they will be asked again",
+            len(missed), len(candidates), prov.name, mdl,
+        )
     logger.info(
         "implication mapper | %d implication(s) from %d candidate pair(s)",
         len(out), len(candidates),

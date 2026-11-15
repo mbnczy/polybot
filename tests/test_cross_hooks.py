@@ -1,6 +1,6 @@
 """
-The two hooks that let cross positions live alongside the rest of the bot:
-the reconciler leaves their markets out, and the redeemer takes them in.
+The hook that lets cross positions live alongside the rest of the bot: the
+reconciler leaves their markets out.
 """
 
 from __future__ import annotations
@@ -9,7 +9,6 @@ import asyncio
 
 import pytest
 
-from execution.auto_redeem import AutoRedeemer
 from execution.reconciler import WalletReconciler
 
 
@@ -78,26 +77,3 @@ def test_without_a_hook_nothing_changes():
     client.rows = [_row(CROSS, "No", 10.0)]
     assert asyncio.run(r.check_once()) is not None
 
-
-def _redeemer(registry_ids, extra, redeemed=()):
-    r = AutoRedeemer.__new__(AutoRedeemer)
-    r._registry = type("R", (), {"condition_ids": set(registry_ids)})()
-    r._extra_ids = extra
-    r._redeemed = set(redeemed)
-    return r
-
-
-def test_the_redeemer_takes_the_cross_markets_in():
-    r = _redeemer({"0xfeed"}, lambda: {"0xn", "0xb"})
-    assert r._candidate_ids() == {"0xfeed", "0xn", "0xb"}
-
-
-def test_already_redeemed_markets_stay_out():
-    r = _redeemer({"0xfeed"}, lambda: {"0xn"}, redeemed={"0xn"})
-    assert r._candidate_ids() == {"0xfeed"}
-
-
-def test_a_failing_hook_does_not_stop_redemption():
-    def boom():
-        raise RuntimeError("book unreadable")
-    assert _redeemer({"0xfeed"}, boom)._candidate_ids() == {"0xfeed"}

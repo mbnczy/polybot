@@ -920,12 +920,6 @@ class CrossGuard:
             p for p in self._book.closed if (p.closed_ts or 0.0) >= cutoff
         ]
 
-    def condition_ids(self) -> set[str]:
-        """Markets AutoRedeemer should watch: held now, or resolved recently."""
-        out = {c for p in self._recent() for c in (p.narrow, p.broad)}
-        out |= {c for a in self._attempts.values() for c in (a.narrow, a.broad)}
-        return out
-
     def managed_titles(self) -> set[str]:
         """Titles whose inventory this guard owns, for WalletReconciler."""
         out = {t for p in self._recent() for t in (p.narrow_title, p.broad_title) if t}
@@ -2078,13 +2072,15 @@ async def _gamma_resolution(condition_id: str) -> "bool | None":
     True if YES won, False if NO won, None while unresolved or unclear.
 
     Filtered on `condition_ids` — the camel-case key is silently ignored and
-    returns an unfiltered page.
+    returns an unfiltered page. Gamma returns a closed market only when asked for
+    closed ones, so without `closed` a settled position was never seen to settle:
+    Brighton/Albion resolved on 2026-10-18 and still held its slot on 2026-11-04.
     """
     import httpx  # noqa: PLC0415
 
     try:
         async with httpx.AsyncClient(timeout=20.0) as h:
-            r = await h.get(_GAMMA, params={"condition_ids": condition_id})
+            r = await h.get(_GAMMA, params={"condition_ids": condition_id, "closed": "true"})
         rows = r.json() if r.status_code == 200 else []
     except Exception:  # noqa: BLE001
         return None

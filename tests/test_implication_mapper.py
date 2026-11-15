@@ -388,3 +388,56 @@ def test_env_model_does_not_leak_into_another_provider(monkeypatch):
     assert im.resolve_model(custom) == "sztaki_pipeline-gemma4:31b"
     # a DIFFERENT provider keeps its own default
     assert im.resolve_model(im.PROVIDERS["openai"]) == "gpt-5"
+
+
+# ── a request that got no answer is not a verdict ─────────────────────────────
+# The endpoint went down on 2026-10-15, and every pair sent to it was written down
+# as "not an implication": about 28,000 of them, for good, 200 more every pass.
+
+def _down():
+    return _StubClient(raise_exc=RuntimeError("Request timed out."))
+
+
+def test_a_down_endpoint_leaves_the_batch_marked_unanswered():
+    cands, failed = [_cand() for _ in range(5)], []
+    out = classify_candidates(cands, provider=PROVIDERS["openai"], model="m", client=_down(), failed=failed)
+    assert out == [] and len(failed) == 5
+
+
+def test_a_down_endpoint_is_given_up_on_inside_the_batch():
+    cli, failed = _down(), []
+    cands = [_cand() for _ in range(200)]
+    classify_candidates(cands, provider=PROVIDERS["openai"], model="m", client=cli, failed=failed, concurrency=1)
+    assert len(cli.calls) == 16, "the rest would only wait out the same timeout"
+    assert len(failed) == 200, "and all of them still count as unanswered"
+
+
+def test_a_no_from_the_model_is_an_answer():
+    cli, failed = _StubClient('{"relation":"NONE","confidence":0.9,"reasoning":"no"}'), []
+    out = classify_candidates([_cand()], provider=PROVIDERS["openai"], model="m", client=cli, failed=failed)
+    assert out == [] and failed == []
+
+
+def test_an_unusable_reply_is_an_answer():
+    """Asking again would pay for the same reply; only a failed request is retried."""
+    cli, failed = _StubClient("not json at all"), []
+    classify_candidates([_cand()], provider=PROVIDERS["openai"], model="m", client=cli, failed=failed)
+    assert failed == []
+
+
+def test_a_flaky_endpoint_is_not_given_up_on():
+    cli = _StubClient('{"relation":"A_IMPLIES_B","confidence":0.9,"reasoning":"subset"}')
+    orig = cli.chat.completions.create
+    n = {"i": 0}
+
+    def flaky(**kw):
+        n["i"] += 1
+        if n["i"] % 2:
+            raise RuntimeError("503")
+        return orig(**kw)
+
+    cli.chat.completions.create = flaky
+    failed: list = []
+    out = classify_candidates([_cand() for _ in range(60)], provider=PROVIDERS["openai"],
+                              model="m", client=cli, failed=failed, concurrency=1)
+    assert n["i"] == 60 and len(out) == 30 and len(failed) == 30

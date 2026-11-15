@@ -369,10 +369,9 @@ def test_restore_puts_open_capital_back_in_the_ledger(tmp_path, monkeypatch):
     assert breaker2.status_dict()["cross_committed_usdc"] == pytest.approx(8.5)
 
 
-def test_it_hands_its_markets_to_the_redeemer_and_the_reconciler(tmp_path, monkeypatch):
+def test_it_hands_its_markets_to_the_reconciler(tmp_path, monkeypatch):
     g, _, _, _ = _guard(tmp_path, monkeypatch, {}, [])
     _open(g)
-    assert g.condition_ids() == {"0xn", "0xb"}
     assert g.managed_titles() == {"N", "B"}
 
 

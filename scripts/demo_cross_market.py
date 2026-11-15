@@ -723,17 +723,24 @@ def discover(markets: list[dict], args) -> list:
     # endpoint in CLOSE-WAIT. The reader's file-descriptor limit is 1024, so a
     # long-lived process eventually runs out.
     client = im.build_client(provider)
+    failed: list = []
     try:
         rels = im.classify_candidates(
             cands, provider=provider, model=model, client=client,
-            concurrency=args.concurrency, rules=rules,
+            concurrency=args.concurrency, rules=rules, failed=failed,
         )
     finally:
         close = getattr(client, "close", None)
         if callable(close):
             close()
-    cache.remember(cands, rels)
+    # A verdict never expires, so a request that got no answer must not become one:
+    # an endpoint down from 2026-10-15 wrote about 28,000 pairs off as "no".
+    unanswered = {id(c) for c in failed}
+    cache.remember([c for c in cands if id(c) not in unanswered], rels)
     cache.save()
+    if failed:
+        print(f"  model      : {len(failed)}/{len(cands)} request(s) got no answer — "
+              f"not remembered, asked again next pass")
     rels = known + rels
     strong = [r for r in rels if r.confidence >= args.threshold]
     print(f"    {len(rels)} asserted ({len(known)} from cache) · "
@@ -1092,12 +1099,13 @@ def _resolved_outcome(condition_id: str) -> bool | None:
 
     Gamma filters on `condition_ids`. The camel-case `conditionId` is silently
     ignored and returns an unfiltered page — which is how a query for one
-    market's fee once returned a different market's every time.
+    market's fee once returned a different market's every time. A closed market
+    is returned only when asked for, as in fetch_resolved.
     """
     import httpx
 
     try:
-        r = _http().get(_GAMMA, params={"condition_ids": condition_id})
+        r = _http().get(_GAMMA, params={"condition_ids": condition_id, "closed": "true"})
         rows = r.json() if r.status_code == 200 else []
     except Exception:                               # noqa: BLE001
         return None

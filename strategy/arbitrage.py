@@ -1530,6 +1530,22 @@ def taker_sell_fee(proceeds: float, sold: float, rate: float | None = None) -> f
     return proceeds * effective_taker_fee(proceeds / sold, rate)
 
 
+def round_trip_pnl(
+    spent: float, bought: float, proceeds: float, sold: float, rate: float | None = None,
+) -> float:
+    """
+    What a leg bought and sold back made, both taker fees included.
+
+    `spent`/`bought` come from the BUY's response and `proceeds`/`sold` from the
+    SELL's, all before fees. Shares not sold are left out of it: they are still
+    held, so their cost is not a loss yet.
+    """
+    if spent <= 0.0 or bought <= 0.0 or sold <= 0.0:
+        return 0.0
+    cost = spent * (1.0 + effective_taker_fee(spent / bought, rate))
+    return proceeds - taker_sell_fee(proceeds, sold, rate) - cost * min(sold, bought) / bought
+
+
 def maker_fee(price: float) -> float:
     """Makers are not charged. Measured over 175 settled maker fills: 0.0000%."""
     return 0.0

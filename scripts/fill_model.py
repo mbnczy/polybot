@@ -45,9 +45,9 @@ sys.path.insert(0, str(REPO))
 
 import httpx  # noqa: E402
 
+from core.data_api import market_trades  # noqa: E402
 from scripts.analyze_ws_recording import _lines, load_tokens  # noqa: E402
 
-_TRADES = "https://data-api.polymarket.com/trades"
 HORIZONS = (180.0, 1800.0, 7200.0)
 MARKOUTS = (60.0, 300.0, 1800.0)
 
@@ -104,17 +104,8 @@ def state_at(series: list, times: list, t: float):
 
 
 def trades_of(cid: str, since: float) -> list:
-    out, offset = [], 0
     with httpx.Client(timeout=30) as c:
-        while offset < 5000:
-            r = c.get(_TRADES, params={"market": cid, "limit": 500, "offset": offset})
-            if r.status_code != 200:
-                break
-            page = r.json()
-            out += page
-            if len(page) < 500 or page[-1]["timestamp"] < since:
-                break
-            offset += 500
+        out = market_trades(lambda u, p: c.get(u, params=p), cid, since=since, max_rows=5000)
     return sorted((t for t in out if t["timestamp"] >= since), key=lambda t: t["timestamp"])
 
 

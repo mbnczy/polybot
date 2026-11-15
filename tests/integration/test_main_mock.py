@@ -40,6 +40,7 @@ from risk.circuit_breaker  import (
 from strategy.arbitrage    import (
     DEFAULT_TAKER_FEE, DESIRED_NET_MARGIN,
     ArbDetector, DutchBookPricer, FeeEngine, MakerRebateEngine, NegRiskArbDetector,
+    round_trip_pnl,
 )
 from strategy.tuner        import tuner_loop
 from telemetry.db_logger   import SignalLogger
@@ -142,7 +143,7 @@ def components(monkeypatch, patched_clob, patched_web3, tmp_path):
     )
 
     # ── step 6: auto redeemer ────────────────────────────────────────────────
-    redeemer = AutoRedeemer(feed_registry=feed_registry, notifier=notifier)
+    redeemer = AutoRedeemer(notifier=notifier, clob_client=client)
 
     return dict(
         client=client, breaker=breaker, notifier=notifier,
@@ -414,7 +415,7 @@ async def test_main_mock_dutch_book_maker_path(monkeypatch, patched_clob, patche
         scan_interval=0.05,
         max_feeds=10,
     )
-    redeemer = AutoRedeemer(feed_registry=feed_registry, notifier=notifier)
+    redeemer = AutoRedeemer(notifier=notifier, clob_client=client)
 
     tasks: list[asyncio.Task] = []
 
@@ -545,7 +546,7 @@ async def test_main_mock_negrisk_path(monkeypatch, patched_clob, patched_web3, t
         scan_interval=9999.0,
         max_feeds=10,
     )
-    redeemer = AutoRedeemer(feed_registry=feed_registry, notifier=notifier)
+    redeemer = AutoRedeemer(notifier=notifier, clob_client=client)
 
     tasks: list[asyncio.Task] = []
 
@@ -806,3 +807,153 @@ async def test_main_mock_negrisk_clob_release_on_submit_failure(monkeypatch, tmp
     status = breaker.status_dict()
     assert status["open_positions"] == 0, "reservation leaked on submit failure"
     assert status["session_pnl"] == 0.0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# taker pair: one leg filled, or one leg under the exchange's minimum
+# ════════════════════════════════════════════════════════════════════════════
+
+async def _run_strategy_until(c, done, timeout: float = 3.0) -> None:
+    """Only what a signal needs: the scanner's feed and the strategy loop."""
+    await c["sig_log"].init()
+    tasks = [
+        asyncio.create_task(scanner_loop(c["scanner"]), name="scanner"),
+        asyncio.create_task(
+            strategy_loop(
+                c["market_queue"], c["detector"], c["dutch_pricer"],
+                c["neg_risk_det"], c["rebate_engine"],
+                c["fee_engine"], c["breaker"],
+                c["client"], c["notifier"], c["sig_log"],
+            ),
+            name="strategy",
+        ),
+        asyncio.create_task(c["sig_log"].run(), name="sig_logger"),
+    ]
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline and not done():
+        await asyncio.sleep(0.02)
+    await asyncio.sleep(0.05)
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    await c["feed_registry"].stop_all()
+    await c["sig_log"].close()
+
+
+def _half_filled(c, *, unwound):
+    """YES is killed; NO fills at a better price than asked, so more shares arrive."""
+    from decimal import Decimal
+    calls = {"pair": 0, "unwound": []}
+
+    async def pair(**kw):
+        calls["pair"] += 1
+        return (
+            {"status": "error", "error": "order couldn't be fully filled."},
+            {"status": "matched", "making_amount": Decimal("5.00"),
+             "taking_amount": Decimal("11.00")},
+        )
+
+    async def unwind(token_id, size, price=0.0):
+        calls["unwound"].append((token_id, size))
+        if isinstance(unwound, Exception):
+            raise unwound
+        return unwound
+
+    async def rate(condition_id):
+        return 0.04
+
+    c["client"].execute_arb_pair = pair
+    c["client"].unwind_leg = unwind
+    c["fee_engine"].get_taker_rate = rate
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_a_half_fill_sells_what_was_bought_and_books_the_result(components):
+    c = components
+    calls = _half_filled(c, unwound={"status": "matched", "making_amount": 11.0,
+                                     "taking_amount": 4.70})
+    await _run_strategy_until(c, lambda: calls["unwound"] and c["notifier"].messages)
+
+    assert calls["pair"] == 1
+    assert calls["unwound"] == [(NO_ID, pytest.approx(11.0))], "the shares received, not asked"
+    status = c["breaker"].status_dict()
+    realised = round_trip_pnl(5.00, 11.0, 4.70, 11.0, 0.04)
+    assert -0.60 < realised < -0.30, "the buy and the sell each pay their fee"
+    assert status["session_pnl"] == pytest.approx(realised, abs=1e-4)
+    assert status["open_positions"] == 0
+    assert any("Half-fill" in m and f"{realised:+.4f}" in m for m in c["notifier"].messages)
+    assert c["notifier"].critical_errors == []
+
+
+@pytest.mark.asyncio
+async def test_a_half_fill_that_could_not_be_sold_asks_for_a_person(components):
+    c = components
+    calls = _half_filled(c, unwound={"status": "error", "error": "unwind sold nothing"})
+    await _run_strategy_until(c, lambda: calls["unwound"] and c["notifier"].critical_errors)
+
+    assert any("UNWIND FAILED" in m for m in c["notifier"].critical_errors)
+    status = c["breaker"].status_dict()
+    assert status["session_pnl"] == 0.0 and status["open_positions"] == 0
+    assert not any("sold back" in m for m in c["notifier"].messages)
+
+
+@pytest.mark.asyncio
+async def test_a_partly_sold_half_fill_books_what_was_sold_and_asks_about_the_rest(components):
+    c = components
+    calls = _half_filled(c, unwound={"status": "matched", "making_amount": 5.5,
+                                     "taking_amount": 2.35, "partial": True})
+    await _run_strategy_until(c, lambda: calls["unwound"] and c["notifier"].critical_errors)
+
+    assert any("UNWIND PARTIAL" in m and "5.50" in m for m in c["notifier"].critical_errors)
+    assert c["breaker"].status_dict()["session_pnl"] == pytest.approx(
+        round_trip_pnl(5.00, 11.0, 2.35, 5.5, 0.04), abs=1e-4)
+
+
+@pytest.mark.asyncio
+async def test_a_market_that_half_filled_is_left_alone(components):
+    c = components
+    calls = _half_filled(c, unwound={"status": "matched", "making_amount": 11.0,
+                                     "taking_amount": 4.70})
+    ticks = []
+    queue = c["market_queue"]
+    real_get = queue.get
+
+    async def tapped():
+        tick = await real_get()
+        ticks.append(tick)
+        return tick
+
+    queue.get = tapped
+    skipped = c["notifier"].skipped
+
+    resent = {"done": False}
+
+    def done():
+        if calls["unwound"] and c["notifier"].messages and not resent["done"]:
+            resent["done"] = True
+            queue.put_nowait(dict(ticks[-1]))
+        return bool(skipped)
+
+    await _run_strategy_until(c, done)
+    assert calls["pair"] == 1
+    assert any("half-filled" in s for s in skipped), skipped
+
+
+@pytest.mark.asyncio
+async def test_a_leg_under_the_exchange_minimum_never_reaches_the_exchange(components, monkeypatch):
+    """
+    2026-11-03 15:08: yes=0.089 at 10.53 shares is $0.94. The exchange refuses that,
+    and beside a filled NO leg it would have been a half-fill. Nothing larger fits
+    the cap, so the pair is left. Here the cap is lowered to the same effect.
+    """
+    import main as main_mod
+    import risk.circuit_breaker as cb_mod
+    monkeypatch.setattr(cb_mod, "MAX_ARB_PAIR_USDC", 2.0)
+    monkeypatch.setattr(main_mod, "MAX_ARB_PAIR_USDC", 2.0)
+    c = components
+    calls = _half_filled(c, unwound={})
+    skipped = c["notifier"].skipped
+    await _run_strategy_until(c, lambda: bool(skipped))
+    assert calls["pair"] == 0
+    assert any("$1 minimum" in s for s in skipped), skipped

@@ -10,7 +10,7 @@ Six long-running coroutines run concurrently under asyncio.gather:
   scanner_loop      ←  MarketScanner polls Gamma API → FeedRegistry
   strategy_loop     ←  Queue consumer → FeeEngine → ArbDetector →
                         CircuitBreaker → dual-FOK → TelegramNotifier
-  auto_redeem_loop  ←  AutoRedeemer polls resolved positions → CTF redeem
+  auto_redeem_loop  ←  AutoRedeemer reports redemptions, redeems what was left
   heartbeat_loop    ←  60-second Telegram health ping
   telegram_loop     ←  python-telegram-bot polling loop; handles /status and
                         /halt commands from the authorised TELEGRAM_CHAT_ID
@@ -29,7 +29,7 @@ Startup sequence
   8.  Initialise FeedRegistry (shared arb_tick queue)
   9.  Seed FeedRegistry with ENV-configured YES/NO pair (if set)
   10. Initialise MarketScanner → FeedRegistry.add_market callback
-  11. Initialise AutoRedeemer(FeedRegistry, TelegramNotifier)
+  11. Initialise AutoRedeemer(TelegramNotifier, PolyClient)
   12. asyncio.gather all tasks
 
 strategy_loop hot path
@@ -99,7 +99,7 @@ load_dotenv()
 
 from config import BotConfig                                       # noqa: E402
 from core.clob_client import (                                     # noqa: E402
-    PolyClient, classify_fills, prime_market_meta,
+    PolyClient, _resp_filled, classify_fills, filled_buy, prime_market_meta,
 )
 from core import market_flow, market_titles                                  # noqa: E402
 from core.scanner import FeedRegistry, MarketScanner               # noqa: E402
@@ -107,7 +107,7 @@ from execution.auto_redeem import AutoRedeemer                     # noqa: E402
 from execution.inventory_manager import InventoryManager           # noqa: E402
 from execution.negrisk_guard import NegRiskBundleGuard             # noqa: E402
 from execution.reconciler import WalletReconciler                 # noqa: E402
-from execution.cross_guard import CrossGuard                                    # noqa: E402
+from execution.cross_guard import CrossGuard, min_order_shares                  # noqa: E402
 from execution.pair_guard import MakerPairGuard                    # noqa: E402
 from risk.circuit_breaker import (                                 # noqa: E402
     ArbOrderIntent,
@@ -129,6 +129,7 @@ from strategy.arbitrage import (                                   # noqa: E402
     NegRiskSignal,
     _normalise_fee,
     plan_bundle_execution,
+    round_trip_pnl,
 )
 from strategy.arb_duration import ArbDurationTracker               # noqa: E402
 from strategy.tuner import fee_recalibration_loop, tuner_loop                               # noqa: E402
@@ -212,6 +213,11 @@ _negrisk_min_relative_edge = _cfg.negrisk_min_relative_edge
 _MAKER_REQUIRE_BOOK_IMPROVEMENT: bool = os.environ.get(
     "MAKER_REQUIRE_BOOK_IMPROVEMENT", "false"
 ).strip().lower() in ("1", "true", "yes", "on")
+# How long a market is left alone after a taker pair half-filled on it. The other
+# leg's quote was not real, and the same market signalled again two minutes later
+# on 2026-11-04.
+_ARB_HALF_FILL_COOLDOWN_S: float = float(os.environ.get("ARB_HALF_FILL_COOLDOWN_S", 7200.0))
+
 # Maker (Dutch Book) arb path toggle. Default on. Set MAKER_ARB_ENABLED=false
 # to disable resting-bid maker orders (one-leg risk) and trade taker-only.
 _maker_arb_enabled = os.environ.get("MAKER_ARB_ENABLED", "true").strip().lower() != "false"
@@ -290,11 +296,18 @@ async def strategy_loop(
     # opened ANOTHER position on the same market and the newer pair silently
     # displaced the older one in per-condition registries.
     busy_conditions: set[str] = set()
+    # condition_id -> monotonic deadline after a half-filled taker pair
+    half_filled_until: dict[str, float] = {}
 
     def _busy_reason(cid: str) -> "str | None":
         """Why a signal on this market is not placed, for the episode summary."""
         if cid in busy_conditions:
             return "an execution is already in flight"
+        until = half_filled_until.get(cid)
+        if until is not None:
+            if time.monotonic() < until:
+                return "a taker pair half-filled here, cooling down"
+            del half_filled_until[cid]
         if pair_guard is not None:
             why = pair_guard.busy_reason(cid)
             if why:
@@ -394,27 +407,25 @@ async def strategy_loop(
                     )
 
                 elif fill_state in ("yes_only", "no_only"):
-                    breaker.release_open()
                     ARB_HALF_FILLS.inc()
-                    naked_token = (
-                        yes_token_id if fill_state == "yes_only" else no_token_id
+                    half_filled_until[condition_id] = (
+                        time.monotonic() + _ARB_HALF_FILL_COOLDOWN_S
                     )
+                    naked_token, naked_resp, naked_price = (
+                        (yes_token_id, yes_resp, yes_ask) if fill_state == "yes_only"
+                        else (no_token_id, no_resp, no_ask)
+                    )
+                    spent, bought = filled_buy(naked_resp, n_shares, naked_price)
                     logger.error(
                         "HALF-FILL (%s) on %s — flattening naked leg %s (%.2f shares)",
-                        fill_state, condition_id[:16], naked_token[:16], n_shares,
+                        fill_state, condition_id[:16], naked_token[:16], bought,
                     )
                     try:
-                        await client.unwind_leg(naked_token, n_shares)
-                        notifier.arb_event(
-                            condition_id,
-                            f"⚠️ half-fill ({fill_state}) — naked leg flattened, "
-                            f"no profit booked",
-                        )
-                        await notifier.notify(
-                            f"⚠️ Half-fill on {condition_id[:16]} ({fill_state}) — "
-                            f"naked leg flattened, no profit booked."
-                        )
+                        unwound = await client.unwind_leg(naked_token, bought)
+                        if not _resp_filled(unwound):
+                            raise RuntimeError(f"unwind not filled: {unwound}")
                     except Exception as uexc:  # noqa: BLE001
+                        breaker.release_open()
                         ARB_UNWIND_FAILURES.inc()
                         logger.error("Unwind failed for %s: %s", naked_token[:16], uexc)
                         notifier.arb_event(
@@ -425,6 +436,38 @@ async def strategy_loop(
                             f"HALF-FILL UNWIND FAILED {condition_id[:16]} "
                             f"({fill_state}) — MANUAL INTERVENTION REQUIRED"
                         )
+                    else:
+                        try:
+                            rate = await fee_engine.get_taker_rate(condition_id)
+                        except Exception:  # noqa: BLE001
+                            rate = None    # the live estimate: the sale has happened
+                        sold = float(unwound.get("making_amount") or 0.0)
+                        realised = round(round_trip_pnl(
+                            spent, bought, float(unwound.get("taking_amount") or 0.0),
+                            sold, rate,
+                        ), 6)
+                        logger.warning(
+                            "HALF-FILL sold back | %s | bought %.2f for %.4f, sold %.2f "
+                            "| realised=%+.4f USDC",
+                            condition_id[:16], bought, spent, sold, realised,
+                        )
+                        notifier.arb_event(
+                            condition_id,
+                            f"⚠️ half-fill ({fill_state}) — naked leg sold back",
+                            realised,
+                        )
+                        await notifier.notify(
+                            f"⚠️ Half-fill on {condition_id[:16]} ({fill_state}) — "
+                            f"naked leg sold back, {realised:+.4f} USDC."
+                        )
+                        if bought - sold >= 0.01:
+                            await notifier.send_critical_error(
+                                f"HALF-FILL UNWIND PARTIAL {condition_id[:16]} — "
+                                f"{bought - sold:.2f} shares still naked — "
+                                f"MANUAL INTERVENTION REQUIRED"
+                            )
+                        # Last: this raises when the day goes through its limit.
+                        breaker.on_fill(pnl=realised)
 
                 else:  # "none" (taker/FOK path: both legs killed, no position)
                     breaker.release_open()
@@ -872,6 +915,18 @@ async def strategy_loop(
                 n_shares = arb_signal.yes_size
             else:
                 n_shares = breaker.calculate_position_size(yes_ask, no_ask)
+                # The exchange refuses a marketable BUY under $1, and one refused
+                # leg beside one filled leg is a half-fill. This is already the most
+                # the cap allows, so a leg still under the minimum means leaving it.
+                if n_shares < max(min_order_shares(yes_ask), min_order_shares(no_ask)):
+                    logger.info(
+                        "Signal on %s skipped — a leg stays under the $1 minimum "
+                        "inside the %.2f cap (yes=%.4f no=%.4f)",
+                        condition_id[:16], MAX_ARB_PAIR_USDC, yes_ask, no_ask,
+                    )
+                    notifier.arb_skipped(
+                        condition_id, "a leg stays under the exchange's $1 minimum")
+                    continue
             if n_shares < 0.01:
                 logger.warning(
                     "Position size %.4f below minimum — skipping "
@@ -1296,13 +1351,9 @@ async def main() -> None:
     # Redemptions are announced to the reconciler so a settlement is never
     # mistaken for an order that escaped supervision.
     redeemer = AutoRedeemer(
-        feed_registry=feed_registry,
         notifier=notifier,
-        clob_client=client,   # V2 SDK redemption routing (post-pUSD migration)
+        clob_client=client,
         on_redeemed=lambda title: reconciler.note_redemption(title),
-        # Cross legs are priced by REST, not the feed registry, so their markets
-        # would otherwise never be redeemed.
-        extra_condition_ids=cross_guard.condition_ids,
     )
 
     # ── inventory manager: recycles paired-fill collateral via mergePositions

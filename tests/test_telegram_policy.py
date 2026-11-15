@@ -152,3 +152,50 @@ async def test_an_episode_is_sent_only_if_something_traded_in_it(monkeypatch):
     n.send_arb_summary("0xc", 4.0, 600.0, 3, True)
     await asyncio.sleep(0.05)
     assert len(n.posted) == 1 and "0xc" in n.posted[0] and "-0.1600" in n.posted[0]
+
+
+# ── what the exchange says when it refuses an order ───────────────────────────
+# Sent as transactions from 2026-11-02: "order couldn't be fully filled" reads as
+# "filled" to a pattern, and nothing had traded.
+
+FOK = "order couldn't be fully filled. FOK orders are fully filled or killed."
+MIN = "invalid amount for a marketable BUY order ($0.94), min size: 1"
+
+
+@pytest.mark.parametrize("line", [f"❌ execution failed — {FOK}", f"❌ execution failed — {MIN}", FOK])
+def test_a_refused_order_is_not_a_trade(line):
+    assert says_traded(line) is False
+
+
+@pytest.mark.parametrize("text,kind", [
+    (f"ARB EXECUTION ERROR: {FOK}", "info"),
+    (f"ARB EXECUTION ERROR: {MIN}", "info"),
+    ("ARB EXECUTION ERROR: connection reset", "critical"),
+    (f"NEG RISK SUBMIT ERROR: {FOK}", "critical"),
+    ("⚠️ Half-fill on 0xcd953913ecd5bf (no_only) — naked leg sold back, -0.6495 USDC.", "trade"),
+    ("💰 CTF REDEEMED — 20.44 pUSD\n  No Will the Republicans win", "trade"),
+    ("⚠️ REDEEM FAILED 3× — Over Abha, 5.00 pUSD still unpaid\nMANUAL INTERVENTION REQUIRED", "critical"),
+    # Both kinds go out; a leg that filled is a transaction as well.
+    ("<b>CRITICAL ERROR</b>\n<code>HALF-FILL UNWIND PARTIAL 0xcd95 — 0.74 shares still naked</code>", "trade"),
+])
+def test_what_these_messages_are_about(text, kind):
+    assert message_kind(text) == kind
+
+
+@pytest.mark.parametrize("line,traded", [
+    ("⚠️ half-fill (no_only) — naked leg sold back", True),
+    ("✅ both legs filled at submission — 10.30 pairs", True),
+])
+def test_real_fills_still_count(line, traded):
+    assert says_traded(line) is traded
+
+
+@pytest.mark.asyncio
+async def test_an_episode_that_ended_in_a_refusal_stays_off_the_chat(monkeypatch):
+    n = _notifier(monkeypatch)
+    n._arb_min_bps = 0.0
+    _detect(n, "0xd")
+    n.arb_event("0xd", f"❌ execution failed — {FOK}"[:140])
+    n.send_arb_summary("0xd", 0.0, 536.0, 1, False)
+    await asyncio.sleep(0.05)
+    assert n.posted == []

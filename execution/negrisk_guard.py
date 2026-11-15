@@ -101,6 +101,17 @@ NEGRISK_COOLDOWN_MAX_S: float = float(
     os.environ.get("NEGRISK_COOLDOWN_MAX_S", 900.0)
 )
 
+# A group that has lost this many unwinds inside the window is left alone for the
+# rest of it, whatever completed in between. The escalating cooldown above resets
+# on a completion and tops out at 15 minutes, so on the night of 2026-11-03 two
+# groups lost 15 times between them in 80 minutes (-1.66 USDC), with 3 completions
+# (+0.43) that each wiped the slate. Replayed, a limit of 3 ends the night at -0.53
+# instead of -1.29. Set 0 to disable.
+NEGRISK_GROUP_MAX_LOSSES: int = int(os.environ.get("NEGRISK_GROUP_MAX_LOSSES", 3))
+NEGRISK_GROUP_LOSS_WINDOW_S: float = float(
+    os.environ.get("NEGRISK_GROUP_LOSS_WINDOW_S", 86_400.0)
+)
+
 # Complete a partially-filled bundle as taker when the missing legs are cheap
 # enough that the finished bundle still clears its payout floor. Set 0 to
 # disable and always flatten (the behaviour before 2026-09-06).
@@ -260,6 +271,10 @@ class NegRiskBundleGuard:
         self._bundles: dict[str, _WatchedBundle] = {}
         # condition_id -> monotonic deadline before which the group is off limits
         self._cooling: dict[str, float] = {}
+        # condition_id -> monotonic times of its recent losing unwinds
+        self._losses: dict[str, list[float]] = {}
+        # condition_id -> monotonic deadline; a completion does not lift this one
+        self._blocked: dict[str, float] = {}
 
     # ──────────────────────────────────────────────────────────────────────────
     # Registration
@@ -339,6 +354,22 @@ class NegRiskBundleGuard:
         )
         return window
 
+    def _note_loss(self, condition_id: str) -> None:
+        """Count a losing unwind; enough of them inside the window block the group."""
+        if NEGRISK_GROUP_MAX_LOSSES <= 0:
+            return
+        now = time.monotonic()
+        recent = [t for t in self._losses.get(condition_id, [])
+                  if now - t < NEGRISK_GROUP_LOSS_WINDOW_S]
+        recent.append(now)
+        self._losses[condition_id] = recent
+        if len(recent) >= NEGRISK_GROUP_MAX_LOSSES:
+            self._blocked[condition_id] = recent[0] + NEGRISK_GROUP_LOSS_WINDOW_S
+            logger.warning(
+                "NegRiskGuard | group %s blocked for %.1f h after %d losing unwinds",
+                condition_id[:16], (self._blocked[condition_id] - now) / 3600.0, len(recent),
+            )
+
     def set_taker_fee(self, rate: float) -> None:
         """Adopt the fee measured from settled trades. The completion test is
         entirely decided by this number, so an assumed one is not good enough:
@@ -375,6 +406,11 @@ class NegRiskBundleGuard:
         """
         if self.is_watching(condition_id):
             return True
+        blocked = self._blocked.get(condition_id)
+        if blocked is not None:
+            if time.monotonic() < blocked:
+                return True
+            del self._blocked[condition_id]
         until = self._cooling.get(condition_id)
         if until is None:
             return False
@@ -844,6 +880,8 @@ class NegRiskBundleGuard:
 
         self._arm_cooldown(bundle.condition_id)
         realised, failures = await self._unwind_all(bundle, naked)
+        if realised < 0.0:
+            self._note_loss(bundle.condition_id)
 
         self._breaker.on_fill(pnl=round(realised, 6))
         note = f" ({failures} leg(s) STUCK — manual)" if failures else ""

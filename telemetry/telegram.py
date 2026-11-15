@@ -95,11 +95,19 @@ _TRADED_RE = re.compile(
     r"(?<!no )\bfilled\b|half-fill|flatten|unwound|\bnaked\b|completed as taker|pnl=",
     re.IGNORECASE,
 )
+# The exchange refusing an order, in its own words. These say "filled" about an
+# order that did not fill: "order couldn't be fully filled. FOK orders are fully
+# filled or killed." The pair path only raises when both legs failed.
+_REFUSED_RE = re.compile(
+    r"execution failed|couldn't be fully filled|fully filled or killed|invalid amount",
+    re.IGNORECASE,
+)
 
 
 def says_traded(text: str) -> bool:
     """Whether an episode's outcome line reports a transaction that happened."""
-    return bool(_TRADED_RE.search(text or ""))
+    text = text or ""
+    return bool(_TRADED_RE.search(text)) and not _REFUSED_RE.search(text)
 
 
 def message_kind(text: str) -> str:
@@ -109,6 +117,9 @@ def message_kind(text: str) -> str:
         return "trade"
     if "NegRisk bundle on" in text and says_traded(text):
         return "trade"
+    # Nothing traded and nobody has anything to do about it.
+    if "ARB EXECUTION ERROR" in text and _REFUSED_RE.search(text):
+        return "info"
     if any(m in text for m in _CRITICAL_MARKERS):
         return "critical"
     return "info"

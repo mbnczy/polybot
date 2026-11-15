@@ -64,6 +64,13 @@ def _trail_s(poll_s: float) -> float:
     return 2.0 * poll_s + 30.0
 
 
+# How far back a redemption on the exchange's feed can explain vanished shares.
+_REDEEM_WINDOW_S: float = 1800.0
+
+# Positions worth less are not worth asking a person about at start-up. Their
+# share counts are still watched.
+_UNMANAGED_MIN_USD: float = float(os.environ.get("RECONCILE_UNMANAGED_MIN_USD", 0.50))
+
 
 
 class WalletReconciler:
@@ -91,6 +98,10 @@ class WalletReconciler:
         # Snapshot key → token id, kept after a position empties so the move
         # that emptied it can still be attributed.
         self._asset_of: dict[str, str] = {}
+        # Snapshot key → value at the last read, for the start-up report.
+        self._value_of: dict[str, float] = {}
+        # Keys whose market has resolved, as of the last read. See _snapshot.
+        self._resolved: set[str] = set()
         self._prev_cash: float | None = None
         self.unexplained_events: int = 0
         # Settlements AutoRedeemer has announced but the snapshot has not yet
@@ -127,12 +138,47 @@ class WalletReconciler:
         if cash is None:
             return None
         held: dict[str, float] = {}
+        resolved: set[str] = set()
         for r in rows:
-            key = f"{r.get('title','')[:40]}|{r.get('outcome','')}"
+            key = self._key(r)
+            # A resolved market cannot trade, so nothing that happens to these
+            # shares is an order. Only live inventory is compared: a loser stays
+            # listed for good at value 0, and a cross leg leaving the managed set
+            # would otherwise read as shares appearing from nowhere.
+            if r.get("redeemable"):
+                resolved.add(key)
+                continue
             held[key] = float(r.get("size") or 0.0)
+            if r.get("value") is not None:
+                self._value_of[key] = float(r["value"])
             if r.get("asset"):
                 self._asset_of[key] = str(r["asset"])
+        self._resolved = resolved
         return self._drop_managed(held), float(cash)
+
+    @staticmethod
+    def _key(row: dict) -> str:
+        return f"{row.get('title','')[:40]}|{row.get('outcome','')}"
+
+    def _worth_reporting(self, key: str) -> bool:
+        """Whether a position held at start-up is worth a person's attention."""
+        value = self._value_of.get(key)
+        return value is None or value >= _UNMANAGED_MIN_USD
+
+    async def _redeemed_on_feed(self, moves: dict[str, float]) -> set[str]:
+        """
+        The moves the wallet's redemption feed explains.
+
+        Polymarket's operator redeems winners within seconds of a market closing,
+        so a position usually goes from held to gone between two reads, with
+        nothing here having been told. The feed is the exchange's own record.
+        """
+        recent = getattr(self._client, "recent_redemptions", None)
+        if not callable(recent) or not any(v < 0 for v in moves.values()):
+            return set()
+        rows = await recent(time.time() - _REDEEM_WINDOW_S)
+        paid = {self._key(r) for r in rows or []}
+        return {k for k, v in moves.items() if v < 0 and k in paid}
 
     def _own_recent(self, moves: dict[str, float]) -> dict[str, float]:
         """The moves on tokens the bot itself traded within the trail window."""
@@ -202,15 +248,16 @@ class WalletReconciler:
             # Adopting them automatically is not safe — the original bundle
             # structure is gone, so we cannot know what they were meant to hedge
             # or at what price. Say so instead, and let a human decide.
-            if held:
-                detail = ", ".join(f"{k} {v:.2f}" for k, v in sorted(held.items()))
+            unmanaged = {k: v for k, v in held.items() if self._worth_reporting(k)}
+            if unmanaged:
+                detail = ", ".join(f"{k} {v:.2f}" for k, v in sorted(unmanaged.items()))
                 logger.warning(
                     "WalletReconciler | %d UNMANAGED position(s) held at "
                     "startup — no guard is watching these and none will: %s",
-                    len(held), detail,
+                    len(unmanaged), detail,
                 )
                 await self._notifier.notify(
-                    f"⚠️ {len(held)} pozíció felügyelet nélkül\n{detail}\n"
+                    f"⚠️ {len(unmanaged)} pozíció felügyelet nélkül\n{detail}\n"
                     "Ezeket egyik guard sem figyeli — nem fogja se kiegészíteni, "
                     "se lezárni. Kézi döntést igényelnek."
                 )
@@ -256,6 +303,20 @@ class WalletReconciler:
             del moves[title]
         if not moves:
             return None
+
+        # The market resolved between the two reads: the shares left live inventory
+        # without an order. Or the exchange's operator has already redeemed them.
+        settled = {k for k, v in moves.items() if v < 0 and k in self._resolved}
+        settled |= await self._redeemed_on_feed(
+            {k: v for k, v in moves.items() if k not in settled})
+        if settled:
+            logger.info(
+                "WalletReconciler | %s — settled at resolution, expected",
+                ", ".join(f"{k} {moves[k]:+.2f}" for k in sorted(settled)),
+            )
+            moves = {k: v for k, v in moves.items() if k not in settled}
+            if not moves:
+                return None
 
         open_positions = int(self._breaker.status_dict().get("open_positions", 0))
         if open_positions > 0:
