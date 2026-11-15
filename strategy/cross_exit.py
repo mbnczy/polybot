@@ -200,17 +200,37 @@ def exit_by_sale(
     return got - pos.entry_cost
 
 
-def resolution_profit(pos: CrossPosition, narrow_yes: bool, broad_yes: bool) -> float:
+def resolution_profit(pos: CrossPosition, narrow_yes: float, broad_yes: float) -> float:
     """
     Profit per pair once both markets have resolved.
 
-    NO on narrow pays when narrow resolved NO; YES on broad pays when broad
-    resolved YES. The implication rules out narrow YES with broad NO, so the
-    payout is 1 or 2 — never 0 — whenever the mapping was right. A 0 here means
-    the implication was false, and that is the one loss this strategy can take.
+    `narrow_yes` and `broad_yes` are what one YES share paid: 1 (or True) when YES
+    won, 0 when NO won, 0.5 when the market was settled 50-50, as a cancelled
+    match is. NO on narrow pays the rest of narrow's YES; YES on broad pays
+    broad's. The implication rules out narrow YES with broad NO, so the payout is
+    1 or 2 — never 0 — whenever the mapping was right. A 0 here means the
+    implication was false, and that is the one loss this strategy can take.
     """
-    payout = (0.0 if narrow_yes else 1.0) + (1.0 if broad_yes else 0.0)
+    payout = (1.0 - float(narrow_yes)) + float(broad_yes)
     return payout - pos.entry_cost
+
+
+def yes_payout(outcome_prices: "str | None") -> "float | None":
+    """
+    What one YES share paid, from a closed market's `outcomePrices`: 1.0, 0.0, or
+    0.5 for a 50-50 settlement. None when the prices say anything else.
+    """
+    try:
+        yes, no = (float(x) for x in json.loads(outcome_prices or "[]"))
+    except (TypeError, ValueError):
+        return None
+    if {yes, no} == {0.0, 1.0} or (yes, no) == (0.5, 0.5):
+        return yes
+    return None
+
+
+def outcome_label(yes: float) -> str:
+    return {1.0: "YES", 0.0: "NO"}.get(float(yes), "50-50")
 
 
 @dataclass(frozen=True)

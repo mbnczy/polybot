@@ -1093,9 +1093,10 @@ def _market_end_ts(market: dict | None) -> float | None:
         return None
 
 
-def _resolved_outcome(condition_id: str) -> bool | None:
+def _resolved_outcome(condition_id: str) -> "float | None":
     """
-    True if YES won, False if NO won, None while unresolved or unclear.
+    What one YES share paid (1.0, 0.0, or 0.5 for a 50-50 settlement), or None
+    while unresolved or unclear.
 
     Gamma filters on `condition_ids`. The camel-case `conditionId` is silently
     ignored and returns an unfiltered page — which is how a query for one
@@ -1112,13 +1113,8 @@ def _resolved_outcome(condition_id: str) -> bool | None:
     for m in rows:
         if str(m.get("conditionId")) != condition_id:
             continue
-        try:
-            yes, no = (float(x) for x in json.loads(m.get("outcomePrices") or "[]"))
-        except (TypeError, ValueError):
-            return None
-        if {yes, no} != {0.0, 1.0}:
-            return None
-        return yes == 1.0
+        from strategy.cross_exit import yes_payout  # noqa: PLC0415
+        return yes_payout(m.get("outcomePrices"))
     return None
 
 

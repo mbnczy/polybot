@@ -76,7 +76,9 @@ from strategy.cross_exit import (
     ExitQuote,
     PositionBook,
     buy_cost,
+    outcome_label,
     resolution_profit,
+    yes_payout,
     sell_proceeds,
     should_exit,
     taker_fee_per_share,
@@ -2013,10 +2015,10 @@ class CrossGuard:
         self.stats["resolved"] += 1
         await self._say(
             f"🏁 CROSS POSITION RESOLVED — {per_pair * pos.size:+.4f} USDC\n"
-            f"  {pos.narrow_title[:56]} → {'YES' if ny else 'NO'}\n"
-            f"  {pos.broad_title[:56]} → {'YES' if by else 'NO'}"
+            f"  {pos.narrow_title[:56]} → {outcome_label(ny)}\n"
+            f"  {pos.broad_title[:56]} → {outcome_label(by)}"
             + ("\n  ⚠️ narrow YES with broad NO: the implication was FALSE"
-               if ny and not by else ""))
+               if float(ny) == 1.0 and float(by) == 0.0 else ""))
         self._breaker.on_cross_close(per_pair * pos.size, committed)
 
     async def _try_exit(self, pos: CrossPosition, now: float) -> None:
@@ -2067,9 +2069,11 @@ class CrossGuard:
             logger.warning("CrossGuard | notify failed: %s", exc)
 
 
-async def _gamma_resolution(condition_id: str) -> "bool | None":
+async def _gamma_resolution(condition_id: str) -> "float | None":
     """
-    True if YES won, False if NO won, None while unresolved or unclear.
+    What one YES share paid (1.0, 0.0, or 0.5 for a 50-50 settlement), or None
+    while unresolved or unclear. Abha/Al Shabab was settled 50-50 on 2026-11-08,
+    and a position on it kept its slot because 0.5 read as "unclear".
 
     Filtered on `condition_ids` — the camel-case key is silently ignored and
     returns an unfiltered page. Gamma returns a closed market only when asked for
@@ -2087,11 +2091,5 @@ async def _gamma_resolution(condition_id: str) -> "bool | None":
     for m in rows:
         if str(m.get("conditionId")) != condition_id:
             continue
-        try:
-            yes, no = (float(x) for x in json.loads(m.get("outcomePrices") or "[]"))
-        except (TypeError, ValueError):
-            return None
-        if {yes, no} != {0.0, 1.0}:
-            return None
-        return yes == 1.0
+        return yes_payout(m.get("outcomePrices"))
     return None
