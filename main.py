@@ -108,6 +108,7 @@ from execution.inventory_manager import InventoryManager           # noqa: E402
 from execution.negrisk_guard import NegRiskBundleGuard             # noqa: E402
 from execution.reconciler import WalletReconciler                 # noqa: E402
 from execution.cross_guard import CrossGuard, min_order_shares                  # noqa: E402
+from execution.reward_quoter import RewardQuoter                   # noqa: E402
 from execution.pair_guard import MakerPairGuard                    # noqa: E402
 from risk.circuit_breaker import (                                 # noqa: E402
     ArbOrderIntent,
@@ -1011,6 +1012,7 @@ async def heartbeat_loop(
     detector:      "ArbDetector | None"  = None,
     neg_risk_det:  "NegRiskArbDetector | None" = None,
     cross_guard:   "CrossGuard | None" = None,
+    reward_quoter: "RewardQuoter | None" = None,
 ) -> None:
     """
     Refresh metrics every HEARTBEAT_INTERVAL (60 s) and send a Telegram health
@@ -1040,6 +1042,8 @@ async def heartbeat_loop(
             # clears every gate, so silence alone says nothing.
             if cross_guard is not None:
                 logger.info("Cross stops | %s", cross_guard.stop_summary())
+            if reward_quoter is not None and reward_quoter.summary() != "off":
+                logger.info("Reward quotes | %s", reward_quoter.summary())
 
             now = time.monotonic()
             if (
@@ -1357,8 +1361,16 @@ async def main() -> None:
 
     # Cross positions are held for days by design; the reconciler leaves their
     # markets out rather than reading every entry and exit as an escape.
-    reconciler = WalletReconciler(client, breaker, notifier,
-                                  managed=cross_guard.managed_titles)
+    # ── reward quoter: minimum-size two-sided quotes on a few quiet markets, for
+    #    the liquidity rewards. OFF unless REWARD_QUOTING_ENABLED=true; its limits
+    #    are in execution/reward_quoter.py. Shares it holds are restored first, so
+    #    the reconciler below never reads them as unmanaged.
+    reward_quoter = RewardQuoter(client, breaker, notifier, fee_engine=fee_engine)
+    reward_quoter.restore()
+
+    reconciler = WalletReconciler(
+        client, breaker, notifier,
+        managed=lambda: cross_guard.managed_titles() | reward_quoter.managed_titles())
 
     # Redemptions are announced to the reconciler so a settlement is never
     # mistaken for an order that escaped supervision.
@@ -1449,12 +1461,14 @@ async def main() -> None:
         asyncio.create_task(inventory.run(),                                   name="inventory"),
         asyncio.create_task(reconciler.run(),                                  name="reconciler"),
         asyncio.create_task(cross_guard.run(),                                 name="cross_guard"),
+        asyncio.create_task(reward_quoter.run(),                               name="reward_quoter"),
         asyncio.create_task(pair_guard.run(),                                  name="pair_guard"),
         *([asyncio.create_task(negrisk_guard.run(), name="negrisk_guard")]
           if negrisk_guard is not None else []),
         asyncio.create_task(heartbeat_loop(breaker, notifier, feed_registry, client, detector,
                                            neg_risk_det=neg_risk_det,
-                                           cross_guard=cross_guard), name="heartbeat"),
+                                           cross_guard=cross_guard,
+                                           reward_quoter=reward_quoter), name="heartbeat"),
         asyncio.create_task(telegram_loop(notifier),                           name="telegram"),
         asyncio.create_task(sig_logger.run(),                                  name="sig_logger"),
         asyncio.create_task(metrics_server(),                                  name="metrics"),

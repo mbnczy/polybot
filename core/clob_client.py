@@ -302,6 +302,9 @@ _UNWIND_MAX_SLICES: int = int(os.environ.get("UNWIND_MAX_SLICES", 12))
 # Fills are looked up seconds after submission, so the answer is always near the
 # head of the feed; the cap stops a lookup walking the entire trade history.
 _TRADE_SCAN_LIMIT: int = int(os.environ.get("TRADE_SCAN_LIMIT", 200))
+# How many trades one read of our own fills walks. It is bounded by `after`
+# already; this stops a runaway feed.
+_FILLS_SCAN_LIMIT: int = int(os.environ.get("FILLS_SCAN_LIMIT", 2000))
 
 # Settled trades to inspect when calibrating the real fee rate at startup.
 _FEE_CALIBRATION_TRADES: int = int(os.environ.get("FEE_CALIBRATION_TRADES", 200))
@@ -549,6 +552,11 @@ def _extract_http_status(exc: Exception) -> int:
             return sc
     match = _STATUS_RE.search(str(exc))
     return int(match.group(1)) if match else 0
+
+
+def _side_name(side: Any) -> str:
+    """"BUY" or "SELL" from an SDK OrderSide or a plain string."""
+    return str(getattr(side, "value", side)).upper().rsplit(".", 1)[-1]
 
 
 def _field(obj: Any, name: str, default: Any = None) -> Any:
@@ -1242,6 +1250,124 @@ class PolyClient:
             } for r in page[0]]
         except Exception as exc:  # noqa: BLE001
             logger.warning("Redemption query failed: %s", exc)
+            return None
+
+    async def recent_income(self, since: float) -> "list[dict] | None":
+        """
+        What the exchange paid the wallet since `since` (epoch seconds) apart from
+        trading: liquidity rewards, maker rebates and holding yield, newest first,
+        as {type, usdc, ts}; None if the query fails. Each is one row a day.
+        """
+        params = {"user": self.trading_wallet, "type": "REWARD,MAKER_REBATE,YIELD",
+                  "start": max(1, int(since)), "limit": 200}
+        try:
+            import httpx  # noqa: PLC0415 — optional at import time
+            async with httpx.AsyncClient(timeout=20.0) as http:
+                page = await data_api.fetch_page(http, "activity", params)
+            if page is None:
+                return None
+            return [{
+                "type": str(r.get("type") or ""),
+                "usdc": float(r.get("usdc_size") or 0.0),
+                "ts":   int(r.get("timestamp") or 0),
+            } for r in page[0]]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Income query failed: %s", exc)
+            return None
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Liquidity rewards — what our resting orders are scoring
+    # ──────────────────────────────────────────────────────────────────────────
+
+    async def fills_since(self, since: float) -> "list[dict] | None":
+        """
+        Every fill of an order of ours matched at or after `since` (epoch seconds),
+        as {trade, order, token, side, shares, price, ts}; None if the trade feed
+        cannot be read.
+
+        One read for any number of resting orders, where order_filled_size reads
+        the feed once an order. A trade carries our order either as its taker or
+        among its makers, each maker with the amount and the price of its own
+        order; a trade the exchange failed to settle moved nothing and is left out.
+        """
+        if _PAPER_TRADE:
+            return []
+
+        def _read() -> list[dict]:
+            out: list[dict] = []
+            seen = 0
+            for page in self._client.list_account_trades(after=str(max(1, int(since)))):
+                for tr in page.items:
+                    seen += 1
+                    if str(getattr(tr, "status", "")).upper() == "FAILED":
+                        continue
+                    ts = getattr(tr, "matched_at", None)
+                    when = ts.timestamp() if hasattr(ts, "timestamp") else float(ts or 0.0)
+                    if str(getattr(tr, "trader_side", "")).upper() == "TAKER":
+                        out.append({
+                            "trade": str(tr.id), "order": str(tr.taker_order_id).lower(),
+                            "token": str(tr.token_id), "side": str(_side_name(tr.side)),
+                            "shares": float(tr.size), "price": float(tr.price), "ts": when,
+                        })
+                        continue
+                    for mo in getattr(tr, "maker_orders", ()) or ():
+                        out.append({
+                            "trade": str(tr.id), "order": str(mo.order_id).lower(),
+                            "token": str(mo.token_id), "side": str(_side_name(mo.side)),
+                            "shares": float(mo.matched_amount), "price": float(mo.price),
+                            "ts": when,
+                        })
+                if seen >= _FILLS_SCAN_LIMIT:
+                    break
+            return out
+
+        try:
+            return await asyncio.get_running_loop().run_in_executor(_executor, _read)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Fill feed read failed: %s", exc)
+            return None
+
+    async def orders_scoring(self, order_ids: "list[str]") -> "dict[str, bool] | None":
+        """Whether each resting order is scoring liquidity rewards now; None on failure."""
+        ids = [str(o) for o in order_ids if o]
+        if _PAPER_TRADE or not ids:
+            return {}
+        try:
+            got = await asyncio.get_running_loop().run_in_executor(
+                _executor, lambda: self._client.get_orders_scoring(order_ids=ids))
+            return {str(k).lower(): bool(v) for k, v in (got or {}).items()}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Order scoring query failed: %s", exc)
+            return None
+
+    async def reward_percentages(self) -> "dict[str, float] | None":
+        """Our current share of each market's reward pool, in percent, by condition id."""
+        if _PAPER_TRADE:
+            return {}
+        try:
+            got = await asyncio.get_running_loop().run_in_executor(
+                _executor, self._client.get_reward_percentages)
+            return {str(k).lower(): float(v) for k, v in (got or {}).items()}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Reward percentages query failed: %s", exc)
+            return None
+
+    async def reward_earnings(self, date: str) -> "dict[str, float] | None":
+        """Liquidity rewards earned on `date` (YYYY-MM-DD, UTC) by condition id."""
+        if _PAPER_TRADE:
+            return {}
+
+        def _read() -> dict[str, float]:
+            out: dict[str, float] = {}
+            for row in self._client.list_user_earnings_for_day(date=date).iter_items():
+                cid = str(row.condition_id).lower()
+                out[cid] = out.get(cid, 0.0) + float(row.earnings)
+            return out
+
+        try:
+            return await asyncio.get_running_loop().run_in_executor(_executor, _read)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Reward earnings query failed for %s: %s", date, exc)
             return None
 
     async def collateral_balance(self) -> "float | None":
