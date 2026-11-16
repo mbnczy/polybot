@@ -139,6 +139,19 @@ def test_a_buy_under_a_dollar_is_sized_up_to_one():
     assert shares_to_buy(0.0, 20, 1.02) == 0.0
 
 
+@pytest.mark.parametrize("ask,shares", [
+    (0.05, 20.4), (0.06, 20.0), (0.017, 60.0),        # these filled on 2026-11-16 as they were
+    (0.029, 40.0), (0.035, 30.0), (0.047, 30.0),      # these were killed at 35.18, 29.15, 21.71
+    (0.044, 25.0), (0.027, 40.0), (0.011, 100.0),     # ... 23.19, 37.78, 92.73
+])
+def test_the_buy_always_costs_a_whole_number_of_cents(ask, shares):
+    got = shares_to_buy(ask, 20, 1.02)
+    assert got == pytest.approx(shares)
+    cents = got * ask * 100.0
+    assert abs(cents - round(cents)) < 1e-6 and got * ask >= 1.02 - 1e-9
+    assert abs(round(cents) / 100.0 / ask * 100.0 - round(got * 100.0)) < 1e-6, "amount / price is exact"
+
+
 def test_a_plan_on_a_cheap_token():
     m = _market()
     book = _book([(0.02, 400), (0.01, 900)], [(0.03, 300), (0.05, 100)])

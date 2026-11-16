@@ -195,11 +195,23 @@ def book_scores(book: "dict | None", mid: float, v: float) -> tuple[float, float
 def shares_to_buy(ask: float, min_size: float, min_buy_usdc: float) -> float:
     """
     Shares to buy for the ask: the market's minimum size, or more where that many
-    would cost less than the exchange accepts for a marketable order.
+    would cost less than the exchange accepts for a marketable order — and then
+    the next size up whose cost is a whole number of cents.
+
+    A marketable BUY is sent as an amount to spend, in cents. Where amount / price
+    is not a whole number of hundredths of a share, the order's rounded price
+    lands a hair under the ask and nothing matches: on 2026-11-16 the three buys
+    that came out exact filled (20.40 @ 0.05, 20 @ 0.06, 60 @ 0.017) and all seven
+    that did not were killed (35.18 @ 0.029 is 1.03 / 0.029 = 35.517...).
     """
     if ask <= 0.0:
         return 0.0
-    return max(min_size, math.ceil(min_buy_usdc / ask * 100.0 - 1e-6) / 100.0)
+    need = max(min_size, min_buy_usdc / ask)
+    k = round(ask * 10_000)                                # the price in hundredths of a cent
+    if k <= 0:
+        return 0.0
+    step = 10_000 // math.gcd(k, 10_000)                   # in hundredths of a share
+    return math.ceil(need * 100.0 / step - 1e-9) * step / 100.0
 
 
 def plan_quote(

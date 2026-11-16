@@ -1520,7 +1520,9 @@ class PolyClient:
                 raise ValueError("BUY market order needs a price to size the spend")
             # Spend = shares x limit price, rounded UP to the cent so rounding
             # can never leave us short of the shares we are trying to buy.
-            kwargs["amount"] = math.ceil(shares * price * 100.0) / 100.0
+            # Rounded first: 40 x 0.029 is 1.1600000000000001 in floating point,
+            # and a cent more than was priced is a different order.
+            kwargs["amount"] = math.ceil(round(shares * price * 100.0, 6)) / 100.0
             kwargs["max_price"] = price
         else:
             kwargs["shares"] = shares
