@@ -135,12 +135,12 @@ def test_a_buy_under_a_dollar_is_sized_up_to_one():
     """The exchange refuses a marketable BUY under $1: 20 shares at 0.03 is $0.60."""
     assert shares_to_buy(0.03, 20, 1.02) == 34.0
     assert shares_to_buy(0.03, 20, 1.02) * 0.03 >= 1.02
-    assert shares_to_buy(0.06, 20, 1.02) == 20
+    assert shares_to_buy(0.06, 20, 1.02) == pytest.approx(22.0), "a tenth over the minimum"
     assert shares_to_buy(0.0, 20, 1.02) == 0.0
 
 
 @pytest.mark.parametrize("ask,shares", [
-    (0.05, 20.4), (0.06, 20.0), (0.017, 60.0),        # these filled on 2026-11-16 as they were
+    (0.05, 22.0), (0.06, 22.0), (0.017, 60.0),        # 20.40, 20 and 60 filled on 2026-11-16
     (0.029, 40.0), (0.035, 30.0), (0.047, 30.0),      # these were killed at 35.18, 29.15, 21.71
     (0.044, 25.0), (0.027, 40.0), (0.011, 100.0),     # ... 23.19, 37.78, 92.73
 ])
@@ -169,8 +169,8 @@ def test_the_bid_is_cut_to_what_the_cost_allows():
                         {"token_id": "no", "outcome": "No", "price": 0.94}])
     book = _book([(0.05, 400)], [(0.06, 300)])
     p = plan_quote(m, book, max_cost=2.5)
-    assert p.buy_shares == 20 and p.bid_shares == 20         # 1.20 + 1.00
-    assert plan_quote(m, book, max_cost=2.0) is None         # only 16 fit: under the minimum
+    assert p.buy_shares == 22 and p.bid_shares == 22         # 1.32 + 1.10
+    assert plan_quote(m, book, max_cost=2.0) is None         # only 13 fit: under the minimum
     assert p.cost <= 2.5
 
 

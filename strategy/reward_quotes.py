@@ -34,6 +34,8 @@ from datetime import datetime, timezone
 from typing import Iterable
 
 _EPS = 1e-9
+# Shares bought for the ask, as a multiple of the market's minimum size.
+_LOT_MARGIN = 1.1
 
 
 @dataclass(frozen=True)
@@ -206,7 +208,9 @@ def shares_to_buy(ask: float, min_size: float, min_buy_usdc: float) -> float:
     """
     if ask <= 0.0:
         return 0.0
-    need = max(min_size, min_buy_usdc / ask)
+    # A tenth over the minimum: 0.16 of a share bought from a 20-share ask on
+    # 2026-11-16 left 19.84, which no longer counts.
+    need = max(min_size * _LOT_MARGIN, min_buy_usdc / ask)
     k = round(ask * 10_000)                                # the price in hundredths of a cent
     if k <= 0:
         return 0.0
