@@ -120,6 +120,10 @@ def _slim(m: dict) -> dict:
     ev = m.get("events")
     if isinstance(ev, list) and ev and isinstance(ev[0], dict) and ev[0].get("id") is not None:
         out["events"] = [{"id": str(ev[0]["id"])}]
+        # Which game a sports event is about (same_fixture): a match and its
+        # exact scores are two events of one game id.
+        if ev[0].get("gameId") not in (None, ""):
+            out["events"][0]["gameId"] = str(ev[0]["gameId"])
     return out
 
 
@@ -846,17 +850,26 @@ def same_fixture(a: dict, b: dict) -> bool:
     same two teams days apart, and the model, seeing titles only, paired them —
     "Spread: Chicago Cubs (-2.5) ⊆ (-1.5)" across two games, "San Francisco
     Giants Team Total: O/U 4.5" against the next night's, both violated at
-    resolution. Markets of one game share its event; where an event is missing,
-    a game's markets still share its start.
+    resolution. Markets of one game share its event.
+
+    Different events are one game only when Polymarket gives both the same game
+    id and they start together. A shared start alone let two matches through:
+    "Brighton & Hove Albion FC leading at halftime?" (Premier League, game
+    90114137) and "Albion FC leading at halftime?" (Uruguay, game 75374852) both
+    kicked off at 13:00 on 2026-10-18, and the pair lost 14.41 USDC live. A
+    match's exact scores are listed as their own event under the match's game
+    id: 20 of 20 sampled audit pairs across two events shared it, and all held.
+    Where either id is missing (117 of 8,233 sports markets on 2026-11-19) the
+    pair is refused.
     """
     if not (_is_sports(a) and _is_sports(b)):
         return True
     ea, eb = _event_id(a), _event_id(b)
     if ea is not None and ea == eb:
         return True
-    # Different events can still be one game: a match's exact scores are listed
-    # as their own event, and those pairs have resolved correctly 2,870 times.
-    # What no two games of one team share is the moment they start.
+    ga, gb = _game_id(a), _game_id(b)
+    if ga is None or gb is None or ga != gb:
+        return False
     ta, tb = _market_end_ts(a), _market_end_ts(b)
     if ta is None or tb is None:
         return False
@@ -881,6 +894,14 @@ def _event_id(market: dict) -> "str | None":
     ev = market.get("events")
     if isinstance(ev, list) and ev and isinstance(ev[0], dict) and ev[0].get("id") is not None:
         return str(ev[0]["id"])
+    return None
+
+
+def _game_id(market: dict) -> "str | None":
+    ev = market.get("events")
+    if isinstance(ev, list) and ev and isinstance(ev[0], dict) \
+            and ev[0].get("gameId") not in (None, ""):
+        return str(ev[0]["gameId"])
     return None
 
 

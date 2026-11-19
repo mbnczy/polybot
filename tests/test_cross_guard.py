@@ -273,6 +273,25 @@ async def test_a_half_fill_is_sold_back_and_booked(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_losing_half_fill_pauses_the_pair_for_two_hours(tmp_path, monkeypatch):
+    """2026-10-12: one pair half-filled every 15 minutes for 2.5 hours, -6 USDC."""
+    books = {**ARB, "by": _book(asks=[(0.45, 20)], bids=[(0.43, 20)])}
+    g, client, breaker, notifier = _guard(tmp_path, monkeypatch, books, [_imp()])
+    client.buy_fail.add("nn")
+    await g.poll_once()
+    assert len(client.buys) == 2 and breaker.status_dict()["daily_pnl"] < 0.0
+    assert "paused for 120 min" in notifier.messages[0]
+    # Past the quarter-hour entry cooldown, still inside the two hours.
+    monkeypatch.setattr(time, "time", lambda: NOW + 16 * 60)
+    await g.poll_once()
+    assert len(client.buys) == 2
+    assert g._last_pass[2].get("cooldown") == 1
+    monkeypatch.setattr(time, "time", lambda: NOW + 2 * 3600 + 60)
+    await g.poll_once()
+    assert len(client.buys) == 4
+
+
+@pytest.mark.asyncio
 async def test_the_breaker_caps_entries(tmp_path, monkeypatch):
     imps = [_imp(narrow=f"0xn{i}", broad=f"0xb{i}") for i in range(3)]
     g, client, breaker, _ = _guard(tmp_path, monkeypatch, ARB, imps)

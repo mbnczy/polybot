@@ -182,6 +182,9 @@ CROSS_CANCEL_RETRY_S: float = float(os.environ.get("CROSS_CANCEL_RETRY_S", 600.0
 # token gets another resting bid for this long. The same 5-year Treasury pair was
 # rested three times in 45 minutes on 2026-09-27, each time filled on one leg by
 # a counterparty of exactly our size and bought back from us a cent lower.
+# A taker pair whose second leg failed, and whose first was sold back at a loss,
+# is not tried again for this long either: on 2026-10-12 one pair was half-filled
+# again and again from 07:26 to 10:00, every 15 minutes, for about -6 USDC.
 CROSS_HALF_FILL_COOLDOWN_S: float = float(os.environ.get("CROSS_HALF_FILL_COOLDOWN_S", 7200.0))
 # Rest at the best bid, behind the queue, rather than a tick above it. A tick
 # above made our bid the best one, and it was hit within seconds by whoever was
@@ -1962,9 +1965,17 @@ class CrossGuard:
                     f"  {imp.broad_title[:60]}\n  Manual decision needed.")
                 return
             self._breaker.on_cross_close(pnl, opp.committed)
+            paused = ""
+            if pnl < 0.0:
+                # The same pair a quarter of an hour later is the same trap.
+                self._cooldown[key] = now + CROSS_HALF_FILL_COOLDOWN_S
+                paused = f"\n  Pair paused for {CROSS_HALF_FILL_COOLDOWN_S / 60.0:.0f} min."
+                logger.warning("CrossGuard | taker half-fill lost %.4f USDC on %s — pair paused "
+                               "for %.0f min", pnl, imp.narrow_title[:40],
+                               CROSS_HALF_FILL_COOLDOWN_S / 60.0)
             await self._say(
                 f"⚠️ CROSS HALF-FILL — {l2} did not fill; {l1} sold back, "
-                f"{pnl:+.4f} USDC.\n  {imp.narrow_title[:60]}\n  {imp.broad_title[:60]}")
+                f"{pnl:+.4f} USDC.\n  {imp.narrow_title[:60]}\n  {imp.broad_title[:60]}{paused}")
             return
 
         size = math.floor(min(got1, got2) * 100.0) / 100.0

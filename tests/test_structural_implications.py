@@ -265,9 +265,12 @@ def test_a_listed_twin_is_not_a_ladder_step():
 def test_the_reader_drops_a_pair_from_two_different_games():
     import scripts.demo_cross_market as reader
     from strategy.cross_market import Implication
-    fri = {"conditionId": "a", "question": "Spread: Chicago Cubs (-2.5)", "endDate": "2026-09-18T23:05:00Z"}
-    sat = {"conditionId": "b", "question": "Spread: Chicago Cubs (-1.5)", "endDate": "2026-09-19T23:05:00Z"}
-    same = {**sat, "conditionId": "c", "endDate": "2026-09-18T23:05:00Z"}
+    fri = {"conditionId": "a", "question": "Spread: Chicago Cubs (-2.5)", "endDate": "2026-09-18T23:05:00Z",
+           "events": [{"id": "1", "gameId": "g-fri"}]}
+    sat = {"conditionId": "b", "question": "Spread: Chicago Cubs (-1.5)", "endDate": "2026-09-19T23:05:00Z",
+           "events": [{"id": "2", "gameId": "g-sat"}]}
+    same = {**sat, "conditionId": "c", "endDate": "2026-09-18T23:05:00Z",
+            "events": [{"id": "3", "gameId": "g-fri"}]}
     rels = [Implication("a", "b", 0.97, "model"), Implication("a", "c", 0.97, "model")]
     kept = reader.drop_cross_fixture(rels, [fri, sat, same])
     assert [(r.narrow, r.broad) for r in kept] == [("a", "c")]
@@ -282,9 +285,11 @@ def test_the_fixture_guard_leaves_other_markets_alone():
 
 # ── the reader's fixture and side guards ──────────────────────────────────────
 
-def _sports(cid, q, ev, kind="team_totals", outcomes=("Yes", "No"), end="2026-09-22T01:45:00Z"):
+def _sports(cid, q, ev, kind="team_totals", outcomes=("Yes", "No"), end="2026-09-22T01:45:00Z",
+            game=None):
+    event = {"id": ev, **({"gameId": game} if game is not None else {})}
     return {"conditionId": cid, "question": q, "sportsMarketType": kind, "endDate": end,
-            "events": [{"id": ev}], "outcomes": json.dumps(list(outcomes))}
+            "events": [event], "outcomes": json.dumps(list(outcomes))}
 
 
 def test_two_nights_of_team_totals_are_different_fixtures():
@@ -325,14 +330,49 @@ def test_dated_event_ladders_are_not_fixtures():
 
 
 def test_a_matchs_exact_scores_are_its_own_fixture():
-    """They are listed as a separate event, and those pairs resolve correctly."""
+    """They are listed as a separate event of the match's game, and those pairs resolve correctly."""
     import scripts.demo_cross_market as reader
-    match = _sports("a", "AS Monaco vs. RC Lens: O/U 2.5", "900", outcomes=("Over", "Under"))
-    exact = _sports("b", "Exact Score: AS Monaco 1 - 0 RC Lens?", "901")
+    match = _sports("a", "AS Monaco vs. RC Lens: O/U 2.5", "900", outcomes=("Over", "Under"),
+                    game=90114783)
+    exact = _sports("b", "Exact Score: AS Monaco 1 - 0 RC Lens?", "901", game="90114783")
     assert reader.same_fixture(match, exact)
     next_night = _sports("c", "Exact Score: AS Monaco 1 - 0 RC Lens?", "902",
-                         end="2026-09-23T01:45:00Z")
+                         end="2026-09-23T01:45:00Z", game="90120001")
     assert not reader.same_fixture(match, next_night)
+    # One game id with two different starts is not trusted either.
+    moved = _sports("d", "Exact Score: AS Monaco 1 - 0 RC Lens?", "903",
+                    end="2026-09-23T01:45:00Z", game="90114783")
+    assert not reader.same_fixture(match, moved)
+
+
+def test_two_matches_that_kick_off_together_are_different_fixtures():
+    """2026-10-12: traded live as an arbitrage, two games, -14.41 USDC."""
+    import scripts.demo_cross_market as reader
+    brighton = _sports("a", "Brighton & Hove Albion FC leading at halftime?", "1134935",
+                       kind="soccer_halftime_result", end="2026-10-18T13:00:00Z", game="90114137")
+    albion = _sports("b", "Albion FC leading at halftime?", "1173798",
+                     kind="soccer_halftime_result", end="2026-10-18T13:00:00Z", game="75374852")
+    assert not reader.same_fixture(brighton, albion)
+
+
+def test_two_events_without_a_game_id_are_not_one_fixture():
+    """The start time was the only evidence, and it is the one that failed."""
+    import scripts.demo_cross_market as reader
+    match = _sports("a", "San Jose Earthquakes vs. Houston Dynamo: O/U 3.5", "10",
+                    outcomes=("Over", "Under"))
+    exact = _sports("b", "Exact Score: San Jose Earthquakes 2 - 2 Houston Dynamo?", "11")
+    assert not reader.same_fixture(match, exact)
+    assert not reader.same_fixture(match, {**exact, "events": [{"id": "11", "gameId": "7"}]})
+    # One event needs no game id.
+    assert reader.same_fixture(match, _sports("c", "San Jose Earthquakes vs. Houston Dynamo: O/U 2.5", "10"))
+
+
+def test_the_slimmed_market_keeps_its_game_id():
+    import scripts.demo_cross_market as reader
+    row = {"conditionId": "x", "question": "Q", "events": [
+        {"id": 1134935, "gameId": 90114137, "title": "Brighton & Hove Albion FC vs. Crystal Palace FC"}]}
+    assert reader._slim(row)["events"] == [{"id": "1134935", "gameId": "90114137"}]
+    assert reader._slim({**row, "events": [{"id": 5}]})["events"] == [{"id": "5"}]
 
 
 def test_price_ladder_kind_reads_each_title_shape():
